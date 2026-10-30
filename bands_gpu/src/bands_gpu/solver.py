@@ -2,7 +2,9 @@
 
     freqs = solve_bands(cell, kpoints, num_bands=8, polarization="tm")     # (nk, num_bands), in units of 2 pi c / a
 
-k points are fractions of the reciprocal lattice vectors (as in MPB). ``interpolate(points, n)`` makes a path.
+k points are fractions of the reciprocal lattice vectors (as in MPB), also for an oblique cell.
+``interpolate(points, n)`` makes a path; ``TRIANGULAR_POINTS`` and ``triangular_path(n)`` give the high-symmetry
+points of the triangular lattice (``geometry.TRIANGULAR``).
 """
 
 from __future__ import annotations
@@ -19,6 +21,18 @@ import numpy as np
 from bands_gpu.geometry import Cell
 from bands_gpu.lobpcg import lobpcg
 from bands_gpu.operator import apply, make_operator, precondition
+
+
+# High-symmetry points of the triangular lattice with the basis geometry.TRIANGULAR (a1 = (1, 0),
+# a2 = (1/2, sqrt(3)/2)), in units of the reciprocal lattice vectors (as MPB): M = b2 / 2 is the center of an edge
+# of the Brillouin zone (|M| = 1 / sqrt(3) in units of 2 pi / a), K = (b2 - b1) / 3 is a corner (|K| = 2 / 3).
+TRIANGULAR_POINTS = {"Gamma": (0.0, 0.0, 0.0), "M": (0.0, 0.5, 0.0), "K": (-1 / 3, 1 / 3, 0.0)}
+
+
+def triangular_path(n: int) -> np.ndarray:
+    """Gamma - M - K - Gamma for the triangular lattice, n points between each pair of corner points."""
+    p = TRIANGULAR_POINTS
+    return interpolate([p["Gamma"], p["M"], p["K"], p["Gamma"]], n)
 
 
 def interpolate(points, n: int) -> np.ndarray:
@@ -61,6 +75,12 @@ def solve_bands(cell: Cell, kpoints, num_bands: int, polarization: str | None = 
         dtype = jnp.complex64
     device = solver_device()
     eps_inv = cell.eps_inverse(sub)
+    # the same eps_inv in all voxels (a homogeneous cell): the operator and the preconditioner are diagonal in G, so
+    # a warm block (plane waves of the last k point) never gains other plane waves and can converge at once to
+    # wrong bands. Each k point then starts from new random vectors.
+    flat = eps_inv.reshape(eps_inv.shape[:-3] + (-1,))
+    if np.all(flat == flat[..., :1]):
+        warm_start = False
     m = 2 if polarization is None else 1
     b = num_bands + extra
     shape = (b, m) + tuple(cell.shape)

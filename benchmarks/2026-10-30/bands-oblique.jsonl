@@ -1,0 +1,2 @@
+{"case": "tri-holes", "n": 128, "kpoints": 16, "bands": 8, "precision": "single", "device": "rocm:0", "first_s": 1.631, "time_s": 5.64, "mean_iterations": 54.375, "all_converged": true, "band1_max": 0.2070363610982895, "band2_min": 0.27438899874687195}
+{"case": "tri-holes", "n": 128, "kpoints": 16, "bands": 8, "precision": "single", "device": "cpu:0", "first_s": 7.899, "time_s": 89.313, "mean_iterations": 65.375, "all_converged": false, "band1_max": 0.20703639090061188, "band2_min": 0.27438902854919434}

@@ -6,9 +6,14 @@ H(r) = sum_G h(G) exp(i (k + G) . r), with h(G) orthogonal to q = k + G: h = c1 
 
 six FFTs per product (three in each direction). Theta is Hermitian and positive semi-definite on the transverse
 basis, so the lowest eigenvalues are the bands. Units: lengths in units of the lattice constant a; k in units of
-2 pi / a in the input; frequencies out in units of 2 pi c / a (as MPB).
+the reciprocal lattice vectors in the input (as MPB); frequencies out in units of 2 pi c / a (as MPB).
 
-2-D cells (nz = 1, k_z = 0) decouple into two polarizations, solved apart with one coefficient per G:
+The grid is uniform in the lattice coordinates, so the FFT frequencies n_i of each axis give the plane waves
+G = 2 pi (n1 b1 + n2 b2 + n3 b3), with the reciprocal vectors b_i of the cell (also for an oblique cell). q, the
+transverse basis u(q) and eps_inv are Cartesian, so the products are the same for any direction of q.
+
+2-D cells (nz = 1, k_z = 0, lattice vectors 1 and 2 in the xy plane) decouple into two polarizations, solved apart
+with one coefficient per G:
     "te": H along z (u = z), E in the plane;     "tm": H in the plane (u = z x q^), E along z.
 """
 
@@ -24,14 +29,16 @@ from bands_gpu.geometry import Cell
 
 
 def reciprocal_vectors(cell: Cell, k_frac) -> np.ndarray:
-    """q = k + G (shape (3, nx, ny, nz)) in units of 1/a (2 pi included). k_frac: k in units of the reciprocal
-    lattice vectors (2 pi / a_i per axis)."""
+    """q = k + G (shape (3, nx, ny, nz), Cartesian) in units of 1/a (2 pi included). k_frac: k in units of the
+    reciprocal lattice vectors b_i (as MPB). q = 2 pi sum_i (k_i + n_i) b_i, with b_i = f_i / size_i
+    (``Cell.unit_reciprocal``; for a rectangular cell f_i = e_i, and q is 2 pi (k_i + n_i) / a_i along axis i)."""
     comps = []
     for i, (a, n) in enumerate(zip(cell.size, cell.shape)):
         g = np.fft.fftfreq(n, d=1.0 / n) if n > 1 else np.zeros(1)
         comps.append(2 * np.pi * (k_frac[i] + g) / a)
     Q = np.meshgrid(*comps, indexing="ij")
-    return np.stack(Q)
+    f = cell.unit_reciprocal
+    return np.stack([Q[0] * f[0, c] + Q[1] * f[1, c] + Q[2] * f[2, c] for c in range(3)])
 
 
 def transverse_basis(q: np.ndarray, polarization: str | None) -> np.ndarray:
@@ -70,6 +77,8 @@ def make_operator(cell: Cell, k_frac, polarization: str | None = None, eps_inv: 
     if polarization and cell.shape[2] != 1:
         raise ValueError("te/tm need a 2-D cell (nz = 1)")
     q = reciprocal_vectors(cell, np.asarray(k_frac, float))
+    if polarization and np.abs(q[2]).max() > 1e-12 * max(np.abs(q).max(), 1.0):
+        raise ValueError("te/tm need k_z = 0 and the lattice vectors 1 and 2 in the xy plane")
     u = transverse_basis(q, polarization)
     if eps_inv is None:
         eps_inv = cell.eps_inverse()
@@ -108,6 +117,7 @@ def precondition(op: Operator, r: jax.Array) -> jax.Array:
 
 
 def fields_h(op: Operator, c: jax.Array) -> jax.Array:
-    """H(r) on the grid (..., 3, nx, ny, nz) for coefficients c (without the Bloch phase exp(i k . r))."""
+    """H(r) (Cartesian components) on the grid of lattice coordinates (..., 3, nx, ny, nz) for coefficients c
+    (without the Bloch phase exp(i k . r)); ``Cell.points()`` gives the Cartesian positions of the grid points."""
     h = jnp.einsum("...mxyz,mixyz->...ixyz", c, op.u.astype(c.dtype))
     return jnp.fft.ifftn(h, axes=(-3, -2, -1))

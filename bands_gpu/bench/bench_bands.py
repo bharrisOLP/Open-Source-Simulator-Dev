@@ -1,4 +1,5 @@
-"""Benchmark of solve_bands: 2-D rods (TM) and a 3-D simple cubic lattice of spheres (both polarizations).
+"""Benchmark of solve_bands: 2-D rods (TM), a 3-D simple cubic lattice of spheres (both polarizations), and a 2-D
+triangular lattice of air holes (TE; an oblique cell).
 
     python bench/bench_bands.py --case rods --n 128 --precision single
     BANDS_GPU_DEVICE=cpu python bench/bench_bands.py ...      # the same algorithm on the CPU (XLA threads)
@@ -14,11 +15,11 @@ jax.config.update("jax_enable_x64", True)
 import jax.numpy as jnp  # noqa: E402
 import numpy as np  # noqa: E402
 
-from bands_gpu.geometry import Cell, Cylinder, Sphere  # noqa: E402
-from bands_gpu.solver import interpolate, solve_bands  # noqa: E402
+from bands_gpu.geometry import TRIANGULAR, Cell, Cylinder, Sphere  # noqa: E402
+from bands_gpu.solver import interpolate, solve_bands, triangular_path  # noqa: E402
 
 ap = argparse.ArgumentParser()
-ap.add_argument("--case", choices=["rods", "spheres"], default="rods")
+ap.add_argument("--case", choices=["rods", "spheres", "tri-holes"], default="rods")
 ap.add_argument("--n", type=int, default=64)
 ap.add_argument("--bands", type=int, default=8)
 ap.add_argument("--precision", choices=["single", "double"], default="single")
@@ -28,6 +29,10 @@ dtype = jnp.complex64 if a.precision == "single" else jnp.complex128
 if a.case == "rods":
     cell = Cell(size=(1, 1, 1), shape=(a.n, a.n, 1), objects=(Cylinder(radius=0.2, eps=12.0),))
     ks, pol = interpolate([[0, 0, 0], [0.5, 0, 0], [0.5, 0.5, 0], [0, 0, 0]], a.kinterp), "tm"
+elif a.case == "tri-holes":
+    cell = Cell(size=(1, 1, 1), shape=(a.n, a.n, 1), basis=TRIANGULAR, eps_background=12.0,
+                objects=(Cylinder(radius=0.3, eps=1.0),))
+    ks, pol = triangular_path(a.kinterp), "te"
 else:
     cell = Cell(size=(1, 1, 1), shape=(a.n, a.n, a.n), objects=(Sphere(radius=0.3, eps=12.0),))
     ks, pol = interpolate([[0, 0, 0], [0.5, 0, 0], [0.5, 0.5, 0], [0.5, 0.5, 0.5], [0, 0, 0]], a.kinterp), None
