@@ -1,6 +1,7 @@
 """Checks of the steady-state heat solver: the exact 1-D slab, the sparse direct solve of the same discrete system,
 and the layered (harmonic-mean) conductance."""
 import jax
+import jax.numpy as jnp
 import numpy as np
 import pytest
 import scipy.sparse.linalg as spl
@@ -51,10 +52,23 @@ def test_matches_the_sparse_direct_solve():
     kappa = np.where(heater, 100.0, kappa)
     q = np.where(heater, 1e15, 0.0)
     bc = {"ymin": ("dirichlet", 300.0), "ymax": ("robin", 10.0, 300.0)}
-    res = solve_steady(x, y, kappa, q, bc, tol=1e-12)
     p = build(x, y, kappa, q, bc)
     ref = spl.spsolve(assemble(p).tocsc(), p.b.ravel()).reshape(p.shape)
-    assert np.max(np.abs(res.T - ref)) < 1e-7 * (ref.max() - 300.0)
+    for precond in ("mg", "jacobi"):
+        res = solve_steady(x, y, kappa, q, bc, tol=1e-12, precond=precond)
+        assert res.converged
+        assert np.max(np.abs(res.T - ref)) < 1e-7 * (ref.max() - 300.0), precond
+
+
+def test_multigrid_iterations_do_not_grow_with_the_grid():
+    from thermal_gpu.structures import heater_stack
+    its = []
+    for dx in (0.05e-6, 0.025e-6):
+        x, y, kappa, q, bc, _ = heater_stack(dx=dx)
+        r = solve_steady(x, y, kappa, q, bc)
+        assert r.converged
+        its.append(r.iterations)
+    assert its[1] <= its[0] + 6 and its[1] < 40
 
 
 def test_converged_flag_and_thin_heater_error():
@@ -62,5 +76,11 @@ def test_converged_flag_and_thin_heater_error():
     x, y, kappa, q, bc, _ = heater_stack(dx=0.05e-6)
     assert solve_steady(x, y, kappa, q, bc).converged
     assert not solve_steady(x, y, kappa, q, bc, max_iter=3).converged
+    assert not solve_steady(x, y, kappa, q, bc, max_iter=3, precond="jacobi").converged
+    # float32 cannot reach the true residual 1e-12 (the recursive CG residual can): the flag must say so
+    r32 = solve_steady(x, y, kappa, q, bc, dtype=jnp.float32)
+    assert not r32.converged and r32.residual > 1e-9
+    with pytest.raises(ValueError):
+        solve_steady(x, y, kappa, q, bc, precond="amg")
     with pytest.raises(ValueError):
         heater_stack(dx=0.3e-6, heater_t=0.1e-6)          # cell centers at 2.05 and 2.35 um: none in the heater

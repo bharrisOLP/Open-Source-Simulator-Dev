@@ -1,0 +1,6 @@
+{"dx_um": 0.02, "cells": 182500, "device": "rocm:0", "cg_s": 0.099, "iterations": 21, "residual": 6.708182925511141e-13, "T_wg_mean": 320.3541455550112, "T_max": 353.7822595632074}
+{"dx_um": 0.02, "cells": 182500, "device": "cpu:0", "cg_s": 0.228, "iterations": 21, "residual": 6.70818292552148e-13, "T_wg_mean": 320.3541455549933, "T_max": 353.7822595632625}
+{"dx_um": 0.01, "cells": 730000, "device": "rocm:0", "cg_s": 0.12, "iterations": 24, "residual": 6.25835818561557e-13, "T_wg_mean": 320.3516093893291, "T_max": 353.760525298388}
+{"dx_um": 0.01, "cells": 730000, "device": "cpu:0", "cg_s": 0.297, "iterations": 24, "residual": 6.258358185646474e-13, "T_wg_mean": 320.35160938945825, "T_max": 353.76052529871635}
+{"dx_um": 0.005, "cells": 2920000, "device": "rocm:0", "cg_s": 0.208, "iterations": 27, "residual": 7.035145225200202e-13, "T_wg_mean": 320.3505715175984, "T_max": 353.7520486851444}
+{"dx_um": 0.005, "cells": 2920000, "device": "cpu:0", "cg_s": 1.303, "iterations": 27, "residual": 7.035145225260042e-13, "T_wg_mean": 320.3505715185671, "T_max": 353.7520486863557}

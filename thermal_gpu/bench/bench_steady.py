@@ -1,5 +1,5 @@
 """Benchmark of solve_steady on the heater stack: GPU, the same CG on the CPU (THERMAL_GPU_DEVICE=cpu), and
-scipy's sparse direct solver. One JSON line per grid step."""
+scipy's sparse direct solver. One JSON line per grid step. --precond jacobi gives the Jacobi CG timings."""
 import argparse
 import json
 import time
@@ -18,13 +18,15 @@ ap = argparse.ArgumentParser()
 ap.add_argument("--dx", type=float, default=0.02e-6)
 ap.add_argument("--direct", action="store_true")
 ap.add_argument("--tol", type=float, default=1e-12)
+ap.add_argument("--precond", choices=("mg", "jacobi"), default="mg")
 a = ap.parse_args()
 x, y, kappa, q, bc, masks = heater_stack(dx=a.dx)
-solve_steady(x, y, kappa, q, bc, max_iter=10)                    # compile
+solve_steady(x, y, kappa, q, bc, max_iter=10, precond=a.precond)  # compile
 t0 = time.perf_counter()
-res = solve_steady(x, y, kappa, q, bc, tol=a.tol)
-row = {"dx_um": a.dx * 1e6, "cells": int(kappa.size), "device": res.device, "cg_s": round(time.perf_counter() - t0, 3),
-       "iterations": res.iterations, "residual": res.residual,
+res = solve_steady(x, y, kappa, q, bc, tol=a.tol, precond=a.precond)
+row = {"dx_um": a.dx * 1e6, "cells": int(kappa.size), "device": res.device, "precond": a.precond,
+       "cg_s": round(time.perf_counter() - t0, 3), "iterations": res.iterations, "residual": res.residual,
+       "converged": res.converged,
        "T_wg_mean": float(res.T[masks["waveguide"]].mean()), "T_max": float(res.T.max())}
 if a.direct:
     p = build(x, y, kappa, q, bc)

@@ -21,5 +21,6 @@ def test_slab_decay_time_constant():
     dt = tau / 200
     res = solve_transient(x, y, np.full((1, n), k), np.zeros((1, n)), bc, np.full((1, n), rho_cp),
                           t_end=tau, dt=dt, probes=[(0, n // 2)], t0_field=t0)
+    assert res.converged and res.max_residual <= 1e-12
     decay = res.probes[-1, 0] / res.probes[0, 0]
     assert decay == pytest.approx(np.exp(-1.0), rel=1e-2)

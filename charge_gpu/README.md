@@ -20,8 +20,9 @@ sol = solve(dev, v_n=2.0, v_p=0.0)  # 2 V reverse bias; sol.n, sol.p (m^-3), sol
   quasi-Fermi levels, negligible minority carriers); it does not model forward bias or currents (use a
   drift-diffusion code such as DEVSIM for those).
 - Cell-centered finite volumes; ohmic contacts as Dirichlet psi = V + V_T asinh(N_net / 2 n_i).
-- Newton's method: the Jacobian is symmetric positive definite, so each step is a Jacobi-preconditioned CG solve as
-  one device loop; log damping of the steps.
+- Newton's method: the Jacobian is symmetric positive definite, so each step is a CG solve as one device loop,
+  preconditioned with the aggregation multigrid of thermal-gpu (default; the Newton term is an extra diagonal, so
+  the hierarchy is rebuilt per step) or Jacobi; log damping of the steps.
 - Plasma dispersion at 1.55 um (Soref and Bennett 1987), from absolute concentrations (the hole term is
   P1^0.8 - P0^0.8). Each contact takes v_n or v_p from the sign of the doping under it.
 
@@ -45,5 +46,8 @@ loss change with the wrong sign: 1.17 to 1.83 V cm and "extra loss". The one rev
 
 ## Known limits and next steps
 
-- Jacobi CG needs many iterations (11k to 36k per bias point on 73k cells): a multigrid preconditioner is next.
+- Multigrid cut the CG iterations per bias point from 11k-36k (Jacobi) to 226-560 on 73k cells. The charge solve
+  of the modulator example (0, 1, 2, 4 V) took 2.1 s instead of 17.7 s on the Mac CPU (measured by the review of
+  this change: `reviews/2026-10-30-b648ae6b7661.md`). With Jacobi CG: 7.4 s on the GPU against 19.5 s on 16 CPU
+  threads (`benchmarks/2026-10-30/run-20261030-0626.jsonl`). GPU timings with multigrid: not run yet.
 - No forward bias, no currents, no 3-D, no temperature dependence.

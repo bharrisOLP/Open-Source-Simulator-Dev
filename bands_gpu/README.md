@@ -44,8 +44,13 @@ numbers carry the discretization error of resolution 32. This solver gives 0.281
 
 ## GPU timings (RX 7900 XT against the same algorithm on the 16 CPU threads of the same PC)
 
-Single precision, full k paths (`bench/bench_bands.py`). These runs used the solver before the A P fix (more
-iterations, the same on both devices): the speed-ups hold, the absolute times are now lower.
+Single precision, full k paths (`bench/bench_bands.py`; the JSON rows are in `benchmarks/2026-10-30/`). After the
+A P fix (about 50 iterations per k point, all k points converged; `run-20261030-0626.jsonl`): rods 128 x 128, 16 k
+points, GPU 5.2 s against CPU 60.3 s (11.7x); spheres 48^3, 13 k points, GPU 17.6 s (no CPU run).
+
+The table below used the solver before the A P fix (`bands-before-ap-fix.jsonl`): about 300 iterations per k point
+on both devices, and most runs stopped at the iteration limit before all k points converged. The ratios compare the
+same work on the two devices, but they are not timings of the current solver.
 
 | Case | Speed-up of the GPU |
 |---|---|

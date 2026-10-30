@@ -72,7 +72,7 @@ def test_matches_an_independent_sparse_newton_solve():
 
     dev, _ = junction(n=400)
     sol = solve(dev, 2.0, 0.0)
-    o = _operators(dev, 2.0, 0.0, np.float64)
+    o, (_, _, gc) = _operators(dev, 2.0, 0.0, np.float64)
     gx, diag, bc = (np.asarray(a)[:, 0] if np.asarray(a).ndim == 2 else np.asarray(a) for a in (o.gx, o.diag, o.bc))
     vol = np.asarray(o.vol)[:, 0]
     n_net = dev.n_net[:, 0]
@@ -89,3 +89,6 @@ def test_matches_an_independent_sparse_newton_solve():
         if np.max(np.abs(d)) < 1e-13:
             break
     assert np.max(np.abs(psi - np.asarray(sol.psi)[:, 0])) < 1e-8
+    assert np.count_nonzero(gc) == 2                            # one contact cell at each end of the 1-D junction
+    with pytest.raises(ValueError):
+        solve(dev, 2.0, 0.0, precond="amg")
