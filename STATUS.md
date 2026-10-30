@@ -46,6 +46,26 @@ mixed-precision eigenpair refinement (the FP64 polish is slow on RDNA3); bends a
   heater (published devices of this type: typically 20 to 30 mW).
 - Next: multigrid preconditioner; 3-D; GPU timings.
 
+**5. optics-gpu (the coupling use case of ZEMAX POP): version 0.1 works.** Folder: `optics_gpu/`.
+- Angular spectrum of the source, real rays through the lens system (Optiland, MIT), image field as a separable
+  ray sum on the GPU (PyTorch), coupling by overlap.
+- Checks: 4f imaging and analytic Gaussian coupling (1e-3), power conservation (1 %), and an aberrated singlet
+  against Optiland's independent Huygens PSF (correlation 0.998).
+- Example `examples/chip_to_fiber_coupling.py`: SiN tip mode (meow-gpu) through a 2.5x lens pair into SMF-28:
+  eta 0.889 at focus, with a focus scan (14 um mode window; an 8 um window cut the mode tails).
+- Next: Optiland's own ray trace on the GPU (PyTorch backend) for large ray counts; ROCm timings.
+
+**6. charge-gpu (reverse-biased PN junctions for depletion modulators): version 0.1 works.** Folder:
+`charge_gpu/`.
+- Nonlinear Poisson with constant quasi-Fermi levels, Newton with device-loop CG; plasma dispersion
+  (Soref-Bennett).
+- Checks: depletion width (Sze, 1 %), charge neutrality, an independent scipy Newton solve (1e-8 V); the
+  built-in potential as a consistency check.
+- Example `examples/pn_modulator.py`: V_pi L 1.39, 1.60, 1.96 V cm at 1, 2, 4 V for a synthetic SOI rib (published:
+  typically 1.5 to 3 V cm); the loss decreases by 1.0 to 2.8 dB/cm (fewer free carriers).
+- Not covered: forward bias and currents (drift-diffusion; DEVSIM stays the tool for that).
+- Next: multigrid preconditioner (thermal and charge share it).
+
 ## Queue (in order of work)
 
 The user asked to start with Meep and meow. After those two, the order is by complexity, the simplest first.
@@ -56,8 +76,8 @@ The user asked to start with Meep and meow. After those two, the order is by com
 | 2 | Meep (FDTD) | Meep (GPL-2); GPU forks: Erised add-on (Triton/CUDA), gpmeep (CUDA C++) | CuPy-ROCm + Triton-AMD, HIP, or fdtdx | very high | probe passed; **waits for the user** (third-party code) |
 | 3 | MPB (band and mode solver) | MPB (GPL-2) | plane-wave basis: FFT + block eigensolver in JAX | medium-high | v0.1 done (own code: `bands_gpu/`) |
 | 4 | Thermal | own finite-volume solver (femwell / scikit-fem as references) | CG on GPU (JAX) | medium | v0.1 done (`thermal_gpu/`) |
-| 5 | ZEMAX (ray + physical optics) | Optiland (MIT, PyTorch); prysm; dLux (JAX) | PyTorch / JAX on ROCm | medium | No open tool replaces Zemax POP; POP is FFT work |
-| 6 | Charge (drift-diffusion) | DEVSIM (Apache-2) | GPU sparse solver through the DEVSIM solver callback | high | FP64 and sparse LU: a poor fit for an RDNA3 card |
+| 5 | ZEMAX (ray + physical optics) | Optiland (MIT, PyTorch) + own physical optics | PyTorch on ROCm | medium | v0.1 done (`optics_gpu/`) |
+| 6 | Charge | own nonlinear Poisson (reverse bias); DEVSIM (Apache-2) for full drift-diffusion | CG on GPU (JAX) | high | v0.1 done for reverse bias (`charge_gpu/`) |
 | 7 | Tidy3D-like suite | fdtdx (MIT, JAX, ROCm) + items 1, 3, 4, 6 | JAX on ROCm | very high | One API over FDTD, mode, EME, heat and charge |
 
 "EME" and "FDTD" in the request of the user are items 1 and 2.
