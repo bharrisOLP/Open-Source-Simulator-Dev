@@ -70,8 +70,10 @@ def test_gradient_has_the_numpy_formulas(device):
 def test_device_pipeline_equals_numpy_pipeline(device, trace_chunk):
     """The 4f coupling into 3 fiber radii and the singlet PSF of tests/test_pop.py: the device pipeline (also in
     blocks of about 500 rays, which checks the halo rows of the Jacobian) against the NumPy pipeline. Observed
-    largest field differences (relative to the largest |E|): GPU 7e-16 (one block) and 1.3e-14 (blocks); CPU 9e-15
-    (4f) and 5.6e-12 (singlet: the PyTorch CPU trace differs from NumPy by up to 7e-14 mm of OPL); eta 4e-16."""
+    largest field differences (relative to the largest |E|; the device pipeline sums with image_planes, the NumPy
+    pipeline with _add_rays): GPU 9.8e-15 and 8.0e-15 (4f, one block and blocks), 1.2e-14 and 1.3e-14 (singlet);
+    CPU 8.6e-15 (4f) and 5.6e-12 (singlet: the PyTorch CPU trace differs from NumPy by up to 7e-14 mm of OPL); eta
+    4.4e-16."""
     src = gaussian(XS, XS, 6.0)
     a = propagate_through(four_f(), src, 0.5, WL, XI, XI, n_pad=4)
     b = propagate_through(four_f(), src, 0.5, WL, XI, XI, n_pad=4, trace_device=device, trace_chunk=trace_chunk)

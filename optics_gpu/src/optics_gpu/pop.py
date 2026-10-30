@@ -32,6 +32,13 @@ Two pipelines (propagate_through):
   central differences as one full grid), so the temporaries of the trace are bounded by trace_chunk rays. Only the
   kept rays stay in memory (RayBundle: L', M', N' and a, 40 bytes per ray). A RayBundle gives fields at more planes
   (dz) and on more grids without a new trace: focus and lateral scans on the device.
+
+The image sum of the device pipeline (image_planes; image_sum is one plane of it) computes all planes of a focus
+scan in one pass over the rays: per chunk of rays, the x factors of all planes are one (Z Nx x chunk) matrix, and
+its product with the y factors sums groups of GROUP_RAYS rays (one batched product for a small output); the groups
+are added in complex128.
+The groups give the GPU parallel work also for a small image (one 128 x 128 plane), and they keep the float32 sums
+short for the complex64 option.
 """
 
 from __future__ import annotations
@@ -45,6 +52,10 @@ import torch
 
 MM = 1e3          # um per mm (Optiland lens units are mm; wavelengths are um)
 SUM_ELEMENTS = 1 << 25   # (Nx + Ny) x chunk: the complex128 elements of ex and ey of one ray chunk (512 MB)
+GROUP_RAYS = 1024        # rays per group of image_planes (one matrix of the batched product; see _add_grouped)
+GROUP_OUTPUTS = 1 << 20  # image_planes: below Z Nx Ny = GROUP_OUTPUTS, one batched product for the groups of a chunk
+ALLOC_SLACK = 6 << 16    # complex128 values (6 MB): allocator rounding, up to 1 MB for each of 6 large temporaries
+PHASE32_MAX = 256.0      # rad: the largest grid phase k L' (x - xc) of the complex64 image sum (see image_planes)
 TRACE_RAYS = 1 << 21     # rays per block of the device trace, Jacobian and weights (see trace_bundle)
 COPY_TOL = 1e-9          # mm and direction cosines: the PyTorch copy of an optic against the original (check rays)
 N_CHECK = 25             # check rays of the PyTorch copy of an optic
@@ -233,9 +244,9 @@ def propagate_through(optic, e_src: np.ndarray, dx: float, wavelength: float, x_
     trace_device "cpu" or "cuda": the device pipeline (trace_bundle, then image_sum). All steps run on that
     device in float64 (Optiland's PyTorch backend for the trace); only the image field comes back to the host.
     trace_chunk: rays per block of the device trace (see trace_bundle).
-    ray_chunk: rays per chunk of the image sum, at least 1 (None: (Nx + Ny) x ray_chunk = SUM_ELEMENTS). The sum
-    keeps one chunk of ex and ey, (Nx + Ny) x ray_chunk complex128 values (512 MB for SUM_ELEMENTS), so that large
-    ray counts fit in memory."""
+    ray_chunk: rays per chunk of the image sum, at least 1. None: for the NumPy pipeline, (Nx + Ny) x ray_chunk =
+    SUM_ELEMENTS (the sum keeps one chunk of ex and ey, (Nx + Ny) x ray_chunk complex128 values, 512 MB for
+    SUM_ELEMENTS, so that large ray counts fit in memory); for the device pipeline, the chunk of image_planes."""
     from optiland.backend.utils import is_torch_tensor, to_numpy
 
     if ray_chunk is not None and ray_chunk < 1:
@@ -439,14 +450,171 @@ def trace_bundle(optic, e_src, dx: float, wavelength: float, na_cut: float = 0.9
     return RayBundle(blocks, wavelength, n_rays, nL * nM, dev, power / df)
 
 
-def image_sum(bundle: RayBundle, x_img, y_img, dz: float = 0.0, ray_chunk: int | None = None) -> torch.Tensor:
+def _grid(v, dev: torch.device, name: str) -> torch.Tensor:
+    """A grid axis or a list of planes (a number, a 1-D NumPy array or tensor) as a 1-D float64 tensor on dev;
+    a ValueError for more than one dimension (for example a meshgrid array)."""
+    t = torch.as_tensor(np.asarray(v) if not isinstance(v, torch.Tensor) else v, dtype=torch.float64, device=dev)
+    if t.dim() > 1:
+        raise ValueError(f"{name} has the shape {tuple(t.shape)}: give a 1-D axis (not a meshgrid array)")
+    return t.reshape(-1)
+
+
+def image_sum(bundle: RayBundle, x_img, y_img, dz: float = 0.0, ray_chunk: int | None = None,
+              dtype: torch.dtype = torch.complex128) -> torch.Tensor:
     """The field E (Nx, Ny), complex128 on the device of the bundle, on the grid (x_img, y_img) in um (NumPy
     arrays or tensors) in the plane at dz um after the image surface (dz < 0: before it):
     E(x, y) = sum_r a_r exp(i k (L'_r x + M'_r y + N'_r dz)). A plane wave per ray: this is the angular-spectrum
-    propagation of the field in image space (air). ray_chunk: as in propagate_through."""
+    propagation of the field in image space (air). One plane of image_planes (ray_chunk and dtype: see there)."""
+    one = dz.reshape(1) if isinstance(dz, torch.Tensor) else [float(dz)]
+    return image_planes(bundle, x_img, y_img, one, ray_chunk=ray_chunk, dtype=dtype)[0]
+
+
+def image_planes(bundle: RayBundle, x_img, y_img, dz, ray_chunk: int | None = None,
+                 dtype: torch.dtype = torch.complex128) -> torch.Tensor:
+    """The fields E (Z, Nx, Ny), complex128 on the device of the bundle, on the grid (x_img, y_img) in um in the Z
+    planes dz (um after the image surface; a number or a 1-D array or tensor):
+    E_z(x, y) = sum_r a_r exp(i k (L'_r x + M'_r y + N'_r dz_z)), the same sum as image_sum for each plane.
+
+    One pass over the rays for all planes. For each chunk of rays:
+    1. the weights of each plane, w_zr = a_r exp(i (k L'_r xc + k M'_r yc + k N'_r dz_z)), in float64 (the phase
+       reference: xc and yc are the centers of the grid axes; the large phases k N' dz stay in float64);
+    2. the grid factors exp(i k L'_r (x - xc)) (Nx, chunk) and exp(i k M'_r (y - yc)) (Ny, chunk) in dtype;
+    3. the x factors times the weights of all planes, one (Z Nx, chunk) matrix, and its product with the y factors
+       (_add_grouped): each group of GROUP_RAYS rays is summed in dtype, the groups in complex128 (one batched
+       product for Z Nx Ny < GROUP_OUTPUTS; else addmm_ into E for complex128, one product per group for complex64).
+
+    dtype: torch.complex128 (default; the reference precision) or torch.complex64 (steps 2 and 3 in float32). For
+    complex64 the largest grid phase theta = k max|L'| max|x - xc| (and the same in y) must be at most PHASE32_MAX
+    rad, else a ValueError stops it (this check reads one scalar from the device). The guard limits the phase, not
+    the error. By the usual rounding analysis (u = 2^-24, to first order), the x and y factors of a term have a
+    phase error of at most 3 theta u each (the rounding of k L', of x - xc and of their product), and the float32
+    sum of a group of n rays adds at most about n u of the sum of |terms|: |E64 - E128| <= about
+    (GROUP_RAYS + 6 PHASE32_MAX) u sum_r |a_r| = 1.5e-4 sum_r |a_r| (to a factor of order 1). Rounding errors of
+    random sign stay far below that bound; one plane wave (all rays the same) comes nearer to it.
+    tests/test_image_planes.py gives the observed values for the tested fields.
+
+    ray_chunk: rays per chunk, at least 1. None: _planes_step, the chunk whose temporaries (weights, factors,
+    products) are at most SUM_ELEMENTS complex128 values, a multiple of GROUP_RAYS when it is larger than
+    GROUP_RAYS. The result E (Z Nx Ny complex128 values) is outside that budget."""
+    if dtype not in (torch.complex128, torch.complex64):
+        raise ValueError(f"dtype {dtype}: use torch.complex128 or torch.complex64")
     dev = bundle.device
-    xi, yi = (torch.as_tensor(np.asarray(v) if not isinstance(v, torch.Tensor) else v, dtype=torch.float64,
-                              device=dev) for v in (x_img, y_img))
+    xi, yi, dzs = _grid(x_img, dev, "x_img"), _grid(y_img, dev, "y_img"), _grid(dz, dev, "dz")
+    nz, nx, ny = dzs.numel(), xi.numel(), yi.numel()
+    step = _planes_step(ray_chunk, nz, nx, ny, dtype)
+    E = torch.zeros((nz * nx, ny), dtype=torch.complex128, device=dev)
+    if E.numel() == 0 or bundle.n_rays == 0:
+        return E.reshape(nz, nx, ny)
+    real = torch.float64 if dtype == torch.complex128 else torch.float32
+    k = bundle.k
+    xc, yc = 0.5 * (xi.amin() + xi.amax()), 0.5 * (yi.amin() + yi.amax())      # 0-d tensors (no host copy)
+    ix, iy = 1j * (xi - xc).to(real), 1j * (yi - yc).to(real)                  # i (x - xc), in dtype
+    if dtype == torch.complex64:
+        _check_phase32(bundle, xi - xc, yi - yc)
+    kdz = k * dzs[:, None]
+    for Lo, Mo, No, ao in bundle.blocks:
+        for s in range(0, ao.numel(), step):
+            q, p = k * Lo[s:s + step], k * Mo[s:s + step]                     # k L', k M' (float64)
+            ph = kdz * No[None, s:s + step]                                    # (Z, chunk) float64
+            ph += q * xc + p * yc
+            w = 1j * ph
+            del ph
+            w = w.exp_().mul_(ao[None, s:s + step]).to(dtype)                 # (Z, chunk), the weights
+            ex = (ix[:, None] * q.to(real)[None, :]).exp_()                    # (Nx, chunk)
+            exz = ex.mul_(w) if nz == 1 else (w[:, None, :] * ex[None]).reshape(nz * nx, -1)   # (Z Nx, chunk)
+            del ex, w
+            ey = (iy[:, None] * p.to(real)[None, :]).exp_()                    # (Ny, chunk)
+            _add_grouped(E, exz, ey)
+            del exz, ey
+    return E.reshape(nz, nx, ny)
+
+
+def _planes_memory(nz: int, nx: int, ny: int, dtype: torch.dtype) -> tuple[float, float]:
+    """The temporaries of one chunk of image_planes, in complex128 values: (per ray, fixed). Per ray, the largest of
+    the three steps of a chunk (each with the vectors k L', k M' and their float32 copies, 2.5 values):
+    - the weights: the phase (Z, float64) and exp(i phase) (Z, complex128), then the weights in dtype: 1.5 Z;
+    - the x factors (Nx), the weights (Z) and the x factors of all planes (Z Nx), in dtype;
+    - the products: the x factors of all planes and the y factors (Z Nx + Ny) in dtype; with groups in one batched
+      product (Z Nx Ny < GROUP_OUTPUTS), also the products of the groups (Z Nx Ny / GROUP_RAYS per ray; in dtype,
+      and for complex64 their complex128 copy, made by sum with dtype).
+    Fixed: with groups in one batched product, the sum of the groups (Z Nx Ny, complex128; the product of a last
+    short group is smaller and comes after it); else, for complex64, the product of one group (Z Nx Ny,
+    complex64); complex128 without groups adds into E in place (addmm_). Also ALLOC_SLACK for the rounding of the
+    PyTorch caching allocator (a block can be up to 1 MB larger than the tensor)."""
+    size = 1.0 if dtype == torch.complex128 else 0.5
+    out = nz * nx * ny
+    weights = 1.5 * nz
+    factors = size * (nx + nz + nz * nx) if nz > 1 else size * (nx + 1)
+    products = size * (nz * nx + ny)
+    if out < GROUP_OUTPUTS:
+        products += (size + (dtype == torch.complex64)) * out / GROUP_RAYS
+        fixed = float(out)
+    else:
+        fixed = size * out if dtype == torch.complex64 else 0.0
+    return max(weights, factors, products) + 2.5, fixed + ALLOC_SLACK
+
+
+def _planes_step(ray_chunk: int | None, nz: int, nx: int, ny: int, dtype: torch.dtype) -> int:
+    """The rays per chunk of image_planes: ray_chunk, or (None) the most rays whose temporaries (_planes_memory) are
+    at most SUM_ELEMENTS complex128 values, a multiple of GROUP_RAYS when it is larger. If the fixed part alone is
+    above SUM_ELEMENTS (complex64 with E above 2 SUM_ELEMENTS values, 1 GB), the chunk is GROUP_RAYS rays and the
+    temporaries are above the budget."""
+    if ray_chunk is not None:
+        if ray_chunk < 1:
+            raise ValueError(f"ray_chunk {ray_chunk}: use an integer of at least 1, or None")
+        return ray_chunk
+    per_ray, fixed = _planes_memory(nz, nx, ny, dtype)
+    if fixed >= SUM_ELEMENTS:
+        return GROUP_RAYS
+    step = max(1, int((SUM_ELEMENTS - fixed) / per_ray))
+    return step - step % GROUP_RAYS if step > GROUP_RAYS else step
+
+
+def _add_grouped(E: torch.Tensor, u: torch.Tensor, v: torch.Tensor) -> None:
+    """E (P, Q, complex128) += u @ v.T for u (P, c) and v (Q, c) of one dtype, the c rays in groups of GROUP_RAYS
+    (a last group can have fewer rays): each group summed in the dtype of u and v, the groups added in complex128.
+    - P Q < GROUP_OUTPUTS: one batched product of all full groups (more parallel work for the GPU), then the sum
+      of the groups in complex128, and one more product for a last short group;
+    - else: complex128 adds the whole chunk into E in place (addmm_; the matrix product has enough parallel work,
+      and float64 needs no groups); complex64 adds one product per group."""
+    (P, c), Q = u.shape, v.shape[0]
+    if P * Q >= GROUP_OUTPUTS:
+        if u.dtype == torch.complex128:
+            E.addmm_(u, v.T)
+        else:
+            for g in range(0, c, GROUP_RAYS):
+                E += u[:, g:g + GROUP_RAYS] @ v[:, g:g + GROUP_RAYS].T
+        return
+    nb = c // GROUP_RAYS
+    n = nb * GROUP_RAYS
+    if nb:
+        ub = u[:, :n].reshape(P, nb, GROUP_RAYS).transpose(0, 1)                # (nb, P, G): views, no copy
+        vb = v[:, :n].reshape(Q, nb, GROUP_RAYS).permute(1, 2, 0)               # (nb, G, Q)
+        E += torch.bmm(ub, vb).sum(0, dtype=torch.complex128)
+    if n < c:
+        if u.dtype == torch.complex128:
+            E.addmm_(u[:, n:], v[:, n:].T)
+        else:
+            E += u[:, n:] @ v[:, n:].T
+
+
+def _check_phase32(bundle: RayBundle, xr: torch.Tensor, yr: torch.Tensor) -> None:
+    """ValueError if a grid phase k L' (x - xc) or k M' (y - yc) of the complex64 image sum is larger than
+    PHASE32_MAX rad (one scalar comes to the host)."""
+    lm = torch.stack([torch.stack([b[0].abs().amax(), b[1].abs().amax()]) for b in bundle.blocks if b[0].numel()])
+    phase = bundle.k * torch.maximum(lm[:, 0].amax() * xr.abs().amax(), lm[:, 1].amax() * yr.abs().amax())
+    worst = float(phase)
+    if not worst <= PHASE32_MAX:
+        raise ValueError(f"the largest grid phase of the complex64 image sum is {worst:.0f} rad (limit "
+                         f"{PHASE32_MAX:.0f}): use dtype=torch.complex128, or a smaller image grid")
+
+
+def _image_sum_direct(bundle: RayBundle, x_img, y_img, dz: float = 0.0,
+                      ray_chunk: int | None = None) -> torch.Tensor:
+    """The reference of image_planes, one plane: the image sum of the NumPy pipeline (_add_rays: one matrix product
+    per chunk of rays, complex128, the phases k L' x without a reference) with the weights a exp(i k N' dz)."""
+    dev = bundle.device
+    xi, yi = _grid(x_img, dev, "x_img"), _grid(y_img, dev, "y_img")
     step = _sum_step(ray_chunk, xi, yi)
     k = bundle.k
     E = torch.zeros((xi.numel(), yi.numel()), dtype=torch.complex128, device=dev)
@@ -461,7 +629,13 @@ def overlap_efficiency_device(e: torch.Tensor, f: torch.Tensor, power=None) -> t
     """overlap_efficiency on the device: |<f, e>|^2 / (P <f, f>), a 0-d float64 tensor. P: power (a sum of |E|^2
     over grid samples), or None for <e, e> (the power on the grid only). The power on a grid is lower than the
     total power by the part that is off the grid; that part changes with dz (wide angles leave the grid). For
-    eta against the total power, give power=bundle.power / (dx dy) (RayBundle.power, grid pitch dx x dy)."""
+    eta against the total power, give power=bundle.power / (dx dy) (RayBundle.power, grid pitch dx x dy).
+    e can also be a stack of fields (Z, Nx, Ny) on the grid of f (image_planes): then the result is a (Z,) tensor,
+    one eta per plane (power: None for the power of each plane, or one power for all planes)."""
+    if e.dim() == f.dim() + 1:
+        ez, fv = e.reshape(e.shape[0], -1), f.reshape(-1)
+        p = (ez.real**2 + ez.imag**2).sum(1) if power is None else power
+        return (ez @ fv.conj()).abs() ** 2 / (p * torch.vdot(fv, fv).real)
     p = torch.vdot(e.ravel(), e.ravel()).real if power is None else power
     return torch.vdot(f.ravel(), e.ravel()).abs() ** 2 / (p * torch.vdot(f.ravel(), f.ravel()).real)
 

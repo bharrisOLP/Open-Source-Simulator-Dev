@@ -11,9 +11,11 @@ img = propagate_through(optic, source_field, dx_um, wavelength_um, x_img_um, y_i
 eta = overlap_efficiency(img.E, gaussian(x_img_um, y_img_um, 5.2))                      # into SMF-28 (MFD 10.4 um)
 img = propagate_through(..., trace_device="cuda")    # all steps on the GPU (the device pipeline, float64)
 
-from optics_gpu.pop import image_sum, lateral_scan, overlap_efficiency_device, trace_bundle
+from optics_gpu.pop import image_planes, image_sum, lateral_scan, overlap_efficiency_device, trace_bundle
 bundle = trace_bundle(optic, source_field, dx_um, wavelength_um, device="cuda")   # trace one time
 E = image_sum(bundle, x_img_um, y_img_um, dz=20.0)       # the field 20 um after the image surface, on the GPU
+stack = image_planes(bundle, x_img_um, y_img_um, np.linspace(-60, 60, 25))      # 25 planes in one pass (Z, Nx, Ny)
+eta_z = overlap_efficiency_device(stack, fiber_mode, power=p0)                  # one eta per plane
 ```
 
 ## Method (`src/optics_gpu/pop.py`)
@@ -25,7 +27,8 @@ E = image_sum(bundle, x_img_um, y_img_um, dz=20.0)       # the field 20 um after
 3. Image field E(x, y) = sum_r A_r sqrt(J_r) df exp(i k (W_r + L'_r (x - x_r) + M'_r (y - y_r))), with
    J = |d(L', M')/d(L, M)| (power conservation per ray tube). The sum is separable in x and y: one matrix
    product on the GPU, in chunks of rays (`ray_chunk`; by default (Nx + Ny) x chunk = 2^25). The sum keeps one
-   chunk of the x and y factors in memory: (Nx + Ny) x chunk complex128 values, 512 MB by default.
+   chunk of the x and y factors in memory: (Nx + Ny) x chunk complex128 values, 512 MB by default. This is the
+   sum of the NumPy pipeline; the device pipeline uses `image_planes` (see "Focus scans in one pass").
 4. Coupling efficiency by the normalized overlap with the receiving mode.
 
 Valid for a source that is small compared with the isoplanatic patch of the system (true for micrometer modes).
@@ -71,10 +74,12 @@ device pipeline: all steps run on that device in float64, and only the image fie
 3. Only the kept rays stay in memory: a `RayBundle` of L', M', N' and the weights a (40 bytes per ray), in blocks.
    `RayBundle.power` is the power of the kept rays by Parseval (sum of |A df|^2 / df, in um^2 times the field
    squared): it does not depend on an image grid or on dz.
-4. `image_sum(bundle, x, y, dz)`: E = sum_r a_r exp(i k (L'_r x + M'_r y + N'_r dz)), in chunks of rays as
-   before. One plane wave per ray, so `dz` is the angular-spectrum propagation in image space: a focus scan needs
-   one trace and one image sum per plane. `lateral_scan` gives the coupling into a Gaussian mode moved to every
-   point of a 2-D grid of lateral offsets with two matrix products (the Gaussian is separable).
+4. `image_sum(bundle, x, y, dz)`: E = sum_r a_r exp(i k (L'_r x + M'_r y + N'_r dz)). One plane wave per ray, so
+   `dz` is the angular-spectrum propagation in image space: a focus scan needs one trace. `image_planes(bundle, x,
+   y, dzs)` computes all planes of a focus scan in one pass over the rays (see "Focus scans in one pass");
+   `image_sum` is one plane of it. `overlap_efficiency_device` takes the stack (Z, Nx, Ny) and gives one eta per
+   plane. `lateral_scan` gives the coupling into a Gaussian mode moved to every point of a 2-D grid of lateral
+   offsets with two matrix products (the Gaussian is separable).
 
 The data that come to the host inside the device pipeline are the 25 check rays of the copy of the optic and
 scalars: the bounding box, and about 50 scalars per block from Optiland's own tests in its trace (observed).
@@ -87,7 +92,51 @@ method by 7.8e-4 at dz = 60 um; normalized by p0, the power on the grid at the i
 by 5.9e-11. That agreement shows that the two propagation methods agree with the same normalization. It does not
 show that p0 is the total power (see the example).
 
-## Checks (`tests/test_pop.py`, `tests/test_trace_backends.py`, `tests/test_device_pipeline.py`)
+## Focus scans in one pass (`image_planes` in `src/optics_gpu/pop.py`)
+
+`image_planes(bundle, x, y, dzs, ray_chunk=None, dtype=torch.complex128)` gives the fields of Z planes, a (Z, Nx, Ny)
+complex128 tensor, in one pass over the rays. `image_sum` is one plane of it. For each chunk of rays:
+
+1. The weights of each plane, w_zr = a_r exp(i (k L'_r xc + k M'_r yc + k N'_r dz_z)), in float64. xc and yc are
+   the centers of the grid axes (the phase reference). The large phases (k N' dz, and k W in a) stay in float64.
+2. The grid factors exp(i k L'_r (x - xc)) (Nx x chunk) and exp(i k M'_r (y - yc)) (Ny x chunk), in `dtype`.
+3. The x factors times the weights of all planes make one (Z Nx x chunk) matrix. Its product with the y factors
+   sums groups of `GROUP_RAYS` = 1024 rays, and the groups are added in complex128. For Z Nx Ny below
+   `GROUP_OUTPUTS` = 2^20, one batched matrix product computes all groups of the chunk. For a larger output, the
+   matrix product has enough parallel work: complex128 adds the whole chunk into E in place (`addmm_`, float64
+   needs no groups), and complex64 adds one product per group.
+
+The arithmetic of the matrix products is the same as for one sum per plane (8 Nx Ny floating-point operations
+per ray and plane). The gain is that the GPU gets more parallel work: Z Nx rows instead of Nx, and one matrix per
+group. The earlier sum gave only a 128 x 128 output per product for the GPU, and one long sum over all rays of the
+chunk. The grid factors are computed one time for all planes. In complex128 the batched sum does 0.92e12
+operations per second (the 1e6-ray rows below: 5.28e5 rays x 8 x 128^2 in 0.075 s per plane); complex64 is 8.5x
+faster.
+
+`dtype=torch.complex64` does steps 2 and 3 in float32. `PHASE32_MAX` = 256 rad limits the largest grid phase
+theta = k max|L'| max|x - xc| (and the same in y): above it, a ValueError stops the sum (this check reads one
+scalar from the GPU). The guard limits the phase, not the error. Two errors come from float32 (u = 2^-24):
+- the rounding of the grid phases: at most about 3 theta u for the x factor and the same for the y factor;
+- the float32 sum of a group of n rays: at most about n u of the sum of |terms|.
+To first order, |E64 - E128| <= about (`GROUP_RAYS` + 6 `PHASE32_MAX`) u sum_r |a_r| = 1.5e-4 sum_r |a_r|. The
+size of the error depends on the field. Rounding errors of random sign stay far below the bound. One plane wave
+(2e4 equal rays at a grid phase of 243 rad, all with the same rounding errors) gave 3.3e-5 of sum_r |a_r| on the
+GPU (`test_complex64_error_of_one_plane_wave_is_within_the_bound`).
+
+For the tested focused fields, the coupling efficiency with complex64 differs from complex128 by at most 3.3e-7
+(a uniform pupil of NA 0.6 at a grid phase of 243 rad, with one power for all planes, as in a focus scan), and by
+8.3e-8 or less in the other checks. The bench differs by 6.4e-9 at 1e7 rays, and the focus scan of the example by
+8.8e-8. These values hold only for these fields. The default stays complex128.
+
+The default chunk keeps the temporaries of one chunk (the weights, the factors and the products) at most
+`SUM_ELEMENTS` complex128 values (512 MB). `_planes_memory` gives the model: per ray, the largest of the three
+steps of a chunk (the weights need 1.5 Z complex128 values per ray before they are cast to `dtype`); fixed, the sum
+of the groups (Z Nx Ny complex128 values) or, for complex64 without batched groups, the product of one group; and
+6 MB for the rounding of the PyTorch caching allocator. The result E (Z Nx Ny complex128 values) is outside that
+budget. Exception: for complex64 with E above 1 GB, the product of one group alone is above the budget; then the
+chunk is `GROUP_RAYS` rays, and the peak is above the budget.
+
+## Checks (`tests/`: `test_pop.py`, `test_trace_backends.py`, `test_device_pipeline.py`, `test_image_planes.py`)
 
 | Case | Reference | Agreement (observed; test tolerance) |
 |---|---|---|
@@ -96,7 +145,7 @@ show that p0 is the total power (see the example).
 | power through the lossless 4f system | integral of \|E\|^2 at the source | (1 %) |
 | point source through a plano-convex singlet at 2f-2f, strong spherical aberration (6 mm stop) | Optiland's scalar Huygens PSF (independent method) | correlation 0.998 (0.99) |
 | PyTorch-backend trace (float64) of 101 x 101 directions, \|L\|, \|M\| <= 0.09, through the 4f system and the singlet (the stop clips about half of them), on the CPU and on the GPU | Optiland's NumPy-backend trace of the same rays | GPU: 0. CPU: positions 7e-15 mm, directions 9e-16, OPL 4e-14 mm, intensity 0 (1e-12 mm and 1e-12); the same NaN rays |
-| the 4f coupling into 3 fiber radii and the singlet PSF field, traced by PyTorch (CPU and GPU) | the same with the NumPy trace | eta: 0 (1e-12); field: GPU 0, CPU 3.6e-12 relative (1e-9); the NumPy values are the same as before this change: eta 0.99998, 0.95324, 0.93319 |
+| the 4f coupling into 3 fiber radii and the singlet PSF field, traced by PyTorch (CPU and GPU) | the same with the NumPy trace | eta: 4.4e-16 (1e-12); field: GPU 1.2e-14, CPU 5.6e-12 relative (1e-9) (the PyTorch trace goes through the device pipeline and its image sum, `image_planes`); the NumPy values are the same as before this change: eta 0.99998, 0.95324, 0.93319 |
 | image sum in 12 chunks of 401 rays (4f, 4501 rays) | one sum | 9e-15 relative (1e-12) |
 | peak GPU memory of the image sum, 4f, chunks of 2048 rays, 128 x 128 image | one chunk of the x and y factors, (128 + 128) x 2048 complex128 values | 1.08x (below 1.3x) |
 | `ray_chunk` 0 and -1 | (an all-zero field before the one review) | ValueError |
@@ -104,7 +153,7 @@ show that p0 is the total power (see the example).
 | a NumPy optic while Optiland's PyTorch backend (float32) is active | the NumPy trace | the check rays run on NumPy; passes (1e-12) |
 | a PyTorch copy of the optic with the image surface moved by 10 um | the check rays of `trace_rays` | RuntimeError |
 | `_np_gradient0` on a uniform axis, the `fftshift(fftfreq)` axis and a random axis, along both axes (CPU, GPU) | `np.gradient` | (1e-13 relative) |
-| device pipeline: the 4f coupling into 3 fiber radii and the singlet PSF field, in one block and in blocks of about 500 rays (CPU, GPU) | the NumPy pipeline | field, GPU: 7e-16 (one block), 1.3e-14 (blocks); CPU: 9e-15 (4f), 5.6e-12 (singlet) (4f 1e-12, singlet 1e-9); eta 4e-16 (1e-12); the same ray counts |
+| device pipeline: the 4f coupling into 3 fiber radii and the singlet PSF field, in one block and in blocks of about 500 rays (CPU, GPU) | the NumPy pipeline | field, GPU: 9.8e-15 and 8.0e-15 (4f, one block and blocks), 1.2e-14 and 1.3e-14 (singlet); CPU: 8.6e-15 (4f), 5.6e-12 (singlet) (4f 1e-12, singlet 1e-9); eta 4.4e-16 (1e-12); the same ray counts |
 | device PSF of the singlet, blocks of about 4000 rays | Optiland's Huygens PSF | correlation (0.99) |
 | `trace_bundle` and `image_sum` on the GPU, 4f, point source, 5.5e4 rays in 8 blocks, watched by a `TorchFunctionMode` | no large tensor made on the CPU; arrays to the host only of the 25 check rays; scalars bounded per block | 20 arrays of 25 values (at most 40); 421 scalars (at most 60 per block + 20) |
 | the watch itself: 10 forms of a copy of 30 values to the host (`cpu`, `to` with a device name, a device, a keyword, a dtype or a CPU tensor, `tolist`, `numpy`, `copy_`, `Tensor.cpu`) and 4 forms of a scalar | | each form is seen |
@@ -114,11 +163,18 @@ show that p0 is the total power (see the example).
 | focus scan by `image_sum(dz)`, 4f image of a 6 um Gaussian into a 15 um Gaussian mode, dz -300 to 400 um (CPU, GPU) | 1 / (1 + (lambda dz / (2 pi w^2))^2); the FFT angular-spectrum propagation of the dz = 0 field | 1.4e-3 (2e-3); FFT: 1.5e-6 (1e-5), 2.7e-7 with the power at dz = 0 (1e-6) |
 | `lateral_scan`, offsets -10 to 8 um in x and y | exp(-s^2 / w^2) times the centered value; `overlap_efficiency` of the moved mode | 8.1e-4 (2e-3); 3e-16 (1e-12) |
 | bad inputs of the device pipeline ("mps", `trace_chunk` 0, no kept direction, `ray_chunk` 0) | | ValueError |
+| `image_planes`: 3000 random rays in 2 blocks, a non-uniform x grid, a y grid off the axis, 4 planes; groups of 256 rays, chunks of 1000 and 700 rays (short last groups); batched groups and the path for large outputs (`GROUP_OUTPUTS` patched to 1) (CPU, GPU) | the plane-wave sum in NumPy (all rays at one time, no phase reference) | complex128 4.1e-14 (1e-12); complex64 5.9e-7 (1e-5); `image_sum` and the per-plane sum: the same |
+| focus scan of 21 planes (dz -80 to 80 um) in one pass: the 4f image of a Gaussian with a curved wavefront, the singlet PSF (CPU, GPU) | one sum per plane with the sum of the NumPy pipeline | field: GPU 1.0e-14 (4f), 1.3e-14 (singlet); CPU 2.0e-15, 2.8e-15 (1e-12); eta of the stack against eta per plane 1.4e-14 or less (1e-12) |
+| complex64 against complex128, 9 planes: the 4f image with a curved wavefront, the singlet PSF, a Gaussian focus with rays up to the direction cosine 0.6; 3 planes: a uniform pupil of NA 0.6 (equal weights, 7.1e4 rays); the last two on a 201 x 201 um grid (grid phase 243 rad) (CPU, GPU) | complex128 | GPU: \|d eta\| with the power of each plane / with one power: 3.7e-9 / 8.3e-8 (4f), 1.2e-8 / 1.6e-8 (singlet), 1.2e-8 / 1.2e-8 (Gaussian focus), 9.9e-8 / 3.3e-7 (uniform pupil) (1e-6); field 1.5e-6, 1.1e-6, 4.0e-7, 1.8e-6 (2e-5) |
+| complex64, one plane wave: 2e4 equal rays (L' 0.5, M' 0.3), grid +-120 um (grid phase 243 rad) (CPU, GPU) | the bound (`GROUP_RAYS` + 6 `PHASE32_MAX`) 2^-24 sum \|a\| = 1.5e-4 sum \|a\| | GPU 3.3e-5, CPU 2.1e-5 of sum \|a\| |
+| complex64 with a grid phase of 316 rad (above `PHASE32_MAX`) | | ValueError; complex128 gives a finite field |
+| peak GPU memory of `image_planes` minus E, default chunk, several chunks (GPU): 41 planes 128 x 128 (budget 2^22 values; complex128, complex64), 21 planes 128 x 128 (2^25; both), 9 planes 512 x 256 (2^22; both), 41 planes 512 x 512 complex64, 101 planes 512 x 512 complex128, 1000 planes on a 1 x 1 grid complex64 (2^25) | the budget, `SUM_ELEMENTS` complex128 values | 0.67, 0.63; 0.97, 0.95; 0.91, 0.74; 0.82; 0.99; 0.96 of the budget (0.5 to 1, no tolerance). Before the one review: 1.13 (41 x 512 x 512 complex64), 1.45 (101 x 512 x 512), 1.28 (1000 x 1 x 1), in the review record |
+| bad inputs of `image_planes` (`dtype` float64, `ray_chunk` 0, a 2-D `x_img`, `y_img` or `dz`, for example a meshgrid array) | | ValueError; an empty list of planes gives a (0, Nx, Ny) result |
 
 All tests ran on the GPU computer (RX 7900 XT; `.venv-optics` from `tools/env/optics_rocm.sh`, PyTorch 2.14.1 for
-ROCm 7.2): 35 passed (`tests/test_device_pipeline.py`: 18). The observed values of the rows from "PyTorch-backend
-trace" down come from the same computer. The NumPy pipeline gives the same values as before the device pipeline:
-eta 0.99998, 0.95324, 0.93319 in the 4f check.
+ROCm 7.2): 65 passed (`tests/test_device_pipeline.py`: 18, `tests/test_image_planes.py`: 30). The observed values
+of the rows from "PyTorch-backend trace" down come from the same computer. The NumPy pipeline gives the same values
+as before the device pipeline: eta 0.99998, 0.95324, 0.93319 in the 4f check.
 
 The Gaussian-beam formulas are textbook results for two Gaussian beams of equal radius (for example Saleh and
 Teich, Fundamentals of Photonics, chapter 3). The focus check differs by 1.4e-3 because the image of the
@@ -184,7 +240,37 @@ pipeline traces with NumPy and sums the image on the GPU, the device pipeline do
 The field difference is `max_rel_dE` of the rows: the largest |E_device - E_NumPy| relative to the largest |E|
 (the GPU trace itself differs from the NumPy trace by 0; the sums run in a different order). The device pipeline
 is 1.40x to 1.85x faster from 1e6 rays on. From 1e6 rays on, the image sum is 93 % to 97 % of the time of the
-device pipeline (the next target); at 1e5 rays it is 70 % (singlet) and 80 % (4f).
+device pipeline; at 1e5 rays it is 70 % (singlet) and 80 % (4f). These rows are from before `image_planes`: the
+image sum of one plane is now 2.1x to 2.2x faster (`single_s` against `per_plane_s` in the next section).
+
+## Focus-scan timings (`bench/bench_image_sum.py`)
+
+A point source through the singlet (as in `bench/bench_pipeline.py`, 128 x 128 image points, pitch 1 um), traced
+one time; Z planes evenly from dz = -100 to +100 um. Time per plane: one sum per plane with the earlier method
+(`per_plane_s`, the sum of the NumPy pipeline: one complex128 matrix product per chunk), `image_sum` (one plane of
+`image_planes`, complex128), and `image_planes` for all Z planes in complex128 and complex64. The per-plane
+methods are timed on 3 planes (on 1 for Z = 1); `image_planes` on all planes (best of 2 runs).
+
+GPU (RX 7900 XT; `bench/bench_image_sum.py --rays 1e5 1e6 1e7 --planes 1 21 41`, run on 2026-10-30; rows in
+`benchmarks/2026-10-30/optics-image-sum.jsonl`):
+
+| Rays traced (kept) | Planes | One sum per plane | `image_sum` | `image_planes`, complex128 | `image_planes`, complex64 | Faster: complex128 / complex64 (`speedup_c128` / `speedup_c64`) |
+|---|---|---|---|---|---|---|
+| 1e5 (5.3e4) | 1 | 24.0 ms | 11.6 ms | 11.7 ms | 1.49 ms | 2.05x / 16.09x |
+| 1e5 (5.3e4) | 21 | 23.7 ms | 11.5 ms | 7.55 ms | 0.85 ms | 3.14x / 27.99x |
+| 1e5 (5.3e4) | 41 | 23.8 ms | 11.4 ms | 7.55 ms | 0.89 ms | 3.15x / 26.64x |
+| 1e6 (5.3e5) | 1 | 236 ms | 109 ms | 108 ms | 13.8 ms | 2.17x / 17.06x |
+| 1e6 (5.3e5) | 21 | 236 ms | 108 ms | 74.9 ms | 8.81 ms | 3.14x / 26.73x |
+| 1e6 (5.3e5) | 41 | 236 ms | 109 ms | 74.9 ms | 8.77 ms | 3.15x / 26.84x |
+| 1e7 (5.3e6) | 1 | 2.36 s | 1.08 s | 1.08 s | 0.142 s | 2.18x / 16.67x |
+| 1e7 (5.3e6) | 21 | 2.36 s | 1.08 s | 0.752 s | 0.0883 s | 3.14x / 26.76x |
+| 1e7 (5.3e6) | 41 | 2.36 s | 1.08 s | 0.752 s | 0.0880 s | 3.14x / 26.83x |
+
+A focus scan of 41 planes at 1e7 rays takes 31 s in complex128 and 3.6 s in complex64, against 97 s with one sum
+per plane. Agreement with one sum per plane (all rows): the field differs by at most 3.3e-14 (complex128) and
+5.6e-7 (complex64) relative to the largest |E|; the coupling into a Gaussian mode of radius 8 um by at most
+5.8e-16 (complex128) and 3.2e-9 (complex64). Between complex64 and complex128 over all planes, with one power for
+all planes (the 1e7 rows only): 6.4e-9.
 
 ## Example: focus and lateral scans on the GPU (`examples/coupling_scans_on_device.py`)
 
@@ -202,8 +288,14 @@ eta 0.8888 at the image surface (the earlier example: 0.889), the best plane at 
 dz = +-60 um; the 1 dB full width of the lateral scan 5.30 um (linear interpolation between the scan points; 5.25 um
 is the span of the 0.25 um scan points within 1 dB). Against the host reference (the NumPy pipeline, the FFT focus
 scan and NumPy overlaps): 5.9e-11 (focus), 1.4e-15 (lateral). Time per scan point (the last row of
-`optics-pipeline.jsonl`): 5.0 ms per focus plane on the GPU against 8.9 ms for the NumPy FFT focus scan; 0.8 us per
+`optics-pipeline.jsonl`): 5.0 ms per focus plane on the GPU against 8.9 ms for the NumPy FFT focus scan; 0.57 us per
 lateral point.
+
+With `image_planes` (the last row of `optics-image-sum.jsonl`, a run of the example on 2026-10-30): 1.6 ms per
+focus plane in complex128 and 0.18 ms in complex64, against 5.0 ms with one sum per plane (the earlier method, in
+the same run); 0.55 us per lateral point. The efficiencies are the same as above (eta 0.8888 at the image
+surface, 0.6667 at dz = +-60 um). The focus scan in one pass differs from one sum per plane by 6.7e-16, complex64
+from complex128 by 8.8e-8; against the host reference 5.9e-11 (focus) and 1.3e-15 (lateral).
 
 The efficiencies use p0, the power on the 64 um image grid at the image surface, for all planes. p0 is not the
 total power, and the normalization of eta is uncertain by about 5e-4 here (`n_pad` 4):
@@ -237,4 +329,6 @@ earlier example interpolates it: the major field component on the cell centers o
 
 ## Next
 
-- A larger image grid or many planes in one image sum (a batch of dz values in one matrix product).
+- A non-uniform FFT (type 1) for the image sum: the direct sum costs 8 Nx Ny operations per ray and plane, a
+  non-uniform FFT about (spread width)^2 per ray and one FFT per plane. It would help large image grids.
+- `propagate_through` and `bench/bench_pipeline.py` with the complex64 option of the image sum.
