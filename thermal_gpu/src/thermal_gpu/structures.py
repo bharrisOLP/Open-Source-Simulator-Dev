@@ -1,8 +1,32 @@
 """Synthetic heater structures: 2-D cross-sections and a 3-D finite-length heater (textbook conductivities;
-no process data)."""
+no process data).
+
+Volumetric heat capacities rho c_p (J/m^3/K) at 300 K, from Incropera et al., "Fundamentals of Heat and Mass
+Transfer", Tables A.1 (Si, tungsten) and A.2 (fused silica): Si 2330 x 712, fused silica (SiO2) 2220 x 745, and
+tungsten 19300 x 132 for the
+heater metal (a generic metal: its conductivity here is K_METAL, not that of tungsten)."""
 import numpy as np
 
 K_SI, K_SIO2, K_METAL = 148.0, 1.4, 100.0
+RHO_CP_SI, RHO_CP_SIO2, RHO_CP_METAL = 2330.0 * 712.0, 2220.0 * 745.0, 19300.0 * 132.0
+SI, SIO2, METAL = 0, 1, 2          # material labels (material_labels)
+
+
+def material_labels(kappa) -> np.ndarray:
+    """The material label of each cell of a structure of this module (SI, SIO2 or METAL), found from its
+    conductivity (K_SI, K_SIO2 or K_METAL). ValueError for an other value."""
+    kappa = np.asarray(kappa, float)
+    labels = np.full(kappa.shape, -1)
+    for lab, k in ((SI, K_SI), (SIO2, K_SIO2), (METAL, K_METAL)):
+        labels[kappa == k] = lab
+    if np.any(labels < 0):
+        raise ValueError("a cell has a conductivity that is not K_SI, K_SIO2 or K_METAL")
+    return labels
+
+
+def heat_capacity(kappa) -> np.ndarray:
+    """rho c_p (J/m^3/K) of each cell of a structure of this module."""
+    return np.array([RHO_CP_SI, RHO_CP_SIO2, RHO_CP_METAL])[material_labels(kappa)]
 
 
 def heater_stack(dx=0.02e-6, width=10e-6, box=2.0e-6, top_ox=2.2e-6, sub=3.0e-6, heater_w=2.0e-6, heater_t=0.1e-6,
