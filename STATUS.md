@@ -87,9 +87,16 @@ CG iterations per bias point instead of 11k to 36k; 2.1 s instead of 17.7 s on t
 - **Finding (resolved): EME against FDTD on a 10 um Si taper (0.5 -> 2.0 um).** meow EME gave T00 = 0.955 and the
   calibrated FDTD 0.997. Cause: meow 0.15 averages the neff of the higher modes in its Gram-Schmidt step
   (`docs/upstream-issues.md`). With the correction in meow-gpu: EME 0.9867 / 0.9900 / 0.9912 at 30 / 60 / 120
-  cells; FDTD 0.9945 at 20 nm (0.997 to 0.998 at 25 nm, where its flux transmission is 1.0014). Agreement within
-  about 0.5 %. Also found: meow drops polygon prisms along z (corrected in the EME adapter).
-- Next: layer stacks from a GDS cross-section; Polygon in the FDTD adapter.
+  cells; FDTD 0.9961 at 20 nm (0.997 to 0.998 at 25 nm; its flux transmission is 1.0003 to 1.002). Agreement
+  within about 0.5 %. Also found: meow drops polygon prisms along z (corrected in the EME adapter).
+- `Polygon` in the FDTD adapter (exact cells at the cell centers; staircase fdtdx polygons on grid edges; no
+  sub-pixel smoothing). A taper with 80 degree sidewalls: EME 0.9878 (0.10 % below vertical walls), FDTD 0.9975 at
+  20 nm (0.14 % above): the sign of this small change is below the accuracy of the comparison.
+- FDTD adapter fixes: each shape fills exactly the cells of its centers (segments of 2.5 cells left oxide gaps:
+  T_flux 0.44 at 40 nm; sloped polygons moved by up to half a cell), the run on the GPU (after an EME run in the
+  same process it was 9 to 13 times slower), a whole number of cells per axis, and clear errors for segments shorter
+  than the step. The FDTD rows were run again (`fdtd-v3.jsonl`; old rows in `fdtd-diagnostics.jsonl`).
+- Next: layer stacks from a GDS cross-section.
 
 ## Queue (in order of work)
 

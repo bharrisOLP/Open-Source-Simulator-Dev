@@ -66,3 +66,7 @@ def test_segments_are_checked():
     with pytest.raises(ValueError, match="input port"):
         check_segments([Segment(0.0, 0.8, a), Segment(0.8, 2.0, a)], first_min=1.0)
     check_segments([Segment(0.0, 1.0, a), Segment(1.0, 2.0, a)], first_min=1.0, last_min=0.5)
+    from photonsuite.fdtd import transmission
+    with pytest.raises(ValueError, match="shorter than the grid step"):          # raised before fdtdx is imported
+        transmission([Segment(0.0, 1.0, a), Segment(1.0, 1.01, a), Segment(1.01, 2.0, a)], (-1, 1), (-1, 1), 1.55,
+                     step=0.04)
