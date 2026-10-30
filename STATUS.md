@@ -17,8 +17,11 @@ Done:
 - Correction of meow's post-processing: each mode keeps its own neff (meow 0.15 averages them in Gram-Schmidt;
   this changed the EME of a taper from 0.955 to 0.991, see item 7).
 
-Open (later, in this order): batched Davidson over several cells (small sections are overhead-bound);
-mixed-precision eigenpair refinement (the FP64 polish is slow on RDNA3); bends and angled propagation.
+- Batched solves (`solve_batch`, `compute_modes_gpu_batch`; an option): the same modes as the per-cell path, but
+  on the RX 7900 XT only 1.2x in single precision and no gain in mixed precision for the 30-cell taper.
+
+Open (later, in this order): profile the batched path (the work per member is its larger cost); mixed-precision
+eigenpair refinement (the FP64 polish is slow on RDNA3); bends and angled propagation.
 
 **2. Meep on AMD: next.** Findings so far (git-ignored clones in `.local/upstream/`):
 - The Erised fork (GPL-2.0-or-later) is a Python add-on: Meep builds the simulation, and the add-on time-steps it
@@ -40,7 +43,11 @@ mixed-precision eigenpair refinement (the FP64 polish is slow on RDNA3); bends a
   finite-difference solver to 2e-4 (both are 0.7 % below the resolution-32 numbers of the MPB tutorial).
 - GPU: 11.7x the same code on 16 CPU threads (rods 128 x 128, 16 k points: 5.2 s against 60.3 s;
   `benchmarks/2026-10-30/`).
-- Next: oblique lattices, find_k for waveguide modes, a comparison with MPB itself.
+- Oblique lattices (triangular, hexagonal, fcc) and the analytic interface normal of the objects (TE at second
+  order from n = 64 to 128 also in sheared voxels; slower above 128, cause not known); triangular air holes
+  128 x 128: 5.6 s on the GPU against 89 s on 16 CPU threads (the CPU run did not converge all k points; 13x per
+  iteration).
+- Next: find_k for waveguide modes, a comparison with MPB itself.
 
 **4. thermal-gpu: version 0.1 works.** Folder: `thermal_gpu/` (`thermal_gpu/README.md`).
 - Cell-centered finite volumes (series face conductance), Jacobi CG as one device loop, steady and implicit
@@ -49,7 +56,12 @@ mixed-precision eigenpair refinement (the FP64 polish is slow on RDNA3); bends a
   time constant (1 %).
 - Example `examples/thermo_optic_phase_shifter.py`: thermal-gpu + meow-gpu give P_pi = 19.0 mW for a synthetic SOI
   heater (published devices of this type: typically 20 to 30 mW).
-- Multigrid preconditioner (shared, below). Next: 3-D.
+- Multigrid preconditioner (shared, below).
+- 3-D steady solver (`solver3d.py`, 3-D aggregation multigrid with semi-coarsening): a 100 um heater with its ends
+  (11 M cells, 25 nm) in 1.03 s of CG on the GPU against 34 s on 16 CPU threads; mid-length rise equal to 2-D to
+  1e-5 (7e-6 at 100 and 50 nm, 8e-6 at 25 nm), the ends at 0.53 of the 2-D rise, the phase integral 1.0001 of 2-D
+  (100 and 50 nm).
+- Next: 3-D transients, temperature-dependent conductivity.
 
 **5. optics-gpu (the coupling use case of ZEMAX POP): version 0.1 works.** Folder: `optics_gpu/`.
 - Angular spectrum of the source, real rays through the lens system (Optiland, MIT), image field as a separable
@@ -69,7 +81,10 @@ mixed-precision eigenpair refinement (the FP64 polish is slow on RDNA3); bends a
 - Example `examples/pn_modulator.py`: V_pi L 1.39, 1.60, 1.96 V cm at 1, 2, 4 V for a synthetic SOI rib (published:
   typically 1.5 to 3 V cm); the loss decreases by 1.0 to 2.8 dB/cm (fewer free carriers).
 - Not covered: forward bias and currents (drift-diffusion; DEVSIM stays the tool for that).
-- Next: GPU timings with multigrid; drift-diffusion for forward bias (or a DEVSIM adapter).
+- Junction capacitance, series resistance and RC bandwidth (`charge_gpu/src/charge_gpu/rc.py`, example
+  `charge_gpu/examples/pn_modulator_rc.py`): C' against eps/W to 1e-4; at 3e17 cm^-3 and 2 V: 0.197 fF/um,
+  39.4 Ohm mm, 20.4 GHz intrinsic. No GPU gain at 73k cells (charge part 1.6x at 293k cells, against the Mac CPU).
+- Next: drift-diffusion for forward bias (or a DEVSIM adapter).
 
 **Shared: aggregation multigrid** (`thermal_gpu/src/thermal_gpu/multigrid.py`), used by thermal-gpu (steady and
 transient) and charge-gpu (Newton steps). Heater stack: 17 to 27 CG iterations from 50 to 5 nm cells (Jacobi: 809
@@ -135,3 +150,6 @@ These do not block the work. The agent continues with the default in brackets.
 - 2026-10-30: shared multigrid (thermal, charge), photonsuite 0.1, benchmark logs (`benchmarks/2026-10-30/`).
 - 2026-10-30: FDTD (fdtdx) and EME adapters in photonsuite; two meow 0.15 errors found and corrected
   (`docs/upstream-issues.md`).
+- 2026-10-30: Polygon in the FDTD adapter and exact cell placement. Then four agents in parallel (user request:
+  "fan out some agents"), each on one package, each change with its own single review: charge RC bandwidth,
+  thermal 3-D, bands oblique lattices, meow batched solves.

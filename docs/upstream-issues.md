@@ -12,7 +12,7 @@ upstream. The user decides if and where to report them.
   projection coefficient is about 0. Example: a 0.525 x 0.22 um Si strip in SiO2 at 1.55 um (20 nm grid), TM0 1.794 becomes 2.137
   (the mean of TM0 and TE0). The EME propagates the higher modes with these wrong phases, so the mode conversion
   of a taper adds up coherently: a linear taper 0.5 -> 2.0 um over 10 um gives |S21|^2 = 0.955; with the
-  correction 0.991 (120 cells), and the 3-D FDTD gives 0.9957 (20 nm grid). More modes make the error larger
+  correction 0.991 (120 cells), and the 3-D FDTD gives 0.9961 (20 nm grid). More modes make the error larger
   (20 modes: 0.947); with the correction the result does not change with 20 modes (0.9899 against 0.9900).
 - **Fix in this repository:** `meow_gpu.meow_backend.post_process_modes` (the default of `compute_modes_gpu`) does
   the same filter, normalization and Gram-Schmidt, and keeps the neff of each mode. Test:

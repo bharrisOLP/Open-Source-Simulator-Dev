@@ -87,9 +87,9 @@ post-processing: its Gram-Schmidt step averages the neff of the higher modes, so
 phase with the fundamental mode (`docs/upstream-issues.md`). With the correction in meow-gpu, the EME gives 0.9867,
 0.9900 and 0.9912 at 30, 60 and 120 cells (10 modes, 20 nm grid; `benchmarks/2026-10-30/eme-neff-fix.jsonl`), and
 0.9899 with 20 modes at 60 cells (before the correction, 20 modes lowered the result by 0.8 %). The FDTD gives
-0.9957 on the 20 nm grid and 0.9974 / 0.9981 on the 25 nm grid; its flux transmission is 1.0009 to 1.0019 (above 1),
-so the FDTD values carry an error of about 0.1 to 0.2 %. The two methods agree within about 0.5 % (0.9912 against
-0.9957). The EME itself does not conserve power: at 60 cells the kept modes on both sides hold 0.994 of the input.
+0.9961 on the 20 nm grid and 0.9974 / 0.9981 on the 25 nm grid; its flux transmission is 1.0003 to 1.0019 (above 1),
+so the FDTD values carry an error of up to about 0.2 %. The two methods agree within about 0.5 % (0.9912 against
+0.9961). The EME itself does not conserve power: at 60 cells the kept modes on both sides hold 0.994 of the input.
 This loss (0.6 %) is of the same order as the remaining gap; its cause (for example the interface regularization of
 meow, or the truncated mode basis) is not tested yet. With meow's own post-processing the total is the same (0.994),
 but 4 % of the power goes into the higher modes.

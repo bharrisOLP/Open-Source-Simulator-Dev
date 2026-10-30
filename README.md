@@ -5,12 +5,12 @@ RX 7900 XT (gfx1100) with ROCm 10.1 pip wheels and JAX 0.11.1.
 
 | Folder | Physics | Method | Status |
 |---|---|---|---|
-| `meow_gpu/` | waveguide modes, EME (a backend for meow) | FDE (the tidy3d operator), block Davidson | 0.1: up to 11x one CPU core (warm start); EME taper 3.3x |
-| `bands_gpu/` | photonic band structures (the method of MPB) | plane waves + FFT, LOBPCG | 0.1: 11.7x the same code on 16 CPU threads (rod lattice, 128 x 128) |
-| `thermal_gpu/` | heat conduction (heaters) | finite volumes, multigrid CG | 0.1: 2.9 million cells in 0.21 s on the GPU |
-| `charge_gpu/` | PN junctions in reverse bias (modulators) | nonlinear Poisson, Newton + multigrid CG | 0.1: multigrid CG, 8x faster than Jacobi CG (Mac CPU) |
+| `meow_gpu/` | waveguide modes, EME (a backend for meow) | FDE (the tidy3d operator), block Davidson | 0.1: up to 11x one CPU core (warm start); EME taper 3.3x; batched solves (option) |
+| `bands_gpu/` | photonic band structures (the method of MPB) | plane waves + FFT, LOBPCG | 0.1: 11.7x the same code on 16 CPU threads (rod lattice, 128 x 128); oblique lattices |
+| `thermal_gpu/` | heat conduction (heaters), 2-D and 3-D | finite volumes, multigrid CG | 0.1: 2-D 2.9 million cells in 0.21 s on the GPU; 3-D steady: 11 million cells, CG 1.0 s (33x faster than 16 CPU threads) |
+| `charge_gpu/` | PN junctions in reverse bias (modulators) | nonlinear Poisson, Newton + multigrid CG | 0.1: multigrid CG, 8x faster than Jacobi CG (Mac CPU); capacitance, series resistance, RC bandwidth |
 | `optics_gpu/` | physical optics through lenses (fiber coupling) | angular spectrum + real rays (Optiland) | 0.1 |
-| `suite/` | one device description for all of the above | multiphysics workflows; 3-D FDTD (fdtdx) and EME adapters | 0.1 |
+| `suite/` | one device description for all of the above | multiphysics workflows; 3-D FDTD (fdtdx) and EME adapters; rectangles and polygons | 0.1 |
 | Meep on AMD | FDTD | ROCm port of a GPU add-on | probe passed; waits for a decision (STATUS.md) |
 
 Examples (`examples/`): a thermo-optic phase shifter (P_pi), a depletion modulator (V_pi L), and chip-to-fiber
