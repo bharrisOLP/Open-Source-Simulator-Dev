@@ -107,9 +107,9 @@ def test_batch_shapes_must_match(problems):
 @pytest.mark.parametrize("precision", ["double", "mixed"])
 def test_ragged_convergence(problems, precision):
     """Members that converge at different iterations: member 0 starts from its own eigenvectors (it stops much
-    earlier: 1 iteration in double; in mixed, the complex128 polish of the rounded vectors takes about 40), the
-    others from random blocks. Each member gives the result of ``davidson`` from the same initial block, so a member
-    that stopped did not change after its stop."""
+    earlier: 1 iteration in double; in mixed, 1 complex64 iteration and 2 refinement steps, against about 46
+    iterations for the other members), the others from random blocks. Each member gives the result of
+    ``davidson`` from the same initial block, so a member that stopped did not change after its stop."""
     b = K + 4
     pcs = [make_preconditioner(p) for p in problems]
     targets = [-(np.sqrt(np.max(np.abs(p.eps_xx))) * (1 + 1e-14)) ** 2 for p in problems]

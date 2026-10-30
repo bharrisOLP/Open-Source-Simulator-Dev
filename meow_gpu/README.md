@@ -25,7 +25,9 @@ S, port_map = mw.compute_s_matrix(modes, cells=cells)   # the rest of meow does 
 - **Warm start.** The solver keeps the modes of its last solve. The cells of a taper change slowly, so the next
   cell needs about 15 iterations instead of 50 to 90.
 - **Precision.** `single` (default): complex64 iteration; the tolerance follows the complex64 floor. `mixed`:
-  complex64, then a complex128 polish (tidy3d-level agreement, slow on cards with slow FP64). `double`.
+  complex64, then a complex128 polish (tidy3d-level agreement). Two polishes: `polish="refine"` (default, from
+  2026-10-30: mixed-precision refinement of the eigenpairs, see below) and `polish="davidson"` (the earlier
+  complex128 Davidson, slow on cards with slow FP64). `double`.
 - **Batched solves.** `compute_modes_gpu_batch(css, num_modes, batch=B)` solves B cross-sections with the same grid
   shape at the same time (`GPUModeSolver.solve_batch`, `fde.eigensolver.davidson_batch`). The device kernels
   (operator, preconditioner, Gram products, Ritz vectors, inserts) run on a leading batch axis (`jax.vmap`); the
@@ -60,7 +62,8 @@ and the preconditioner setup (first call: about 1 to 5 s more); the tidy3d time 
 | 0.5 um strip, 10 nm grid | 120k | 6 | 5.73 s | 1.00 s | 0.52 s | 3.3e-6 |
 | 3.0 um strip, 10 nm grid | 200k | 20 | 8.34 s | 2.14 s | 0.73 s | 2.5e-6 |
 
-`mixed` agrees with tidy3d to 2e-11 in neff, but it is 1.5x to 5x slower than `single` on this card.
+`mixed` agrees with tidy3d to 2e-11 in neff, but it is 1.5x to 5x slower than `single` on this card (measured with
+the earlier polish, now `polish="davidson"`).
 
 **EME of a taper** (`bench/bench_eme_taper.py`: Si strip 0.5 -> 2.0 um over 10 um, 30 cells, 10 modes,
 20 nm grid, 36k unknowns per cell). The times include the compile, the setup and meow's post-processing of all
@@ -73,7 +76,7 @@ neff correction below), so the |S21| values compare the two mode solvers, not th
 | tidy3d, 1 process | 20.6 s | 0.97570552 |
 | tidy3d, 8 processes | 13.3 s | 0.97570552 |
 | meow-gpu single (1 process) | 6.3 s | 0.97568 (2.3e-5 lower) |
-| meow-gpu mixed | 20.9 s | 0.97570552 (4e-12) |
+| meow-gpu mixed (earlier polish, `polish="davidson"`) | 20.9 s | 0.97570552 (4e-12) |
 
 The single-precision error of the S-parameters (about 2e-5, measured on this one case) is far below the
 discretization error of a 20 nm grid (neff changes by about 4e-3 between a 20 nm and a 10 nm grid). The mode
@@ -92,8 +95,9 @@ case with the mode-solve time, |S21|, max |dneff| against the per-cell run and t
 | B = 8 | 4.49 s | 7.3e-6 | 20.75 s | 6.3e-12 |
 | B = 16 (15 used) | 4.57 s | 4.8e-6 | 18.75 s | 4.9e-12 |
 
-On this card the batched path is only about 1.2x faster in single precision, and it is not faster in mixed
-precision, for this taper (30 cells, 36k unknowns per cell). It stays an option; the per-cell path is the default.
+The mixed columns used the earlier polish (now `polish="davidson"`). On this card the batched path is only about
+1.2x faster in single precision, and it is not faster in mixed precision, for this taper (30 cells, 36k unknowns
+per cell). It stays an option; the per-cell path is the default.
 The iterations in the same rows show why (time = `modes_s`, which also includes meow's post-processing, about 0.6 s
 on a CPU):
 
@@ -130,6 +134,73 @@ batch starts cold in all B members (about 46 iterations, against about 15 for a 
 adds copies of the last cell (B = 4 and 8: 32 members for 30 cells). The differences against the per-cell run are
 at the single-precision tolerance.
 
+## Mixed-precision refinement (the default polish of `mixed`, 2026-10-30)
+
+`fde.eigensolver.refine`. The complex64 Davidson stops at a residual of 1e-3 (`REFINE_SWITCH_TOL`). Then each step:
+
+1. complex128 Rayleigh-Ritz on the subspace [Q, T] (two blocks: an orthonormal basis Q of the last Ritz vectors, and
+   the last corrections T) and the complex128 residuals. The stop test is that of the complex128 Davidson (the
+   relative residuals of the k wanted pairs below `tol`, 1e-10).
+2. complex64 correction solves: for each pair that is not converged, 20 steps (`REFINE_INNER`) of GMRES on the
+   projected correction equation of Jacobi-Davidson (Sleijpen and van der Vorst 1996),
+   (I - Q Q^H)(A - theta_i)(I - Q Q^H) t_i = -r_i, with the fast-diagonalization preconditioner on the right. The
+   projection on the whole block deflates near eigenvalues (a cluster). The GMRES steps run in one compiled device
+   loop (`jax.lax.fori_loop`), with no host step.
+3. The corrections go back to complex128 (orthogonal to Q, orthonormal), with one complex128 operator apply each.
+
+The complex64 solves change only the rate of convergence. The accuracy comes from the complex128 residuals and the
+complex128 Rayleigh-Ritz (iterative refinement: Dongarra, Moler and Wilkinson 1983). The first step selects the b
+Ritz pairs nearest the target; the next steps follow each pair by its Ritz value. Reason (a GPU run with 14 GMRES
+steps, taper cell 18): with a selection by the distance to the target, a new Ritz value with a residual of 8.6e-2
+(it goes to lambda = -1.935, an eigenvalue that the complex64 Davidson did not find) replaced a converged pair, and
+the refinement stopped there. The operator is not Hermitian, so a step can also give spurious Ritz values (one at
+-1.886 - 8.5e-4i in the same run). At each step the wanted pairs are the k tracked pairs nearest the target
+(`_selection`), not the pairs of the first step: the complex64 Ritz values (residual 1e-3) cannot order the two
+modes of a near-degenerate pair. With the wanted set of the first step, a mode count that cuts such a pair gave the
+other mode of the pair with `converged=True` (review, 2026-10-30: two cores, 1 mode, TE odd instead of TE even). An
+identified neighbour (residual below 1e-2) whose Ritz value can still be nearer the target than a wanted value
+(within its residual) must also converge before the stop. The result gives the pairs sorted by the distance to the
+target. The refinement stops with `converged=False` when the largest residual of the stop test does not halve in 3
+steps, when no correction is left, or at the iteration limit. It then gives the step with the smallest residual,
+and `GPUModeSolver` warns. `polish="davidson"` gives the earlier method; `GPUModeSolver(switch_tol=...,
+refine_inner=...)` changes the two parameters.
+
+**Checks** (`tests/test_refine.py`; the numbers below are from the same cases on the RX 7900 XT, run through
+`tools/gpu_run.sh`). 4 modes and 4 extra block vectors. The agreement columns are those of the refinement; the last
+column gives the complex128 applies of the refinement / the earlier polish / the double solve.
+
+| Case | Reference | max \|dneff\| | 1 - \|cos\| (fields) | complex128 applies |
+|---|---|---|---|---|
+| 0.5 um strip, 40 nm grid | double-precision Davidson, same start | 1.6e-12 | <= 1.1e-16 | 24 / 456 / 727 |
+| two 0.44 um cores, 2.24 um gap | ARPACK shift-invert, assembled matrix | 4.6e-13 | <= 3.1e-11 | 29 / 398 / 764 |
+
+- The strip: the residuals of the refined pairs, computed again with the assembled SciPy matrix (independent of the
+  JAX operator), are 6.3e-13. Iterations: 49 (refine) against 106 (earlier polish).
+- The two cores: the even and odd TE supermodes differ by 2.7e-8 in neff (relative eigenvalue splitting 2.4e-8,
+  below the complex64 epsilon 1.2e-7). The single-precision solve mixes the two modes (1 - |cos| = 0.32 and 0.27);
+  the refinement separates them (the earlier polish: 1.1e-9; double: 8.3e-11).
+- A mode count that cuts a near-degenerate pair (the two cores with 1 mode: the TE pair; 3 modes: the TM pair,
+  splitting 8.8e-5; start blocks from seeds 0, 1 and 2): the refinement gives the even mode of the pair, as ARPACK
+  and the double solve (test bound 1 - |cos| < 1e-5; max |dneff| against the double solve 7.9e-12, in the review
+  script of the same cases).
+- A tolerance below the complex128 floor (1e-17): the refinement stops after 7 steps, with `converged=False` and
+  residuals of 0.9e-14 to 1.4e-14. The step limit also gives `converged=False`, and the solver warns.
+
+**EME of the taper** (`bench/bench_refine.py`: the 30-cell taper of `bench_eme_taper.py`, 10 modes, 20 nm grid; RX
+7900 XT, `--repeat 2`, the second run; times as in the tables above, with meow's post-processing; rows in
+`benchmarks/2026-10-30/meow-refine.jsonl`):
+
+| Case | Mode solves | complex128 applies | Iterations (sequential) | \|S21\| | max \|dneff\| against double |
+|---|---|---|---|---|---|
+| double | 28.95 s | 21213 | 1080 | 0.9933381220221 | - |
+| mixed, earlier polish (`polish="davidson"`) | 19.48 s | 18642 | 1625 | 0.9933381220224 | 6.2e-12 |
+| mixed, refine (default) | 11.77 s | 1729 | 487 | 0.9933381220219 | 3.4e-12 |
+| single | 5.59 s | 0 | 480 | 0.9933148474063 | 5.4e-6 |
+
+The refinement makes `mixed` 1.66x faster on this card, with 10.8x fewer complex128 applies. It does the same
+number of sequential iterations as `single` (complex64 iterations plus refinement steps), but each refinement step
+costs more (20 complex64 GMRES steps on the device, and the complex128 products).
+
 ## Correction of meow's post-processing (each mode keeps its neff)
 
 In meow 0.15, `Mode.__add__` averages the neff of the two modes, and the Gram-Schmidt step of
@@ -154,10 +225,23 @@ cells instead of 0.952 / 0.955, and the 3-D FDTD of the same taper gives 0.9961 
   eigenproblems grow with B (one for each member, in a thread pool of up to 8 threads). All members need the same
   grid shape (`compute_modes_gpu_batch` groups the cells by grid shape). The device memory grows with B (the
   subspace buffers are B x max_subspace vectors).
-- The complex128 polish of the `mixed` mode is slow from Ritz vectors that are already converged in complex64 (a
-  small subspace of 3 blocks: about 40 iterations for the 0.45 um strip, 40 nm grid, of `tests/test_batch.py`).
-- The complex128 polish is slow on consumer GPUs. Next: mixed-precision refinement of each eigenpair (complex128
-  residuals, complex64 corrections).
+- The earlier complex128 polish (`polish="davidson"`) is slow from Ritz vectors that are already converged in
+  complex64 (a small subspace of 3 blocks: about 35 iterations for the 0.45 um strip, 40 nm grid, of
+  `tests/test_batch.py`). The default polish of `mixed` is now the refinement (see above).
+- The refinement is still about 2x slower than `single` on the RX 7900 XT. With fewer GMRES steps
+  (`refine_inner`) it can stall (the halving rule stops it, not converged). No fallback to the earlier polish yet.
+- Device memory: the GMRES basis holds (`REFINE_INNER` + 1) x b complex64 vectors, 168 b n bytes at 20 steps (b
+  block vectors, n unknowns; 0.8 GB for b = 24 and n = 200k). The earlier polish keeps 3 b complex128 vectors in V
+  and in A V (96 b n bytes).
+- On a CPU the refinement is not faster than the earlier polish: the complex128 rate of a CPU is not low, and the
+  refinement does more complex64 work. Not measured with the code of this version.
+- All precisions can miss eigenvalues nearer the target than the kept modes. Taper cell 18 (`bench_refine.py`):
+  ARPACK on the assembled matrix finds lambda = -1.9350 and -1.9038 (box modes below cutoff, neff 1.391 and 1.380)
+  between the 9th (-1.9871) and the 10th kept mode (-1.8877); the double, the mixed and the single solves keep
+  -1.8877. The strip of `tests/test_refine.py` (4 modes): ARPACK finds two modes at neff 1.444 and modes at 1.4074
+  and 1.3604 nearer the target than the 4th kept mode (1.3413), which tidy3d also gives (`tests/test_solver.py`).
+- The batched solve (`davidson_batch`) runs the refinement member after member, after the batched complex64
+  Davidson (the same steps as the per-cell solve, but the device kernels of the refinement are not batched).
 - With PML, the solver can miss PML eigenvalues that are nearer the target than the kept modes (meow filters PML
   modes, so the kept modes were still correct in the review test). No test solves PML eigenpairs yet.
 - meow's own post-processing (normalization, Gram-Schmidt, on the CPU) costs about 35 ms per cell.
@@ -172,5 +256,11 @@ precision; a batch of 1; the warm start between batches; `compute_modes_gpu_batc
 convergence (members that stop at very different iterations give the results of `davidson` from the same initial
 block), the stop by the stall rule and the iteration limit of each member, and the tidy3d direction rule for modes
 below cutoff. On the CPU the iterations and the matvecs must be the same as those of the per-cell solve (all three
-precisions); on a GPU the iteration check has a slack and is not done in single precision. On the GPU computer:
-`bash tools/remote.sh setup-env`, then run pytest with `.venv-rocm`.
+precisions); on a GPU the iteration check has a slack and is not done in single precision.
+`tests/test_refine.py` checks the mixed-precision refinement (above): the strip against the double solve and the
+SciPy residuals, the two-core cluster against ARPACK, a mode count that cuts a near-degenerate pair (1 and 3 modes
+of the two cores, 3 start blocks, against ARPACK and the double solve by neff and field overlap), the complex128
+applies against the earlier polish, the tracking and the selection of the pairs, the stop with `converged=False`
+(tolerance out of reach, step limit, solver warning), and the earlier polish (per cell and batched). Run all tests
+on the GPU computer (`bash tools/remote.sh push`, then `bash tools/gpu_run.sh meow_gpu python -m pytest -q` there;
+`tools/gpu_run.sh` uses `.venv-rocm` and the GPU lock; first `bash tools/remote.sh setup-env`).

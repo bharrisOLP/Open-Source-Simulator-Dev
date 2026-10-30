@@ -40,6 +40,8 @@ import numpy as np
 
 from meow_gpu.device import put, solver_device
 from meow_gpu.fde.eigensolver import (
+    POLISHES,
+    REFINE_INNER,
     davidson,
     davidson_batch,
     make_preconditioner,
@@ -86,12 +88,16 @@ class SolveInfo:
     converged: bool
     warm: bool
     residual: float
+    matvecs_hi: int = 0       # the complex128 operator applies (vectors)
 
 
 @dataclass
 class GPUModeSolver:
     """Mode solver with a warm-start memory. ``extra``: block vectors beyond ``num_modes`` (more vectors, fewer
-    iterations on clustered spectra)."""
+    iterations on clustered spectra). ``polish`` (precision "mixed" only): "refine" (mixed-precision refinement
+    of the eigenpairs: complex128 residuals and Rayleigh-Ritz, complex64 correction solves) or "davidson" (the
+    earlier complex128 Davidson polish). ``switch_tol``: the residual at which the complex64 Davidson of "mixed"
+    stops (None: the default of the polish). ``refine_inner``: the GMRES steps of each correction solve."""
 
     precision: str = "single"
     extra: int = 8
@@ -99,6 +105,9 @@ class GPUModeSolver:
     max_iter: int = 500
     warm_start: bool = True
     seed: int = 0
+    polish: str = "refine"
+    switch_tol: float | None = None
+    refine_inner: int = REFINE_INNER
     last_info: SolveInfo | None = None
     last_batch_info: list[SolveInfo] | None = None
     _memory: dict = field(default_factory=dict, repr=False)
@@ -122,9 +131,11 @@ class GPUModeSolver:
         tol, floor = self._tolerance(float(jnp.max(jnp.abs(pc.lam))), target)
         if floor is not None:
             _warn_floor(floor)
-        res = davidson(op, pc, num_modes, target, x0, tol=tol, max_iter=self.max_iter, precision=self.precision)
+        res = davidson(op, pc, num_modes, target, x0, tol=tol, max_iter=self.max_iter, precision=self.precision,
+                       polish=self.polish, switch_tol=self.switch_tol, inner=self.refine_inner)
         self._memory[key] = res.vectors
-        self.last_info = self._info(res.iterations, res.matvecs, res.converged, warm, res.residuals)
+        self.last_info = self._info(res.iterations, res.matvecs, res.converged, warm, res.residuals,
+                                    res.matvecs_hi)
         if not self.last_info.converged:
             warnings.warn(f"meow_gpu: the eigensolver did not converge (residual {np.max(res.residuals):.1e})",
                           stacklevel=2)
@@ -167,11 +178,12 @@ class GPUModeSolver:
         if any(f is not None for f in floors):
             _warn_floor(max(f for f in floors if f is not None))
         res = davidson_batch(op, pc, num_modes, targets, x0, tol=np.array(tols), max_iter=self.max_iter,
-                             precision=self.precision)
+                             precision=self.precision, polish=self.polish, switch_tol=self.switch_tol,
+                             inner=self.refine_inner)
         self._memory[batch_key] = res.vectors
         self._memory[key] = res.vectors[-1]
         self.last_batch_info = [self._info(int(res.iterations[i]), int(res.matvecs[i]), bool(res.converged[i]),
-                                           warm, res.residuals[i]) for i in range(nbat)]
+                                           warm, res.residuals[i], res.member(i).matvecs_hi) for i in range(nbat)]
         self.last_info = self.last_batch_info[-1]
         bad = [i for i, info in enumerate(self.last_batch_info) if not info.converged]
         if bad:
@@ -191,6 +203,8 @@ class GPUModeSolver:
     def _check(self) -> None:
         if self.precision not in PRECISIONS:
             raise ValueError(f"precision must be one of {PRECISIONS}")
+        if self.polish not in POLISHES:
+            raise ValueError(f"polish must be one of {POLISHES}")
 
     def _random_block(self, shape: tuple[int, int], b: int) -> jax.Array:
         rng = np.random.default_rng(self.seed)
@@ -214,10 +228,11 @@ class GPUModeSolver:
         floor = FLOOR_FACTOR * float(np.finfo(np.float32).eps) * anorm / max(1.0, abs(target))
         return max(tol, min(floor, SINGLE_TOL_CAP)), (floor if floor > SINGLE_TOL_CAP else None)
 
-    def _info(self, iterations: int, matvecs: int, converged: bool, warm: bool, residuals) -> SolveInfo:
+    def _info(self, iterations: int, matvecs: int, converged: bool, warm: bool, residuals,
+              matvecs_hi: int = 0) -> SolveInfo:
         resid = float(np.max(residuals))
         converged = converged or (self.precision == "single" and resid < SINGLE_FLOOR)
-        return SolveInfo(iterations, matvecs, converged, warm, resid)
+        return SolveInfo(iterations, matvecs, converged, warm, resid, matvecs_hi)
 
 
 _fields_batch = jax.jit(jax.vmap(fields))

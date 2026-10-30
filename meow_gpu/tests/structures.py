@@ -18,3 +18,25 @@ def strip(width=0.5, height=0.22, n_core=N_SI, n_clad=N_SIO2, w_dom=3.0, h_dom=2
         return np.where(inside, n_core**2, n_clad**2).astype(complex)
 
     return eps(xc, ye), eps(xe, yc), eps(xe, ye), x, y
+
+
+def coupler(core=11, height=0.22, gap=40, margin=25, n_core=N_SI, n_clad=N_SIO2, h_dom=1.6, dx=0.04):
+    """Two identical cores, far apart (a weak directional coupler): the even and odd supermodes have very close
+    eigenvalues (a cluster). Widths, gap and margins in cells of dx; the structure is mirror-symmetric on the grid
+    (core = 11 cells: 0.44 um at dx = 0.04). Ex at the cell centres in x; Ey and Ez at the cell edges in x, in the
+    core when the edge is between two core cells."""
+    nx = 2 * (core + margin) + gap
+    x = (np.arange(nx + 1) - nx / 2) * dx
+    y = np.arange(-h_dom / 2, h_dom / 2 + dx / 2, dx)
+    yc, ye = 0.5 * (y[1:] + y[:-1]), y[:-1]
+    cell = np.zeros(nx, bool)
+    cell[margin: margin + core] = True
+    cell[margin + core + gap: margin + 2 * core + gap] = True
+    edge = np.zeros(nx, bool)
+    edge[1:] = cell[1:] & cell[:-1]
+
+    def eps(in_x, yy):
+        inside = in_x[:, None] & (np.abs(yy) < height / 2)[None, :]
+        return np.where(inside, n_core**2, n_clad**2).astype(complex)
+
+    return eps(cell, ye), eps(edge, yc), eps(edge, ye), x, y
