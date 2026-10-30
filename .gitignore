@@ -1,0 +1,12 @@
+.venv/
+__pycache__/
+*.pyc
+.DS_Store
+.local/
+.claude/settings.local.json
+build/
+results/
+*.egg-info/
+.pytest_cache/
+# local tool: it names the private folders and the host of the user
+tools/remote.sh

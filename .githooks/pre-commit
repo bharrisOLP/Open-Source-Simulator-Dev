@@ -1,0 +1,20 @@
+#!/usr/bin/env bash
+# Two checks before each commit (CLAUDE.md "Commits"): the public-repository hygiene check (tools/hygiene.py) and
+# the adversarial review gate (tools/review.sh). Each check runs the copy in HEAD (already reviewed), so that a
+# staged change of a check cannot approve itself. Only a first commit (no HEAD) runs the staged copies. A missing
+# check blocks the commit. Do not bypass this hook with --no-verify.
+set -euo pipefail
+src() {  # the reviewed copy of a check: HEAD, else (first commit) the index
+  if git rev-parse -q --verify HEAD >/dev/null; then git show "HEAD:$1" 2>/dev/null || true; else git show ":$1" 2>/dev/null || true; fi
+}
+gate=$(src tools/review.sh)
+hyg=$(src tools/hygiene.py)
+if [[ -z $gate || -z $hyg ]]; then
+  echo "BLOCKED: tools/review.sh or tools/hygiene.py is missing from HEAD (or, for a first commit, from the index)." >&2
+  exit 1
+fi
+tmp=$(mktemp)
+trap 'rm -f "$tmp"' EXIT
+printf '%s\n' "$hyg" >"$tmp"
+uv run --no-project --quiet --offline --script "$tmp"
+bash -c "$gate" review.sh check
