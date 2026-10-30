@@ -27,6 +27,8 @@ sols[1].current                                           # A/m (= mA/mm) out of
 rib_index_change(pin, sols[1], sols[0])                   # mean n, p, index change and loss change in the rib
 g = dd.solve(pin, 0.0, 0.95, guess=sols[1], method="gummel", linear="device", tau_n=1e-9, tau_p=1e-9)
 g.converged, g.linear_error, g.linear_fallbacks          # Gummel with all steps on the JAX device (continuity.py)
+d = dd.solve(pin, 0.0, 0.95, guess=sols[1], linear="device", tau_n=1e-9, tau_p=1e-9)
+d.krylov_iterations, d.linear_fallbacks, d.timings      # Newton, the linear solves on the JAX device (coupled.py)
 ```
 
 ## Method
@@ -88,10 +90,12 @@ and the results of `poisson.py` and `rc.py` do not change):
   Shockley check (see there), 1 ns and 10 ns for the SOI rib (effective lifetime of SOI rib waveguides about 1 ns:
   Dimitropoulos et al., Appl. Phys. Lett. 86, 071115 (2005)).
 - Two solvers, and where they run:
-  - `method="newton"` (default): the coupled Newton method on (psi, n, p). The Jacobian is assembled on the host and
-    solved with the sparse direct LU of scipy (SuperLU) on the CPU. The n and p columns are scaled with n and p (the
-    unknowns are the relative changes), the rows are equilibrated. Damping: the step of psi is at most 10 V_T; a
-    carrier density changes by at most a factor exp(10) per step and stays positive.
+  - `method="newton"` (default): the coupled Newton method on (psi, n, p). The Jacobian is assembled on the host.
+    The n and p columns are scaled with n and p (the unknowns are the relative changes), the rows are equilibrated.
+    Damping: the step of psi is at most 10 V_T; a carrier density changes by at most a factor exp(10) per step and
+    stays positive. The linear solver of each step is the option `linear`:
+    - `linear="superlu"` (default, the reference): the sparse direct LU of scipy (SuperLU) on the CPU;
+    - `linear="device"`: FGMRES with a block multigrid preconditioner on the JAX device (`coupled.py`, below).
   - `method="gummel"`: the decoupled Gummel iteration. The Poisson step (symmetric positive definite: the nonlinear
     Poisson equation with the quasi-Fermi levels of the last carriers per cell) runs on the JAX device with the
     multigrid-preconditioned CG of `poisson.py` (the hierarchy of `continuity.hierarchy`, below). The two continuity
@@ -139,7 +143,8 @@ symmetric, as the preconditioner, and BiCGSTAB in row-relative residuals as the 
   the true residual (recomputed after the loop), at most 1e-11; above it, up to 3 restarts from the last vector.
 - A device solve that is not converged, or that cannot run (the span limit below), is not used: the Gummel
   iteration solves that step with SuperLU and counts it in `DDSolution.linear_fallbacks`. `linear_error` (the
-  largest backward error of the last continuity steps; also measured for `linear="superlu"`, and None for Newton),
+  largest backward error of the last continuity steps; also measured for `linear="superlu"`; None for the SuperLU
+  Newton, and the largest relative residual of the linear solves for the device Newton, below),
   `linear_converged` and `krylov_iterations` report the solves; a Gummel solve is converged only when its last
   continuity steps are.
 - Range: E and F must stay in the float64 range, so the psi span in the semiconductor may be at most 1200 V_T
@@ -150,6 +155,48 @@ symmetric, as the preconditioner, and BiCGSTAB in row-relative residuals as the 
   and the LU coarsest inverse; it replaced the 1024-cell pseudo-inverse of `build_hierarchy`, whose host time was
   most of the Gummel time). A change of `thermal_gpu.multigrid` can change both Gummel paths: the tests of
   `tests/test_dd_device.py` and `tests/test_drift_diffusion.py` cover them.
+
+### The Newton steps on the device (`coupled.py`)
+
+Each Newton step solves J_s y = b, the system of the SuperLU path: the columns scaled with (V_T, n, p), so
+y = (dpsi / V_T, dn / n, dp / p), and the rows with 1 / max |row|. J_s is nonsymmetric and couples all three
+unknowns.
+
+- Krylov method: FGMRES (flexible GMRES, right preconditioned; Saad 1993), restarted after 60 steps, Arnoldi with
+  classical Gram-Schmidt done twice. The residual is the 2-norm of the row-equilibrated system, so all rows
+  (Poisson, majority and minority carriers) have the same weight. J_s is copied to the device in ELL form (a fixed
+  number of entries per row: a gather and a row sum, no atomic adds). One jitted call does one Arnoldi step; the
+  host keeps the small Hessenberg matrix and the Givens rotations.
+- Preconditioner: one block Gauss-Seidel step in quasi-Fermi variables (the linear form of the Gummel decoupling),
+  x = dpsi / V_T, a = -dphi_n / V_T, b = dphi_p / V_T, so dn / n = x + a and dp / p = -x + b. In these variables:
+  - the Poisson block is V_T (A + diag(q V (n + p) / V_T)), the Jacobian of the nonlinear Poisson equation with
+    fixed quasi-Fermi levels (symmetric positive definite): one V-cycle of the multigrid of the Gummel Poisson step;
+  - the electron block is J_nn diag(n) = -S_n diag(n / E_n): the Slotboom operator S_n of `continuity.py`, with
+    the Newton derivative dR/dn in place of the linearized recombination: one V-cycle on S_n. Holes the same;
+  - the step: x from the Poisson block, then a from the electron rows with the x term moved to the right side, then
+    b from the hole rows with the x and a terms. These terms are products with rows of J_s, so no block is
+    assembled. The couplings left out (the upper triangle) are those of the Gummel iteration; FGMRES removes them.
+- Stop and flag: FGMRES aims at a true relative residual ||b - J_s y|| / ||b|| of 1e-10 (`coupled.RTOL`); it stops
+  there, after a cycle that does not halve the true residual (stagnation), or after 300 steps. A solve is used when
+  its true relative residual is at most 1e-6 (`coupled.ACCEPT`): an inexact Newton step (Dembo, Eisenstat and
+  Steihaug 1982), and the residual F of each Newton step is exact (host). Why not 1e-10 as the limit: in some Newton
+  steps far from the solution (the 1-D junction at 1 V and 3 V reverse, started from `poisson.solve`) the true
+  residual stagnated at 1.7e-9 to 8.9e-9 (a scratch run; probably round-off: the preconditioned vectors span many
+  decades); with the 1e-10 limit these steps used SuperLU. In all continuation tests every solve reached 1e-10
+  (largest 9.97e-11); the 3 V test from `poisson.solve` uses a solve at 8.5e-9.
+- A solve that is not used (above 1e-6, not finite) or that cannot run (the span limit of the Slotboom scaling,
+  `continuity.SpanError`) is replaced by SuperLU for that Newton step and counted in `linear_fallbacks`.
+  `krylov_iterations` (FGMRES steps), `linear_error` (the largest relative residual of the device solves) and
+  `timings` (assembly, setup, krylov, linear) report the solves.
+- Cost per Newton step: the Jacobian assembly on the host (as for SuperLU), the three hierarchies on the host (the
+  2 x 2 coarsening and a 256-cell LU inverse), the copies to the device, and on average 16 to 27 FGMRES steps
+  (the tests and the bench), each 1.3 to 2.9 ms on the RX 7900 XT. The first solve on a new mesh compiles the step
+  (the one-step warm-up of the bench: 1.5 s at 36 600 cells, 2.4 s at 146 400 cells). Memory: two blocks of 61 and
+  60 vectors of the unknowns (170 MB at 146 400 cells).
+- Default: SuperLU. The device path is faster on the 2-D rib (bench below) but slower on small meshes: on the 1-D
+  junction (400 cells, 0.6 V from `poisson.solve`, 11 Newton steps) its linear solves take 0.206 s against
+  0.007 s with SuperLU. It also adds the compile time per mesh. Use `linear="device"` for 2-D meshes like the rib
+  of the bench (36 600 cells and more).
 
 ## Checks (`tests/test_junction.py`, `tests/test_rc.py`)
 
@@ -234,6 +281,25 @@ All values from the GPU computer (the device path on the RX 7900 XT, rocm:0). Th
   solution: after 50, 200 and 800 iterations the relative update is still 2e-9 to 6e-9, and the current is
   1.9e-4, 1.7e-4, 1.5e-4 from Newton (SuperLU) and 3.4e-5, 7.9e-5, 2.2e-5 (device, no fallback). Use Newton for
   such devices.
+
+## Checks of the device Newton solver (`tests/test_newton_device.py`)
+
+All values from the GPU computer (the FGMRES loops on the RX 7900 XT, rocm:0). Reference: the Newton method with
+SuperLU (same discretization, same scaled system). The differences: psi in V; n and p relative, where the
+reference is above 1 cm^-3; the contact currents relative to the largest contact current. Continuation in 50 mV
+steps (forward) or 0.5 V steps (reverse) from 0 V, each bias step started from the last device solution.
+
+| Case | Reference | Agreement |
+|---|---|---|
+| ELL product of J_s on the device, PIN rib (10 nm, contacts 1 um from the center), first Newton step from 0.95 V to 1.0 V | the scipy product | test 1e-14 of \|J_s\| \|v\| per row |
+| One linear solve, the same step (high injection) | SuperLU of the same scaled system | 21 FGMRES steps, true relative residual 2.2e-11; max \|y - y_SuperLU\| / max \|y_SuperLU\| = 1.5e-10 (test 1e-8); with 2 steps the flag is False |
+| PIN rib, 0 to 1.0 V (21 solves, 119 Newton steps, 2219 FGMRES steps), tau 1 ns | SuperLU Newton (`sweep`) | no fallback; at 0.6, 0.9, 1.0 V: the same Newton steps (6, 6, 5); psi 2.3e-15, 3.2e-15, 2.8e-15 V; n and p 3.3e-14 or better; contact currents 3.4e-11, 8.4e-14, 2.9e-14 (I = 0.0107, 5.49, 31.2 A/m); rib index change 2.4e-15 or better (tests 1e-11 V, 1e-8, 1e-8, 1e-8, 1e-8); each column carries I to 1e-9 of I (test) |
+| PIN rib at 2 V reverse; the depletion-modulator rib (`rib_pn`, 3e17 cm^-3, 10 nm, contacts 1 um from the center) at 1 and 4 V reverse | SuperLU Newton | no fallback; psi 1.0e-14, 7.3e-15, 2.8e-14 V; n and p 2.0e-13 or better (tests 1e-11 V, 1e-8); the generation currents (-1.121e-7, -7.493e-9, -2.249e-8 A/m) the same to the 4 printed digits, except -7.493e-9 against -7.494e-9 A/m at 1 V (test 1e-9 A/m) |
+| 1-D junction (1e18 cm^-3, 2.5 nm cells) at 1, 5, 25 V reverse (51 solves, 304 Newton steps) | SuperLU Newton | no fallback; psi 2.3e-15, 1.1e-14, 4.3e-13 V; n 7.2e-14, 2.3e-13, 3.7e-12; p 8.7e-14, 3.7e-13, 4.6e-12 (tests 1e-12 V, 1e-9) |
+| Long-base diode of the Shockley check, 0 to 0.8 V (17 solves, 82 Newton steps) | Shockley J0 (exp(V/V_T) - 1); SuperLU Newton | J / J_Shockley = 1.897020, 1.004094, 1.001546, 0.999355, 0.990809, 0.939446 at 0.3, 0.6, 0.65, 0.7, 0.75, 0.8 V: the SuperLU values to all 7 digits (test 1 % from 0.6 to 0.75 V); the current equals the SuperLU current exactly (difference 0.0 in this run; test 1e-8 of I or 1e-9 A/m); psi 6.1e-16 V or better, n and p 2.8e-14 or better; the contact sum and each cross-section (tests 1e-12 and 1e-9 A/m, as the SuperLU test) |
+| Far starts, no continuation: 1-D junction at 0 V from the perturbed state (20 mV, 30 %); at 0.6 V and 3 V reverse from `poisson.solve`; the L-shaped block (xmin and ymax contacts) at 0.4 V | `poisson.solve` at 0 V (tests 1e-11 V, 1e-9); SuperLU Newton for the other three | no fallback; the other three: Newton steps 11, 13, 8 (SuperLU 11, 16, 8; test: at most 2 more), psi 2.2e-16, 1.2e-14, 5.6e-17 V, n and p 3.7e-13 or better (tests 1e-12 V, 1e-9); at 3 V one solve stops at the relative residual 8.5e-9 (stagnation; used, because it is below 1e-6) |
+| A device solve flagged not converged; `SPAN_MAX` below the psi span | SuperLU Newton | every Newton step solved with SuperLU (`linear_fallbacks` = the Newton steps), psi to 1e-12 V (tests) |
+| Solution info | | `linear`, `device`, `linear_error` (0 to 1e-6), `timings` (assembly, setup, krylov, linear); SuperLU: `linear_error` None |
 
 ## Example: depletion modulator (`examples/pn_modulator.py`)
 
@@ -354,20 +420,49 @@ One JSON line per case:
 - `pin-newton`: the PIN rib of the example (contacts 1.5 um from the center), Newton sweep 0 to 1.0 V; skip with
   `--no-sweep`;
 - at each bias of `--biases` (default 0.6 and 0.9 V), from the Newton solution 50 mV lower (the same start for all
-  rows): `pin-newton-step` (one Newton solve, SuperLU, the reference), `pin-gummel-superlu` (Gummel, the continuity
-  steps with SuperLU), `pin-gummel-device` (Gummel, all steps on the JAX device), `pin-gummel-device-cpu` (the same
-  code with JAX on the CPU; skip with `--no-cpu`). The Gummel rows give the time of the solve, a one-iteration
-  warm-up apart (the JIT compile of the mesh), the times of the Poisson and the continuity steps, the iterations,
-  the backward error of the linear solves and the differences to the Newton solution (current, psi, n, p).
+  rows): `pin-newton-step` (one Newton solve, SuperLU, the reference; with the times of the assembly and the
+  linear solves), `pin-newton-device` (one Newton solve with `linear="device"`: the time of the solve, a one-step
+  warm-up apart, and the times of the assembly, the setup and the FGMRES loops), `pin-gummel-superlu` (Gummel, the
+  continuity steps with SuperLU; skip with `--no-gummel-superlu`), `pin-gummel-device` (Gummel, all steps on the
+  JAX device), `pin-gummel-device-cpu` (the same code with JAX on the CPU; skip with `--no-cpu`). The Gummel rows
+  give the time of the solve, a one-iteration warm-up apart (the JIT compile of the mesh), the times of the Poisson
+  and the continuity steps, the iterations, the backward error of the linear solves and the differences to the
+  Newton solution (current, psi, n, p).
 
 ```
 bash tools/remote.sh sh <<'EOF'
 bash tools/gpu_run.sh charge_gpu python bench/bench_dd.py --dx 10e-9 --biases 0.9 --no-diode --no-sweep  # small
 GPU_RUN_TIMEOUT=3600 bash tools/gpu_run.sh charge_gpu python bench/bench_dd.py --dx 10e-9 5e-9 --no-diode --no-sweep
+GPU_RUN_TIMEOUT=1200 bash tools/gpu_run.sh charge_gpu python bench/bench_dd.py --dx 10e-9 5e-9 --no-diode \
+    --no-sweep --no-cpu --no-gummel-superlu                                    # the Newton comparison below
 EOF
 ```
 
-The full run (`bench_dd.py --dx 10e-9 5e-9 --no-diode --no-sweep`; rows in
+The Newton comparison (`bench_dd.py --dx 10e-9 5e-9 --no-diode --no-sweep --no-cpu --no-gummel-superlu`; rows in
+`benchmarks/2026-10-30/charge-newton-device.jsonl`). From the Newton solution 50 mV lower; 6 Newton steps in each
+Newton row (both linear solvers), 16 and 42 Gummel iterations; no fallback:
+
+| Cells (unknowns), cell | Bias | Newton, SuperLU (assembly + LU) | Newton, device (assembly + setup + FGMRES; steps) | Gummel, all on rocm:0 |
+|---|---|---|---|---|
+| 36 600 (43 300), 10 nm | 0.6 V | 0.76 s (0.06 + 0.70) | 0.44 s (0.06 + 0.07 + 0.30; 114) | 1.08 s |
+| 36 600 (43 300), 10 nm | 0.9 V | 0.77 s (0.06 + 0.70) | 0.50 s (0.06 + 0.18 + 0.26; 117) | 3.10 s |
+| 146 400 (173 200), 5 nm | 0.6 V | 4.76 s (0.20 + 4.54) | 0.83 s (0.20 + 0.20 + 0.40; 137) | 1.78 s |
+| 146 400 (173 200), 5 nm | 0.9 V | 4.82 s (0.20 + 4.60) | 0.81 s (0.19 + 0.14 + 0.47; 161) | 20.5 s |
+
+- The device Newton equals the SuperLU Newton to 9.5e-11 of the current or better (psi 1.6e-14 V, n and p 5.1e-14);
+  the relative residual of its linear solves is at most 9.3e-11. The Gummel rows: 2.2e-10 of the current or better.
+- Speed-up of the device Newton over the SuperLU Newton: 1.75x and 1.53x at 10 nm, 5.75x and 5.93x at 5 nm (0.6
+  and 0.9 V). SuperLU grows with the mesh (0.70 s to 4.6 s of LU for 4x the cells: the fill of the direct LU); the
+  device time grows less (0.44 to 0.50 s, then 0.81 to 0.83 s). The device Newton is the fastest path in all four
+  rows; at 5 nm it is 2.1x faster than the device Gummel path at 0.6 V and 25x at 0.9 V.
+- The development runs of this change gave 0.32 to 0.56 s for the device Newton at 10 nm and 0.77 to 0.78 s at
+  5 nm: the device times change by 0.1 to 0.2 s from run to run (the FGMRES step took 2.2 to 2.9 ms in the logged
+  rows). The GPU computer is shared.
+- About half of the device Newton time at 5 nm is not the FGMRES loop: the assembly of the Jacobian (scipy, on the
+  host) and the setup (the hierarchies on the host, the copies to the device) take 0.40 s of 0.83 s (0.6 V) and
+  0.33 s of 0.81 s (0.9 V).
+
+The earlier full run, before the device Newton (`bench_dd.py --dx 10e-9 5e-9 --no-diode --no-sweep`; rows in
 `benchmarks/2026-10-30/charge-dd-device.jsonl`, with the LU coarsest inverse). Each Gummel row: total time, then the
 Poisson and the continuity steps; 16 Gummel iterations at 0.6 V and 42 at 0.9 V, from the Newton solution 50 mV
 lower; no linear fallback in any row:
@@ -385,10 +480,10 @@ lower; no linear fallback in any row:
   than SuperLU (6.3 and 5.9 ms against 3.9 and 3.8 ms: only 3350 silicon cells, and a device solve has a fixed cost
   of some milliseconds for the host setup of the hierarchy, the transfers and the kernel launches); at 5 nm it is
   faster (7.7 and 8.3 ms against 16.2 and 16.0 ms).
-- Whole bias step: at 10 nm Newton is the fastest at both biases (the Gummel rows are 1.1x to 4.1x slower). At 5 nm
-  and 0.6 V the device Gummel path is the fastest (1.64 s against 4.76 s for Newton: 2.9x); at 5 nm and 0.9 V (high
-  injection, 42 Gummel iterations, each with a nonlinear Poisson solve) Newton is the fastest (4.78 s against
-  18.34 s).
+- Whole bias step (before the device Newton): at 10 nm the SuperLU Newton is the fastest at both biases (the Gummel
+  rows are 1.1x to 4.1x slower). At 5 nm and 0.6 V the device Gummel path is the fastest (1.64 s against 4.76 s for
+  Newton: 2.9x); at 5 nm and 0.9 V (high injection, 42 Gummel iterations, each with a nonlinear Poisson solve)
+  Newton is the fastest (4.78 s against 18.34 s).
 - The device code on the GPU is 3.0x to 16.8x faster than the same code with JAX on the CPU (total times).
 
 Earlier version (v1: the Poisson step with the 1024-cell coarsest level of thermal-gpu, the continuity steps on the
@@ -411,19 +506,26 @@ GPU (10 and 5 nm), and to 3.3e-10 (10 nm) and 5.6e-10 (5 nm) with it on the CPU.
   doping): 2.6 to 4.4 s per doping for 73k cells on the RX 7900 XT against 2.6 to 3.4 s on the Mac CPU, and 5.3 s
   against 8.6 s for 293k cells (`benchmarks/2026-10-30/charge-rc.jsonl`): no GPU gain at 73k cells.
 - No 3-D, no temperature dependence.
-- Drift-diffusion solvers: the Gummel iteration can run fully on the device (`linear="device"`), but the Newton
-  method still uses SuperLU on the CPU. On the SOI rib (the bench above) Newton is the fastest path at 10 nm (0.76 s
-  against 0.93 s and 3.14 s for the device Gummel path at 0.6 and 0.9 V) and at 5 nm in high injection (4.78 s
-  against 20.67 s at 0.9 V); the device Gummel path is the fastest at 5 nm and 0.6 V (1.64 s against 4.76 s).
-  Gummel converges linearly (16 iterations at 0.6 V, 42 at 0.9 V) and stalls on long devices with large cells (the
-  1.6 mm long-base diode). The continuity systems of an SOI rib are small (the silicon only: 3350 cells at 10 nm,
-  13 400 at 5 nm): SuperLU solves them faster than the device at 10 nm, the device is faster at 5 nm.
+- Drift-diffusion solvers: both methods can run their linear solves on the device (`linear="device"`). On the SOI
+  rib (the bench above) the device Newton is the fastest path: 0.44 to 0.50 s at 10 nm and 0.81 to 0.83 s at 5 nm,
+  against 0.76 to 0.77 s and 4.8 s with SuperLU and 1.08 to 20.5 s for the device Gummel path. SuperLU stays the
+  default: on small meshes (the 1-D tests) it is much faster (0.007 s against 0.206 s of linear solves on the
+  400-cell junction), and the device path compiles once per mesh (1.5 to 2.4 s). Gummel converges linearly (16
+  iterations at 0.6 V, 42 at 0.9 V) and stalls on long devices with large cells (the 1.6 mm long-base diode); the
+  device Newton does not (the long-base diode test).
+- The device Newton: the Jacobian is assembled on the host and the hierarchies are built on the host per Newton
+  step (about half of its time at 5 nm); the host loop of FGMRES makes one transfer per step (2.2 to 2.9 ms per
+  step in the logged bench). Its preconditioner leaves out the upper-triangle couplings (Poisson from the
+  quasi-Fermi levels, electrons from holes): 19 to 27 FGMRES steps per Newton step on average in the logged bench. Far from the solution (reverse bias from
+  `poisson.solve`) some solves stagnate at a relative residual of about 1e-9 to 1e-8; they are used as inexact
+  Newton steps (limit 1e-6). Not tested: meshes above 146 400 cells. Above a psi span of 31 V (the Slotboom
+  limit of `continuity.py`) every Newton step uses SuperLU.
 - The device continuity solver is tested from 1.0 V forward (PIN rib) to 25 V reverse (1-D junction, 1e18 cm^-3);
   its limit is a psi span of 1200 V_T (31 V) in the semiconductor (float64 range of the Slotboom scaling). A solve
   that does not converge, or a span above the limit, falls back to SuperLU for that step (`linear_fallbacks`).
-- Next: the coupled Newton step on the device (GMRES with a block preconditioner: the Poisson multigrid and the
-  Slotboom multigrid of `continuity.py`), and the setup of the hierarchies on the device (no host round trip per
-  solve).
+- Next: the Jacobian assembly and the setup of the hierarchies on the device (no host round trip per Newton step),
+  the FGMRES cycle as one jitted loop, an adaptive tolerance of the linear solves (Eisenstat-Walker), and a
+  choice of the linear solver from the mesh size.
 - Drift-diffusion physics: Boltzmann statistics, SRH with constant lifetimes and a midgap trap, the Masetti
   mobility constant in the field (no velocity saturation, no carrier-carrier scattering), no Auger recombination,
   no band-gap narrowing, no surface recombination at the oxide, 300 K only, ideal ohmic contacts, steady state only

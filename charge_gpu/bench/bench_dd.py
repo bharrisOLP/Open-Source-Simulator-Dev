@@ -6,7 +6,11 @@ Cases:
   Skipped with --no-sweep.
 - At each bias of --biases, from the Newton solution 50 mV lower (the same start for all rows):
   - pin-newton-step: one Newton solve (SuperLU on the CPU), the reference of the other rows;
-  - pin-gummel-superlu: Gummel, the Poisson step on the JAX device, the continuity steps with SuperLU on the CPU;
+  - pin-newton-device: one Newton solve with the device linear solver (coupled.py: FGMRES, block multigrid; the
+    Jacobian assembled on the host), with a one-step warm-up (the JIT compile) timed apart, and the times of the
+    assembly, the setup (hierarchies, transfers) and the FGMRES loops;
+  - pin-gummel-superlu: Gummel, the Poisson step on the JAX device, the continuity steps with SuperLU on the CPU
+    (skipped with --no-gummel-superlu);
   - pin-gummel-device: Gummel, the Poisson step and the continuity steps (BiCGSTAB, Slotboom multigrid) on the
     JAX device (the GPU when there is one);
   - pin-gummel-device-cpu: the same code with JAX on the CPU (CHARGE_GPU_DEVICE=cpu).
@@ -14,7 +18,7 @@ Cases:
   timed solve, the times of the Poisson and continuity steps, and the differences to the Newton solution.
 
     bash tools/gpu_run.sh charge_gpu python bench/bench_dd.py                                   (diode and 10 nm)
-    bash tools/gpu_run.sh charge_gpu python bench/bench_dd.py --dx 10e-9 5e-9 --no-diode --no-sweep
+    bash tools/gpu_run.sh charge_gpu python bench/bench_dd.py --dx 10e-9 5e-9 --no-diode --no-sweep --no-cpu
 """
 import argparse
 import json
@@ -86,7 +90,24 @@ def _gummel_row(dev, case, bias, start, ref, linear, cpu=False):
             "linear_fallbacks": g.linear_fallbacks, **_diff(g, ref)}
 
 
-def pin_cases(dx, biases, sweep=True, cpu=True):
+def _newton_device_row(dev, bias, start, ref):
+    """One Newton solve with the device linear solver (coupled.py), from the same start as the reference; a solve
+    with one Newton step first (the JIT compile of this mesh), timed apart."""
+    kw = dict(guess=start, method="newton", linear="device", tau_n=TAU, tau_p=TAU)
+    t0 = time.perf_counter()
+    dd.solve(dev, 0.0, bias, max_iter=1, **kw)
+    t_warm = time.perf_counter() - t0
+    t0 = time.perf_counter()
+    s = dd.solve(dev, 0.0, bias, **kw)
+    t = time.perf_counter() - t0
+    return {"case": "pin-newton-device", "bias_V": bias, "method": "newton", "linear": "device",
+            "jax_device": str(solver_device()), "time_s": round(t, 3), "warmup_1_iteration_s": round(t_warm, 3),
+            **{k: round(v, 3) for k, v in s.timings.items()}, "iterations": s.iterations,
+            "krylov_iterations": s.krylov_iterations, "converged": s.converged, "linear_residual": s.linear_error,
+            "linear_fallbacks": s.linear_fallbacks, **_diff(s, ref)}
+
+
+def pin_cases(dx, biases, sweep=True, cpu=True, gummel_superlu=True):
     dev = rib_pin(dx=dx)
     common = {"dx_nm": dx * 1e9, "cells": int(dev.n_net.size), "semiconductor_cells": int(dev.semiconductor.sum())}
     if sweep:
@@ -105,9 +126,11 @@ def pin_cases(dx, biases, sweep=True, cpu=True):
         t0 = time.perf_counter()
         ref = dd.solve(dev, 0.0, bias, guess=start, tau_n=TAU, tau_p=TAU)
         yield {"case": "pin-newton-step", **common, "bias_V": bias, "method": "newton", "linear": "superlu",
-               "time_s": round(time.perf_counter() - t0, 3), "iterations": ref.iterations,
-               "converged": ref.converged, "I_mA_per_mm": round(ref.current, 6)}
-        rows = [("pin-gummel-superlu", "superlu", False), ("pin-gummel-device", "device", False)]
+               "time_s": round(time.perf_counter() - t0, 3), **{k: round(v, 3) for k, v in ref.timings.items()},
+               "iterations": ref.iterations, "converged": ref.converged, "I_mA_per_mm": round(ref.current, 6)}
+        yield {**_newton_device_row(dev, bias, start, ref), **common}
+        rows = [("pin-gummel-superlu", "superlu", False)] if gummel_superlu else []
+        rows.append(("pin-gummel-device", "device", False))
         if cpu:
             rows.append(("pin-gummel-device-cpu", "device", True))
         for case, linear, on_cpu in rows:
@@ -123,13 +146,15 @@ def main():
     ap.add_argument("--no-diode", action="store_true")
     ap.add_argument("--no-sweep", action="store_true", help="skip the Newton sweep 0 to 1.0 V")
     ap.add_argument("--no-cpu", action="store_true", help="skip the device path with JAX on the CPU")
+    ap.add_argument("--no-gummel-superlu", action="store_true", help="skip Gummel with the SuperLU continuity steps")
     a = ap.parse_args()
     print(json.dumps({"case": "env", "jax_default_device": str(solver_device()), "cpu_count": os.cpu_count(),
                       "jax": jax.__version__}), flush=True)
     if not a.no_diode:
         print(json.dumps(diode_case()), flush=True)
     for dx in a.dx:
-        for row in pin_cases(dx, a.biases, sweep=not a.no_sweep, cpu=not a.no_cpu):
+        for row in pin_cases(dx, a.biases, sweep=not a.no_sweep, cpu=not a.no_cpu,
+                             gummel_superlu=not a.no_gummel_superlu):
             print(json.dumps(row), flush=True)
 
 

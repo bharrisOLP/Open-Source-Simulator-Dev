@@ -232,8 +232,9 @@ def test_short_base_diode_against_shockley_on_the_device():
 
 
 def test_linear_option_is_checked():
+    """An unknown linear solver is refused for both methods (Newton with linear="device": test_newton_device.py)."""
     dev, _ = junction(n=50)
     with pytest.raises(ValueError, match="linear"):
         dd.solve(dev, 0.0, 0.1, method="gummel", linear="cg")
-    with pytest.raises(ValueError, match="newton"):
-        dd.solve(dev, 0.0, 0.1, linear="device")
+    with pytest.raises(ValueError, match="linear"):
+        dd.solve(dev, 0.0, 0.1, method="newton", linear="cg")
