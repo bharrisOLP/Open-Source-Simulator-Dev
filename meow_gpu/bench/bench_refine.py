@@ -89,7 +89,10 @@ def main():
                "matvecs_all": int(sum(i.matvecs for i in infos)),
                "iterations": its, "iterations_total": int(sum(its)),
                "max_residual": float(max(i.residual for i in infos)),
-               "all_converged": bool(all(i.converged for i in infos))}
+               "all_converged": bool(all(i.converged for i in infos)),
+               # cells of each polish ("refine+davidson": the fallback ran; "": single, double)
+               "polish_used": {u: sum(i.polish_used == u for i in infos)
+                               for u in sorted({i.polish_used for i in infos})}}
         t0 = time.perf_counter()
         with jax.default_device(jax.devices("cpu")[0]):
             S, port_map = mw.compute_s_matrix(modes, cells=cells)

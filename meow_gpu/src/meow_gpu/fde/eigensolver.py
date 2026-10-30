@@ -113,6 +113,14 @@ def precondition(pc: Preconditioner, r: jax.Array, theta: jax.Array) -> jax.Arra
 # Fixed-shape device kernels. Blocks are (rows, 2, Nx, Ny); the products use a flat (rows, n) view.
 # ---------------------------------------------------------------------------------------------------------------
 
+def require_x64(precision: str) -> None:
+    """Precision "mixed" and "double" need complex128. Without ``jax_enable_x64``, JAX runs the complex128 parts in
+    complex64 without an error (a polish to the complex64 floor that cannot reach its tolerance): stop with an error."""
+    if precision in ("mixed", "double") and jax.dtypes.canonicalize_dtype(jnp.complex128) != jnp.complex128:
+        raise RuntimeError(f'precision "{precision}" needs complex128: call jax.config.update("jax_enable_x64", True) '
+                           "before the solve")
+
+
 def _flat(a: jax.Array) -> jax.Array:
     return a.reshape(a.shape[0], -1)
 
@@ -193,6 +201,7 @@ class EigResult:
     matvecs: int              # operator applies (vectors), in all precisions
     converged: bool
     matvecs_hi: int = 0       # the operator applies in complex128 (vectors)
+    polish: str = ""          # "mixed": the complex128 polish used ("refine", "refine+davidson" or "davidson")
 
 
 def _davidson_fixed(op: DeviceOperator, pc: Preconditioner, k: int, target: complex, x0: jax.Array, tol: float,
@@ -296,10 +305,14 @@ def _davidson_fixed(op: DeviceOperator, pc: Preconditioner, k: int, target: comp
 # with their near neighbours (``_selection``): with the wanted set of the first step, a mode count that cuts a
 # near-degenerate pair (even and odd supermodes, splitting 2.7e-8 in neff) gave the other mode of the pair (review,
 # 2026-10-30).
+# An identified Ritz value that no pair follows (residual below REFINE_IDENTIFIED) replaces the followed value farthest
+# from the target when it is nearer the target (``_track``): an eigenvalue that the complex64 Davidson did not find
+# can come in (the second mode of a near-degenerate pair of window modes, examples/chip_to_fiber_coupling.py).
 # The refinement stops with ``converged=False`` when the largest residual of the stop test does not halve in
 # ``REFINE_STALL`` steps (for example a tolerance below the complex128 floor; the count starts again when a pair
 # enters the stop test for the first time), when no correction is left, or at the step limit; it then gives the step
-# with the smallest largest residual.
+# with the smallest largest residual. ``davidson`` (precision "mixed") then runs the steps of the earlier polish from
+# the complex64 block (``_refine_with_fallback``).
 # ---------------------------------------------------------------------------------------------------------------
 
 REFINE_INNER = 20         # GMRES steps of each complex64 correction solve
@@ -374,11 +387,17 @@ def _gmres_coef(hb: np.ndarray, beta: np.ndarray, active: np.ndarray) -> np.ndar
     return y
 
 
-def _track(vals: np.ndarray, prev: np.ndarray) -> np.ndarray:
+def _track(vals: np.ndarray, prev: np.ndarray, rn_vals: np.ndarray | None = None,
+           target: complex = 0.0) -> np.ndarray:
     """The indices of the Ritz values ``vals`` that continue the pairs with the values ``prev`` (one for each pair,
     in the order of prev; greedy: the nearest (pair, value) first). Pairs with no value left are left out, and the
     next pairs move one index down: this has no effect on the result, because ``_selection`` chooses the wanted
-    pairs by their distance to the target, not by their index."""
+    pairs by their distance to the target, not by their index.
+
+    rn_vals (the relative residuals of all values): then an identified value that no pair follows (residual below
+    REFINE_IDENTIFIED) replaces the followed value farthest from the target, when it is nearer the target. This
+    lets an eigenvalue that the complex64 Davidson did not find come in (for example the second mode of a
+    near-degenerate pair), but not a spurious Ritz value (its residual is large)."""
     d = np.abs(prev[:, None] - vals[None, :])
     out = np.full(len(prev), -1)
     used = np.zeros(len(vals), dtype=bool)
@@ -386,7 +405,26 @@ def _track(vals: np.ndarray, prev: np.ndarray) -> np.ndarray:
         i, j = divmod(int(flat), len(vals))
         if out[i] < 0 and not used[j]:
             out[i], used[j] = j, True
-    return out[out >= 0]
+    out = out[out >= 0]
+    if rn_vals is None or len(out) == 0:
+        return out
+    dist = np.abs(vals - target)
+    for j in np.argsort(dist, kind="stable"):
+        if used[j] or not rn_vals[j] < REFINE_IDENTIFIED:
+            continue
+        far = int(np.argmax(dist[out]))
+        if dist[j] >= dist[out[far]]:
+            break
+        used[out[far]], used[j] = False, True
+        out[far] = j
+    return out
+
+
+@jax.jit
+def _take_rows(xa: jax.Array, ra: jax.Array, sel: jax.Array, mask: jax.Array):
+    """Rows sel of xa and ra; the rows without ``mask`` are zero."""
+    m4 = mask[:, None, None, None]
+    return jnp.where(m4, xa[sel], 0), jnp.where(m4, ra[sel], 0)
 
 
 def _selection(theta: np.ndarray, rn: np.ndarray, nb: int, k: int, target: complex, tol: float):
@@ -423,6 +461,7 @@ def refine(op32: DeviceOperator, op64: DeviceOperator, pc: Preconditioner, k: in
     applies of the correction solves; ``matvecs_hi`` counts the complex128 applies. Not converged: the result of the
     step with the smallest largest residual of the stop test.
     """
+    require_x64("mixed")
     b = x0.shape[0]
     big_m = 2 * b
     drop = 1e-10                                     # as the complex128 Davidson
@@ -453,18 +492,27 @@ def refine(op32: DeviceOperator, op64: DeviceOperator, pc: Preconditioner, k: in
     for it in range(1, max_steps + 1):
         # 1. complex128 Rayleigh-Ritz and residuals
         vals, y = np.linalg.eig(h[:m, :m])
+        yall = np.zeros((big_m, big_m), dtype=np.complex128)        # all m Ritz pairs, for _track
+        yall[:m, :m] = y
+        tall = np.zeros(big_m, dtype=np.complex128)
+        tall[:m] = vals
+        xa, ra, rna_dev = _ritz(put(yall, jnp.complex128), put(tall, jnp.complex128), v, w)
+        rna = np.array(rna_dev, dtype=np.float64)
+        rna[m:] = np.inf
         if it == 1:
             order = np.argsort(np.abs(vals - target))[:b]
         else:
-            order = _track(vals, theta[:nb])
+            order = _track(vals, theta[:nb], rna[:m], target)
         nb = len(order)
         theta = np.zeros(b, complex)
         theta[:nb] = vals[order]
         ypad = np.zeros((big_m, b), dtype=np.complex128)
         ypad[:m, :nb] = y[:, order]
-        x, r, rn_dev = _ritz(put(ypad, jnp.complex128), put(theta, jnp.complex128), v, w)
-        rn = np.array(rn_dev, dtype=np.float64)
-        rn[nb:] = np.inf
+        sel = np.zeros(b, dtype=np.int32)
+        sel[:nb] = order
+        x, r = _take_rows(xa, ra, put(sel), put(np.arange(b) < nb))
+        rn = np.full(b, np.inf)
+        rn[:nb] = rna[order]
         used, worst = _selection(theta, rn, nb, k, target, tol)
         if verbose:
             print(f"  refine {it:3d} m {m:3d} max res {worst:.2e} ({len(used)} pairs) theta0 {theta[0]:.14f}",
@@ -537,6 +585,7 @@ def davidson(op: DeviceOperator | tuple[DeviceOperator, DeviceOperator], pc: Pre
         raise ValueError("the initial block needs at least k vectors")
     if polish not in POLISHES:
         raise ValueError(f"polish must be one of {POLISHES}")
+    require_x64(precision)
     max_subspace = max_subspace or max(4 * b, b + 2 * k)   # the host eig costs O(max_subspace^3)
     if precision == "mixed":
         op32, op64 = op
@@ -547,16 +596,53 @@ def davidson(op: DeviceOperator | tuple[DeviceOperator, DeviceOperator], pc: Pre
             return lo                         # no iterations left for the polish: the complex64 result, not converged
         left = max(0, max_iter - lo.iterations)
         if polish == "refine":
-            hi = refine(op32, op64, pc, k, target, lo.vectors, tol, left, inner, verbose)
+            hi = _refine_with_fallback(op32, op64, pc, k, target, lo.vectors, tol, left, inner, verbose,
+                                       max_subspace)
         else:
             # complex128 products are slow on consumer GPUs: the polish uses a small subspace (3 blocks)
             hi = _davidson_fixed(op64, pc, k, target, lo.vectors.astype(jnp.complex128), tol, left, 3 * b, verbose)
+            hi.polish = "davidson"
         hi.iterations += lo.iterations
         hi.matvecs += lo.matvecs
         return hi
     dtype = jnp.complex64 if precision == "single" else jnp.complex128
     return _davidson_fixed(op, pc, k, target, x0.astype(dtype), tol, max_iter, max_subspace, verbose,
                            stall_iters=12 if precision == "single" else 0)
+
+
+FALLBACK_STALL = 30       # the complex128 stage of the fallback stops when its residual did not halve in this many
+#                           iterations (only below STALL_FLOOR: a tolerance below the complex128 floor)
+
+
+def _refine_with_fallback(op32: DeviceOperator, op64: DeviceOperator, pc: Preconditioner, k: int, target: complex,
+                          lo_vectors: jax.Array, tol: float, left: int, inner: int, verbose: bool,
+                          max_subspace: int) -> EigResult:
+    """``refine`` from the complex64 block ``lo_vectors``. When it stops without convergence and iterations are left,
+    the fallback runs the steps of the earlier polish from the same complex64 block: the complex64 Davidson
+    continues to DAVIDSON_SWITCH_TOL, then the complex128 Davidson with a subspace of 3 blocks (with a stall rule,
+    FALLBACK_STALL). The fallback does not start from the refined block: from there it cannot find an eigenvalue that
+    the refined block misses (the second mode of a near-degenerate pair; review, 2026-10-30).
+
+    Result: that of the refinement ("refine"), or (``polish`` "refine+davidson") that of the fallback when it
+    converged, else the one of the two with the smaller largest residual. converged=True always means that the k
+    pairs have complex128 residuals below tol. The counts include both parts."""
+    hi = refine(op32, op64, pc, k, target, lo_vectors, tol, left, inner, verbose)
+    hi.polish = "refine"
+    rest = left - hi.iterations
+    if hi.converged or rest <= 0:
+        return hi
+    b = lo_vectors.shape[0]
+    fb = _davidson_fixed(op32, pc, k, target, lo_vectors.astype(jnp.complex64), max(DAVIDSON_SWITCH_TOL, tol), rest,
+                         max_subspace, verbose, stall_iters=12)
+    if fb.iterations < rest:
+        lo_iters, lo_mv = fb.iterations, fb.matvecs
+        fb = _davidson_fixed(op64, pc, k, target, fb.vectors.astype(jnp.complex128), tol, rest - lo_iters, 3 * b,
+                             verbose, stall_iters=FALLBACK_STALL)
+        fb.iterations += lo_iters
+        fb.matvecs += lo_mv
+    best = fb if fb.converged or np.max(fb.residuals) <= np.max(hi.residuals) else hi
+    return EigResult(best.values, best.vectors.astype(jnp.complex128), best.residuals, hi.iterations + fb.iterations,
+                     hi.matvecs + fb.matvecs, best.converged, hi.matvecs_hi + fb.matvecs_hi, "refine+davidson")
 
 
 def _switch_tol(polish: str, switch_tol: float | None) -> float:
@@ -671,6 +757,7 @@ class BatchEigResult:
     matvecs: np.ndarray       # (B,)
     converged: np.ndarray     # (B,) bool
     matvecs_hi: np.ndarray | None = None   # (B,) the complex128 applies (None: zero)
+    polishes: list[str] | None = None      # (B,) the polish of each member, as EigResult.polish (None: "")
 
     def __len__(self) -> int:
         return len(self.iterations)
@@ -678,8 +765,9 @@ class BatchEigResult:
     def member(self, i: int) -> EigResult:
         """The result of member i, as ``davidson`` gives it."""
         hi = 0 if self.matvecs_hi is None else int(self.matvecs_hi[i])
+        polish = "" if self.polishes is None else self.polishes[i]
         return EigResult(self.values[i], self.vectors[i], self.residuals[i], int(self.iterations[i]),
-                         int(self.matvecs[i]), bool(self.converged[i]), hi)
+                         int(self.matvecs[i]), bool(self.converged[i]), hi, polish)
 
 
 def _davidson_batch_fixed(op: DeviceOperator, pc: Preconditioner, k: int, target: np.ndarray, x0: jax.Array,
@@ -816,6 +904,7 @@ def davidson_batch(op: DeviceOperator | tuple[DeviceOperator, DeviceOperator], p
         raise ValueError("the initial block needs at least k vectors")
     if polish not in POLISHES:
         raise ValueError(f"polish must be one of {POLISHES}")
+    require_x64(precision)
     max_subspace = max_subspace or max(4 * b, b + 2 * k)
     target = np.broadcast_to(np.asarray(target, dtype=complex), (nbat,))
     tol = np.broadcast_to(np.asarray(tol, dtype=float), (nbat,))
@@ -830,7 +919,7 @@ def davidson_batch(op: DeviceOperator | tuple[DeviceOperator, DeviceOperator], p
         if not todo.any():
             return lo
         if polish == "refine":
-            return _refine_members(op32, op64, pc, k, target, tol, left, inner, verbose, lo, todo)
+            return _refine_members(op32, op64, pc, k, target, tol, left, inner, verbose, lo, todo, max_subspace)
         hi = _davidson_batch_fixed(op64, pc, k, target, lo.vectors.astype(jnp.complex128), tol, left, 3 * b,
                                    verbose)
         keep = ~todo
@@ -840,6 +929,7 @@ def davidson_batch(op: DeviceOperator | tuple[DeviceOperator, DeviceOperator], p
         hi.iterations = hi.iterations + lo.iterations
         hi.matvecs = np.where(todo, hi.matvecs + lo.matvecs, lo.matvecs)
         hi.matvecs_hi = np.where(todo, hi.matvecs_hi, 0)
+        hi.polishes = ["davidson" if t else "" for t in todo]
         return hi
     dtype = jnp.complex64 if precision == "single" else jnp.complex128
     return _davidson_batch_fixed(op, pc, k, target, x0.astype(dtype), tol, max_iter, max_subspace, verbose,
@@ -847,19 +937,21 @@ def davidson_batch(op: DeviceOperator | tuple[DeviceOperator, DeviceOperator], p
 
 
 def _refine_members(op32, op64, pc, k, target, tol, left, inner, verbose, lo: BatchEigResult,
-                    todo: np.ndarray) -> BatchEigResult:
-    """``refine`` for each member with ``todo``, from the complex64 result ``lo`` of the batch; the other members
-    keep their complex64 result (as ``davidson`` does when no iterations are left)."""
+                    todo: np.ndarray, max_subspace: int) -> BatchEigResult:
+    """``refine`` (with the fallback of ``_refine_with_fallback``) for each member with ``todo``, from the complex64
+    result ``lo`` of the batch; the other members keep their complex64 result (as ``davidson`` does when no
+    iterations are left)."""
     def member(tree, i):
         return jax.tree.map(lambda a: a[i], tree)
 
     vectors = lo.vectors.astype(jnp.complex128)
     out = BatchEigResult(lo.values.copy(), vectors, lo.residuals.copy(), lo.iterations.copy(), lo.matvecs.copy(),
-                         lo.converged.copy(), np.zeros(len(lo), dtype=int))
+                         lo.converged.copy(), np.zeros(len(lo), dtype=int), [""] * len(lo))
     rows = []
     for i in np.flatnonzero(todo):
-        r = refine(member(op32, i), member(op64, i), member(pc, i), k, target[i], lo.vectors[i], float(tol[i]),
-                   int(left[i]), inner, verbose)
+        r = _refine_with_fallback(member(op32, i), member(op64, i), member(pc, i), k, target[i], lo.vectors[i],
+                                  float(tol[i]), int(left[i]), inner, verbose, max_subspace)
+        out.polishes[i] = r.polish
         out.values[i], out.residuals[i], out.converged[i] = r.values, r.residuals, r.converged
         out.iterations[i] += r.iterations
         out.matvecs[i] += r.matvecs

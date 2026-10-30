@@ -40,3 +40,18 @@ def coupler(core=11, height=0.22, gap=40, margin=25, n_core=N_SI, n_clad=N_SIO2,
         return np.where(inside, n_core**2, n_clad**2).astype(complex)
 
     return eps(cell, ye), eps(edge, yc), eps(edge, ye), x, y
+
+
+def sin_tip(half=7.0, dx=0.1, side=0.3, n_core=N_SIN, n_clad=N_SIO2):
+    """A small square SiN core (side x side um) in SiO2, in a square window of +-half um: a weakly guided mode
+    (neff about 1.448 at 1.55 um, cladding 1.444) just above a dense band of window modes. The structure of
+    examples/chip_to_fiber_coupling.py on a coarser grid (that example: dx = 0.05)."""
+    g = np.arange(-half, half + 1e-9, dx)
+    xc, xe = 0.5 * (g[1:] + g[:-1]), g[:-1]
+
+    def eps(xx, yy):
+        X, Y = np.meshgrid(xx, yy, indexing="ij")
+        core = (np.abs(X) < side / 2) & (np.abs(Y) < side / 2)
+        return np.where(core, n_core**2, n_clad**2).astype(complex)
+
+    return eps(xc, xe), eps(xe, xc), eps(xe, xe), g, g

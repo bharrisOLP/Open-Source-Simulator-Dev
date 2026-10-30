@@ -7,15 +7,19 @@ resolution), they are eigenpairs of the assembled SciPy matrix (an independent c
 refinement needs far fewer complex128 operator applies than the complex128 Davidson polish, and it stops with
 converged=False (not silently) when it cannot reach the tolerance.
 """
+import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
 import scipy.sparse.linalg as sla
-from structures import coupler, strip
+from structures import coupler, sin_tip, strip
 
+import meow_gpu.fde.eigensolver as eigensolver
 from meow_gpu.device import put
 from meow_gpu.fde.eigensolver import (
+    REFINE_INNER,
     REFINE_STALL,
+    _refine_with_fallback,
     _selection,
     _track,
     davidson,
@@ -193,6 +197,12 @@ def test_track_keeps_each_pair():
     vals = np.array([-1.850276 + 4e-11j, -1.935, -6.956546, -1.886025 - 8.5e-4j, -7.809716, -1.887704 - 6e-11j])
     assert list(_track(vals, prev)) == [4, 2, 5, 0]
     assert list(_track(vals[:3], prev)) == [2, 1, 0]       # fewer values than pairs: pair 0 is left out
+    # with the residuals of all values: -1.935 comes in only when it is identified (residual below 1e-2); then it
+    # replaces the followed value farthest from the target (-1.850276). The spurious value never comes in.
+    rn = np.array([1e-10, 8.6e-2, 1e-12, 4e-1, 1e-12, 1e-10])
+    assert list(_track(vals, prev, rn, -12.0)) == [4, 2, 5, 0]
+    rn[1] = 1e-4
+    assert list(_track(vals, prev, rn, -12.0)) == [4, 2, 5, 1]
 
 
 def test_solver_warns_when_the_refinement_does_not_converge():
@@ -201,6 +211,130 @@ def test_solver_warns_when_the_refinement_does_not_converge():
     with pytest.warns(UserWarning, match="did not converge"):
         s.solve(p, K)
     assert not s.last_info.converged and s.last_info.residual < 1e-12
+    assert s.last_info.polish_used == "refine+davidson"      # the fallback ran too
+    assert s.last_info.iterations < 250 < s.max_iter          # its stall rule stopped it (review, 2026-10-30)
+
+
+def test_fallback_stops_by_its_stall_rule_and_keeps_the_better_result(strip_case):
+    """A tolerance below the complex128 floor: the fallback (the steps of the earlier polish from the complex64 block)
+    stops by its stall rule, not at the iteration limit, and the result is not worse than that of the refinement
+    alone (review, 2026-10-30: without the stall rule, 500 iterations and a larger final residual)."""
+    p, pc, target, x0, op = strip_case
+    x64 = davidson(op[0], pc, K, target, x0, tol=1e-3, precision="single").vectors
+    alone = refine(op[0], op[1], pc, K, target, x64, tol=1e-17, max_steps=400)
+    both = _refine_with_fallback(op[0], op[1], pc, K, target, x64, 1e-17, 400, REFINE_INNER, False, 4 * (K + 4))
+    assert not alone.converged and not both.converged and both.polish == "refine+davidson"
+    assert both.iterations < 400
+    assert np.max(both.residuals) <= np.max(alone.residuals) and np.max(both.residuals) < 1e-12
+    assert both.matvecs_hi > alone.matvecs_hi
+
+
+def test_batched_fallback():
+    """The fallback in the batched path (``_refine_members``, ``BatchEigResult.polishes``): a tolerance out of reach
+    (both members: "refine+davidson", stopped by the stall rule), and the weakly guided SiN tip in a batch of 1 (the
+    result of ``solve``)."""
+    probs = [make_problem(*strip(width=w, dx=0.04, dy=0.04, w_dom=2.4, h_dom=1.6), 1.55) for w in (0.45, 0.5)]
+    s = GPUModeSolver(precision="mixed", extra=4, tol=1e-17, warm_start=False)
+    with pytest.warns(UserWarning, match="did not converge"):
+        s.solve_batch(probs, K)
+    for info in s.last_batch_info:
+        assert info.polish_used == "refine+davidson" and not info.converged
+        assert info.residual < 1e-12 and info.iterations < s.max_iter
+    p = make_problem(*sin_tip(), 1.55)
+    one = GPUModeSolver(precision="mixed", extra=8, warm_start=False)
+    n_one, e_one, _ = one.solve(p, K)
+    bat = GPUModeSolver(precision="mixed", extra=8, warm_start=False)
+    ((n_bat, e_bat, _),) = bat.solve_batch([p], K)
+    assert bat.last_batch_info[0].converged and one.last_info.converged
+    assert bat.last_batch_info[0].polish_used == one.last_info.polish_used == "refine+davidson"
+    assert np.max(np.abs(n_bat - n_one)) < 1e-9
+    assert np.all(_cos(e_bat[:2], e_one[:2]) > 1 - 1e-6)
+
+
+def test_complex128_precisions_need_x64(strip_case):
+    """Without jax_enable_x64, JAX runs complex128 arrays in complex64 without an error: "mixed" and "double" stop
+    with a clear error instead (review, 2026-10-30)."""
+    p, pc, target, x0, op = strip_case
+    jax.config.update("jax_enable_x64", False)
+    try:
+        for precision in ("mixed", "double"):
+            with pytest.raises(RuntimeError, match="jax_enable_x64"):
+                GPUModeSolver(precision=precision).solve(p, K)
+            with pytest.raises(RuntimeError, match="jax_enable_x64"):
+                davidson(op if precision == "mixed" else op[1], pc, K, target, x0, precision=precision)
+        with pytest.raises(RuntimeError, match="jax_enable_x64"):
+            refine(op[0], op[1], pc, K, target, x0, tol=1e-10, max_steps=1)
+    finally:
+        jax.config.update("jax_enable_x64", True)
+
+
+def test_weakly_guided_mode_converges():
+    """Regression (2026-10-30, examples/chip_to_fiber_coupling.py): a weakly guided SiN tip mode just above a dense
+    band of window modes. The refinement alone stalls at a residual of about 3e-10 (the halving rule stops it; before
+    the fallback, "mixed" returned converged=False here, while polish="davidson" converged). The fallback runs the
+    steps of the earlier polish from the complex64 block. References: the earlier polish and the double
+    solve from the same start (neff and fields), ARPACK shift-invert on the assembled matrix (the neff of the two
+    guided modes; ARPACK also finds two modes at exactly n = 1.444 that all precisions of this solver miss, a known
+    limit), and the residuals of all 4 pairs with the assembled SciPy matrix."""
+    p = make_problem(*sin_tip(), 1.55)
+    s = GPUModeSolver(precision="mixed", extra=8, warm_start=False)
+    n_mix, e_mix, _ = s.solve(p, K)
+    assert s.last_info.converged and s.last_info.residual < 1e-10
+    assert s.last_info.polish_used in ("refine", "refine+davidson")
+    old = GPUModeSolver(precision="mixed", polish="davidson", extra=8, warm_start=False)
+    n_old, e_old, _ = old.solve(p, K)
+    assert old.last_info.converged and old.last_info.polish_used == "davidson"
+    dbl = GPUModeSolver(precision="double", extra=8, warm_start=False)
+    n_dbl, e_dbl, _ = dbl.solve(p, K)
+    assert dbl.last_info.converged and dbl.last_info.polish_used == ""
+    assert np.max(np.abs(n_mix - n_old)) < 1e-9 and np.max(np.abs(n_mix - n_dbl)) < 1e-9
+    assert np.real(n_mix[0]) > 1.444                          # the guided mode
+    # fields: the two guided modes (the window modes 3 and 4 are a near-degenerate pair: compare their subspace)
+    assert np.all(_cos(e_mix[:2], e_dbl[:2]) > 1 - 1e-6)
+    qa, qb = np.linalg.qr(_unit(e_mix[2:4]).T)[0], np.linalg.qr(_unit(e_dbl[2:4]).T)[0]
+    assert np.linalg.svd(qa.conj().T @ qb, compute_uv=False).min() > 1 - 1e-6
+    target = -(1.996 * (1 + 10 * np.finfo(float).eps)) ** 2
+    vals = sla.eigs(assemble(p), k=K, sigma=target, tol=1e-13, return_eigenvectors=False)
+    n_ref = np.sort(np.real(_neff(vals)))[::-1]
+    assert np.max(np.abs(np.real(n_mix[:2]) - n_ref[:2])) < 1e-9
+    u = e_mix[:, :2]                                          # (Ex, Ey): the eigenvector of the operator
+    assert np.all(_scipy_residuals(p, -(n_mix**2), u) < 1e-10)
+
+
+@pytest.fixture(scope="module")
+def example_tip():
+    """The grid of examples/chip_to_fiber_coupling.py (the SiN tip on 50 nm, 280 x 280 cells, 4 modes, extra 8) and
+    the references: the earlier polish and the double solve."""
+    p = make_problem(*sin_tip(dx=0.05), 1.55)
+    old = GPUModeSolver(precision="mixed", polish="davidson", extra=8, warm_start=False)
+    ref_old = old.solve(p, K)
+    dbl = GPUModeSolver(precision="double", extra=8, warm_start=False)
+    ref_dbl = dbl.solve(p, K)
+    assert old.last_info.converged and dbl.last_info.converged
+    return p, ref_old, ref_dbl
+
+
+@pytest.mark.parametrize("admission", [True, False])
+def test_example_grid_gives_the_modes_of_the_earlier_polish(example_tip, monkeypatch, admission):
+    """End to end on the grid of the example (review, 2026-10-30). Before the admission rule and the fallback, the
+    4th mode was 1.44122808 instead of 1.4418766 (the second mode of a near-degenerate pair of window modes was not
+    in the block). admission=False turns off the admission rule of ``_track``: then only the fallback (the steps of
+    the earlier polish from the complex64 block) protects the result, and it must give the same modes. All 4 neff
+    against the earlier polish and the double solve; the fields of the guided modes by overlap, the near-degenerate
+    pair by its subspace."""
+    p, (n_old, e_old, _), (n_dbl, e_dbl, _) = example_tip
+    if not admission:
+        track = eigensolver._track
+        monkeypatch.setattr(eigensolver, "_track", lambda vals, prev, rn_vals=None, target=0.0: track(vals, prev))
+    s = GPUModeSolver(precision="mixed", extra=8, warm_start=False)
+    n, e, _ = s.solve(p, K)
+    assert s.last_info.converged
+    assert np.max(np.abs(n - n_old)) < 1e-9 and np.max(np.abs(n - n_dbl)) < 1e-9
+    assert np.real(n[3]) > 1.4418                             # not the wrong mode of the regression (1.44122808)
+    for ref in (e_old, e_dbl):
+        assert np.all(_cos(e[:2], ref[:2]) > 1 - 1e-6)
+        qa, qb = np.linalg.qr(_unit(e[2:4]).T)[0], np.linalg.qr(_unit(ref[2:4]).T)[0]
+        assert np.linalg.svd(qa.conj().T @ qb, compute_uv=False).min() > 1 - 1e-6
 
 
 def test_mixed_iteration_limit_inside_the_refinement(strip_case):

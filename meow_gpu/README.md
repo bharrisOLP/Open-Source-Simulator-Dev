@@ -162,10 +162,34 @@ the refinement stopped there. The operator is not Hermitian, so a step can also 
 modes of a near-degenerate pair. With the wanted set of the first step, a mode count that cuts such a pair gave the
 other mode of the pair with `converged=True` (review, 2026-10-30: two cores, 1 mode, TE odd instead of TE even). An
 identified neighbour (residual below 1e-2) whose Ritz value can still be nearer the target than a wanted value
-(within its residual) must also converge before the stop. The result gives the pairs sorted by the distance to the
-target. The refinement stops with `converged=False` when the largest residual of the stop test does not halve in 3
-steps, when no correction is left, or at the iteration limit. It then gives the step with the smallest residual,
-and `GPUModeSolver` warns. `polish="davidson"` gives the earlier method; `GPUModeSolver(switch_tol=...,
+(within its residual) must also converge before the stop. An identified Ritz value that no pair follows (residual
+below 1e-2; the refinement computes the residuals of all Ritz pairs) replaces the followed value farthest from the
+target when it is nearer the target: an eigenvalue that the complex64 Davidson did not find can come in, a spurious
+value (large residual) cannot. The result gives the pairs sorted by the distance to the target. The refinement stops
+without convergence when the largest residual of the stop test does not halve in 3 steps, when no correction is
+left, or at the iteration limit.
+
+**Fallback.** When the refinement stops without convergence and iterations are left, the fallback runs the steps of
+the earlier polish from the same complex64 block: the complex64 Davidson continues to the switch tolerance of the
+earlier polish (2e-5), then the complex128 Davidson with 3 blocks. It does not start from the refined block: from
+there it cannot find an eigenvalue that the refined block misses (review, 2026-10-30: from the refined block, with
+the admission rule turned off, it converged to a wrong 4th mode on the grid of the example). The complex128 stage
+stops when its residual does not halve in 30 iterations (only below 1e-3), and the result is the fallback result
+when it converged, else the result (refinement or fallback) with the smaller residual. What the code guarantees:
+`converged=True` means that the k pairs have complex128 residuals below the tolerance; the mode set is that of a
+Davidson run from the complex64 block, so the known limit "all precisions can miss eigenvalues" applies to it as to
+the earlier polish. `SolveInfo.polish_used` gives "refine", "refine+davidson" (the fallback ran) or "davidson" (""
+for "single", "double", and for "mixed" when no iterations are left after the complex64 stage); the iterations and
+the complex128 applies include all parts. Reason (2026-10-30, `examples/chip_to_fiber_coupling.py`): for the weakly
+guided mode of a SiN tip (0.3 x 0.3 um, just above a dense band of window modes in a 14 x 14 um window, 4 modes)
+the refinement stopped above the tolerance, and the example stopped. Its 4th mode was also not that of the earlier
+polish: the second mode of a near-degenerate pair of window modes was not in the block of the complex64 Davidson,
+and the tracking did not let it in. With the admission of identified values and the fallback, the variants of this
+structure that were tried on the GPU (windows of 8 to 14 um, grids of 50 to 100 nm) converge to the 4 neff of the
+earlier polish; the refinement alone did not converge there, and the fallback finished. The test
+`test_weakly_guided_mode_converges` (the 14 um window on a 100 nm grid) failed before this change; the test
+`test_example_grid_gives_the_modes_of_the_earlier_polish` checks all 4 modes on the 50 nm grid of the example,
+with and without the admission rule. `polish="davidson"` gives the earlier method; `GPUModeSolver(switch_tol=...,
 refine_inner=...)` changes the two parameters.
 
 **Checks** (`tests/test_refine.py`; the numbers below are from the same cases on the RX 7900 XT, run through
@@ -187,7 +211,11 @@ column gives the complex128 applies of the refinement / the earlier polish / the
   and the double solve (test bound 1 - |cos| < 1e-5; max |dneff| against the double solve 7.9e-12, in the review
   script of the same cases).
 - A tolerance below the complex128 floor (1e-17): the refinement stops after 7 steps, with `converged=False` and
-  residuals of 0.9e-14 to 1.4e-14. The step limit also gives `converged=False`, and the solver warns.
+  residuals of 0.9e-14 to 1.4e-14 (`refine` alone). In `mixed`, the fallback then runs and stops by its stall rule
+  (not at the iteration limit); its result is not worse than that of the refinement. The step limit also gives
+  `converged=False`, and the solver warns.
+- Precision "mixed" and "double" need `jax_enable_x64`: without it JAX runs complex128 arrays in complex64 without an
+  error, so the solver stops with an error.
 
 **EME of the taper** (`bench/bench_refine.py`: the 30-cell taper of `bench_eme_taper.py`, 10 modes, 20 nm grid; RX
 7900 XT, `--repeat 2`, the second run; times as in the tables above, with meow's post-processing; rows in
@@ -195,10 +223,10 @@ column gives the complex128 applies of the refinement / the earlier polish / the
 
 | Case | Mode solves | complex128 applies | Iterations (sequential) | \|S21\| | max \|dneff\| against double |
 |---|---|---|---|---|---|
-| double | 28.95 s | 21213 | 1080 | 0.9933381220221 | - |
+| double | 28.46 s | 21213 | 1080 | 0.9933381220221 | - |
 | mixed, earlier polish (`polish="davidson"`) | 19.48 s | 18642 | 1625 | 0.9933381220224 | 6.2e-12 |
-| mixed, refine (default) | 11.77 s | 1729 | 487 | 0.9933381220219 | 3.4e-12 |
-| single | 5.59 s | 0 | 480 | 0.9933148474063 | 5.4e-6 |
+| mixed, refine (default) | 11.72 s | 1729 | 487 | 0.9933381220219 | 3.4e-12 |
+| single | 5.51 s | 0 | 480 | 0.9933148474063 | 5.4e-6 |
 
 The refinement makes `mixed` 1.66x faster on this card, with 10.8x fewer complex128 applies. It does the same
 number of sequential iterations as `single` (complex64 iterations plus refinement steps), but each refinement step
@@ -337,8 +365,10 @@ cells instead of 0.952 / 0.955, and the 3-D FDTD of the same taper gives 0.9961 
 - The earlier complex128 polish (`polish="davidson"`) is slow from Ritz vectors that are already converged in
   complex64 (a small subspace of 3 blocks: about 35 iterations for the 0.45 um strip, 40 nm grid, of
   `tests/test_batch.py`). The default polish of `mixed` is now the refinement (see above).
-- The refinement is still about 2x slower than `single` on the RX 7900 XT. With fewer GMRES steps
-  (`refine_inner`) it can stall (the halving rule stops it, not converged). No fallback to the earlier polish yet.
+- The refinement is still about 2x slower than `single` on the RX 7900 XT. It can stall: with fewer GMRES steps
+  (`refine_inner`), and for a weakly guided mode above a dense band of window modes (see "Fallback"). Then the
+  fallback (the steps of the earlier polish from the complex64 block) finishes the solve, and the solve costs more
+  than the earlier polish alone (more complex128 applies too).
 - Device memory: the GMRES basis holds (`REFINE_INNER` + 1) x b complex64 vectors, 168 b n bytes at 20 steps (b
   block vectors, n unknowns; 0.8 GB for b = 24 and n = 200k). The earlier polish keeps 3 b complex128 vectors in V
   and in A V (96 b n bytes).
@@ -376,8 +406,11 @@ precisions); on a GPU the iteration check has a slack and is not done in single 
 `tests/test_refine.py` checks the mixed-precision refinement (above): the strip against the double solve and the
 SciPy residuals, the two-core cluster against ARPACK, a mode count that cuts a near-degenerate pair (1 and 3 modes
 of the two cores, 3 start blocks, against ARPACK and the double solve by neff and field overlap), the complex128
-applies against the earlier polish, the tracking and the selection of the pairs, the stop with `converged=False`
-(tolerance out of reach, step limit, solver warning), and the earlier polish (per cell and batched).
+applies against the earlier polish, the tracking and the selection of the pairs, the weakly guided SiN tip (the
+fallback; against the earlier polish, the double solve, ARPACK and the SciPy residuals; on the 50 nm grid of the
+example all 4 modes, with and without the admission rule; the batched fallback), the stop with `converged=False`
+(tolerance out of reach: the stall rule of the fallback and the better result; step limit; solver warning), the
+error without `jax_enable_x64`, and the earlier polish (per cell and batched).
 `tests/test_bend.py` checks the bend modes (see "Bend modes"), and a batch of bends and a straight cell. Run all tests
 on the GPU computer (`bash tools/remote.sh push`, then `bash tools/gpu_run.sh meow_gpu python -m pytest -q` there;
 `tools/gpu_run.sh` uses `.venv-rocm` and the GPU lock; first `bash tools/remote.sh setup-env`).

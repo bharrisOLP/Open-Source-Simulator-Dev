@@ -49,6 +49,7 @@ from meow_gpu.fde.eigensolver import (
     make_preconditioner,
     precondition,
     precondition_batch,
+    require_x64,
     stack,
 )
 from meow_gpu.fde.operator import FDEProblem, bend_error, fields, make_problem
@@ -91,6 +92,7 @@ class SolveInfo:
     warm: bool
     residual: float
     matvecs_hi: int = 0       # the complex128 operator applies (vectors)
+    polish_used: str = ""     # "mixed": "refine", "refine+davidson" (the fallback) or "davidson"
 
 
 @dataclass
@@ -137,7 +139,7 @@ class GPUModeSolver:
                        polish=self.polish, switch_tol=self.switch_tol, inner=self.refine_inner)
         self._memory[key] = res.vectors
         self.last_info = self._info(res.iterations, res.matvecs, res.converged, warm, res.residuals,
-                                    res.matvecs_hi)
+                                    res.matvecs_hi, res.polish)
         if not self.last_info.converged:
             warnings.warn(f"meow_gpu: the eigensolver did not converge (residual {np.max(res.residuals):.1e})",
                           stacklevel=2)
@@ -210,9 +212,9 @@ class GPUModeSolver:
         for i in reversed(range(nbat)):              # the memory of solve: the last member of each kind
             if kinds[i] not in kinds[i + 1:]:
                 self._memory[kinds[i]] = res.vectors[i]
-        self.last_batch_info = [self._info(int(res.iterations[i]), int(res.matvecs[i]), bool(res.converged[i]),
-                                           warm[i], res.residuals[i], res.member(i).matvecs_hi)
-                                for i in range(nbat)]
+        members = [res.member(i) for i in range(nbat)]
+        self.last_batch_info = [self._info(r.iterations, r.matvecs, r.converged, warm[i], r.residuals, r.matvecs_hi,
+                                           r.polish) for i, r in enumerate(members)]
         self.last_info = self.last_batch_info[-1]
         bad = [i for i, info in enumerate(self.last_batch_info) if not info.converged]
         if bad:
@@ -234,6 +236,7 @@ class GPUModeSolver:
             raise ValueError(f"precision must be one of {PRECISIONS}")
         if self.polish not in POLISHES:
             raise ValueError(f"polish must be one of {POLISHES}")
+        require_x64(self.precision)
 
     def _random_block(self, shape: tuple[int, int], b: int) -> jax.Array:
         rng = np.random.default_rng(self.seed)
@@ -266,10 +269,10 @@ class GPUModeSolver:
         return max(tol, min(floor, SINGLE_TOL_CAP)), (floor if floor > SINGLE_TOL_CAP else None)
 
     def _info(self, iterations: int, matvecs: int, converged: bool, warm: bool, residuals,
-              matvecs_hi: int = 0) -> SolveInfo:
+              matvecs_hi: int = 0, polish: str = "") -> SolveInfo:
         resid = float(np.max(residuals))
         converged = converged or (self.precision == "single" and resid < SINGLE_FLOOR)
-        return SolveInfo(iterations, matvecs, converged, warm, resid, matvecs_hi)
+        return SolveInfo(iterations, matvecs, converged, warm, resid, matvecs_hi, polish)
 
 
 _fields_batch = jax.jit(jax.vmap(fields))
