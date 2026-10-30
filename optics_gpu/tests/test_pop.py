@@ -10,22 +10,11 @@ import warnings
 
 import numpy as np
 import pytest
-from optiland.optic import Optic
 
 from optics_gpu.pop import gaussian, overlap_efficiency, propagate_through
+from optics_gpu.systems import aberrated_singlet, four_f
 
 warnings.filterwarnings("ignore", category=RuntimeWarning)
-
-
-def four_f(f1=2.0, f2=5.0, wl=1.55):
-    o = Optic()
-    o.add_surface(index=0, thickness=f1)
-    o.add_surface(index=1, surface_type="paraxial", f=f1, thickness=f1 + f2, is_stop=True)
-    o.add_surface(index=2, surface_type="paraxial", f=f2, thickness=f2)
-    o.add_surface(index=3)
-    o.set_aperture(aperture_type="EPD", value=3.0)
-    o.add_wavelength(value=wl, is_primary=True)
-    return o
 
 
 def image(w0, dx, ni, di):
@@ -72,21 +61,9 @@ def test_aberrated_singlet_matches_optiland_huygens_psf():
     the image of a single-pixel source (flat angular spectrum) is the PSF; it must match Optiland's own scalar
     Huygens PSF (an independent method: pupil sampling and Huygens-Fresnel summation). The stop must be a physical
     aperture (RadialAperture): the EPD setting aims the ray generator but does not clip rays."""
-    from optiland.materials import IdealMaterial
-    from optiland.physical_apertures import RadialAperture
     from optiland.psf import HuygensPSF
 
-    o = Optic()
-    o.add_surface(index=0, thickness=40.0)
-    o.add_surface(index=1, radius=10.0, thickness=3.0, material=IdealMaterial(n=1.5), is_stop=True,
-                  aperture=RadialAperture(r_max=3.0))
-    o.add_surface(index=2, radius=np.inf, thickness=1.0)
-    o.add_surface(index=3)
-    o.set_aperture(aperture_type="EPD", value=6.0)
-    o.set_field_type(field_type="object_height")
-    o.add_field(y=0.0)
-    o.add_wavelength(value=1.55, is_primary=True)
-    o.image_solve()
+    o = aberrated_singlet()
     xi = np.arange(-40, 40) * 1.0
     src = np.zeros((64, 64), complex)
     src[32, 32] = 1.0
