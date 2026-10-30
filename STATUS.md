@@ -20,8 +20,12 @@ Done:
 - Batched solves (`solve_batch`, `compute_modes_gpu_batch`; an option): the same modes as the per-cell path, but
   on the RX 7900 XT only 1.2x in single precision and no gain in mixed precision for the 30-cell taper.
 
-Open (later, in this order): profile the batched path (the work per member is its larger cost); mixed-precision
-eigenpair refinement (the FP64 polish is slow on RDNA3); bends and angled propagation.
+- Mixed-precision refinement (the default of "mixed"): complex128 residuals and Rayleigh-Ritz, complex64 GMRES on
+  the correction equation; the 30-cell taper in 11.8 s instead of 19.5 s (10.8x fewer complex128 applies), the
+  same 1e-10 tolerance; near-degenerate pairs keep their mode identity (tested against ARPACK).
+
+Open (later, in this order): profile the batched path (the work per member is its larger cost); bends and angled
+propagation.
 
 **2. Meep on AMD: next.** Findings so far (git-ignored clones in `.local/upstream/`):
 - The Erised fork (GPL-2.0-or-later) is a Python add-on: Meep builds the simulation, and the add-on time-steps it
@@ -47,7 +51,10 @@ eigenpair refinement (the FP64 polish is slow on RDNA3); bends and angled propag
   order from n = 64 to 128 also in sheared voxels; slower above 128, cause not known); triangular air holes
   128 x 128: 5.6 s on the GPU against 89 s on 16 CPU threads (the CPU run did not converge all k points; 13x per
   iteration).
-- Next: find_k for waveguide modes, a comparison with MPB itself.
+- find_k (the k of each band at a fixed frequency, as MPB find-k): Newton with the Hellmann-Feynman group
+  velocity, parity; a dielectric slab against the exact supercell (1.2e-5 to 4.4e-5 at n 1025; the error depends on the subpixel
+  sample count), a photonic-crystal line-defect waveguide against an independent finite-difference solver.
+- Next: a comparison with MPB itself.
 
 **4. thermal-gpu: version 0.1 works.** Folder: `thermal_gpu/` (`thermal_gpu/README.md`).
 - Cell-centered finite volumes (series face conductance), Jacobi CG as one device loop, steady and implicit
@@ -61,7 +68,10 @@ eigenpair refinement (the FP64 polish is slow on RDNA3); bends and angled propag
   (11 M cells, 25 nm) in 1.03 s of CG on the GPU against 34 s on 16 CPU threads; mid-length rise equal to 2-D to
   1e-5 (7e-6 at 100 and 50 nm, 8e-6 at 25 nm), the ends at 0.53 of the 2-D rise, the phase integral 1.0001 of 2-D
   (100 and 50 nm).
-- Next: 3-D transients, temperature-dependent conductivity.
+- 3-D transients (implicit Euler, BDF2, Crank-Nicolson) and kappa(T) (Picard): the 10-90 % rise time of the 3-D
+  heater is 17.94 us (equal to 2-D to 3e-5); kappa(T) of Si and SiO2 lowers the heater rise by 0.9 % at 100 W/m (Si alone: +1.3e-5). 3-D transient
+  with 2.7 M cells: 20 s on the GPU against 349 s on 16 CPU threads.
+- Next: kappa(T) in the transients; a 3-D heater with vias and pads.
 
 **5. optics-gpu (the coupling use case of ZEMAX POP): version 0.1 works.** Folder: `optics_gpu/`.
 - Angular spectrum of the source, real rays through the lens system (Optiland, MIT), image field as a separable
@@ -70,7 +80,9 @@ eigenpair refinement (the FP64 polish is slow on RDNA3); bends and angled propag
   against Optiland's independent Huygens PSF (correlation 0.998).
 - Example `examples/chip_to_fiber_coupling.py`: SiN tip mode (meow-gpu) through a 2.5x lens pair into SMF-28:
   eta 0.889 at focus, with a focus scan (14 um mode window; an 8 um window cut the mode tails).
-- Next: Optiland's own ray trace on the GPU (PyTorch backend) for large ray counts; ROCm timings.
+- Optiland's ray trace on the GPU (PyTorch backend, float64; `tools/env/optics_rocm.sh`): equal to the NumPy trace
+  (difference 0); at 1e7 rays 7.3x faster than one-thread NumPy (4.5x with the copy to the host); not faster below about 1e5 rays.
+- Next: the Jacobian and the weights on the GPU, so that a GPU trace does not go back to the host.
 
 **6. charge-gpu (reverse-biased PN junctions for depletion modulators): version 0.1 works.** Folder:
 `charge_gpu/`.
@@ -84,7 +96,10 @@ eigenpair refinement (the FP64 polish is slow on RDNA3); bends and angled propag
 - Junction capacitance, series resistance and RC bandwidth (`charge_gpu/src/charge_gpu/rc.py`, example
   `charge_gpu/examples/pn_modulator_rc.py`): C' against eps/W to 1e-4; at 3e17 cm^-3 and 2 V: 0.197 fF/um,
   39.4 Ohm mm, 20.4 GHz intrinsic. No GPU gain at 73k cells (charge part 1.6x at 293k cells, against the Mac CPU).
-- Next: drift-diffusion for forward bias (or a DEVSIM adapter).
+- Drift-diffusion (Scharfetter-Gummel, SRH; coupled Newton with SuperLU on the CPU, or Gummel with the Poisson step
+  on the GPU): the long-base diode within 1 % of Shockley (0.60 to 0.75 V); a PIN phase shifter at 0.9 V with a carrier lifetime of 1 ns:
+  L_pi 1.07 mm, P_pi 3.7 mW.
+- Next: the continuity equations on the device (BiCGSTAB), so that forward bias runs on the GPU.
 
 **Shared: aggregation multigrid** (`thermal_gpu/src/thermal_gpu/multigrid.py`), used by thermal-gpu (steady and
 transient) and charge-gpu (Newton steps). Heater stack: 17 to 27 CG iterations from 50 to 5 nm cells (Jacobi: 809
@@ -153,3 +168,7 @@ These do not block the work. The agent continues with the default in brackets.
 - 2026-10-30: Polygon in the FDTD adapter and exact cell placement. Then four agents in parallel (user request:
   "fan out some agents"), each on one package, each change with its own single review: charge RC bandwidth,
   thermal 3-D, bands oblique lattices, meow batched solves.
+- 2026-10-30: second wave of five agents: optics GPU ray trace, drift-diffusion, thermal transients and kappa(T),
+  find_k and the mixed-precision refinement of meow-gpu, each with its single review (one review found a
+  blocker: the refinement could return the wrong mode of a near-degenerate pair; fixed and tested). New rule
+  (user): every test and bench runs on the Ubuntu GPU computer, never on the Mac (`tools/gpu_run.sh`, a GPU lock).

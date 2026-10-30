@@ -61,10 +61,18 @@ adversarial review"). Keep each commit small, so that one review covers it.
   Never reword a command only to pass the gate.
 - Share the computer: other sessions run jobs there. Run `usage` before a large job. Use one GPU job at a time.
 - Do not delete files on the computer. `push` deletes nothing there.
+- **Run every test and every bench on the GPU computer, never on the Mac** (user, 2026-10-30: "All tests need to go
+  to the ubuntu pc"). Also the tests of agents and reviewers. Push first, then run through the GPU lock:
+  `bash tools/remote.sh sh <<'EOF'` / `bash tools/gpu_run.sh <folder> python -m pytest -q` / `EOF`.
+  `tools/gpu_run.sh` takes the lock `.local/gpu.lock` (one gpu_run.sh process at a time in this repository; test
+  runs at the same time failed and gave wrong timings) and uses `.venv-rocm` (`.venv-optics` for optics_gpu). The
+  lock does not cover jobs of other sessions: run `usage` before a large run. On the Mac, only
+  static checks: `tools/hygiene.py`, `tools/review.sh`, reading code.
 
 ## Code
 
 - Python only through uv (`uv run`, `uv add`). JavaScript only through bun. Set `PYTHONDONTWRITEBYTECODE=1`.
+  A new dependency must also go into the GPU environment (`tools/env/rocm_jax.sh` or `tools/env/optics_rocm.sh`).
 - Each solver has a CPU reference path and tests that compare GPU against CPU and against an independent solver
   (the upstream tool, an analytic case, or a published number).
 - Keep the license of each upstream project. A fork of a GPL project stays GPL.
