@@ -22,17 +22,24 @@ Done:
 
 - Mixed-precision refinement (the default of "mixed"): complex128 residuals and Rayleigh-Ritz, complex64 GMRES on
   the correction equation; the 30-cell taper in 11.8 s instead of 19.5 s (10.8x fewer complex128 applies), the
-  same 1e-10 tolerance; near-degenerate pairs keep their mode identity (tested against ARPACK).
+  same 1e-10 tolerance; near-degenerate pairs keep their mode identity (tested against ARPACK). When the
+  refinement stalls (a weakly guided SiN tip above a dense band of window modes), a fallback runs the earlier
+  polish from the complex64 block.
 
-Open (later, in this order): profile the batched path (the work per member is its larger cost); bends and angled
-propagation.
+- Bend modes on the GPU (the bent-waveguide operator of tidy3d; equal to its matrix to 1e-14); only angled
+  propagation still falls back to tidy3d.
+
+Open (later, in this order): profile the batched path (the work per member is its larger cost); angled propagation.
 
 **2. Meep on AMD: next.** Findings so far (git-ignored clones in `.local/upstream/`):
 - The Erised fork (GPL-2.0-or-later) is a Python add-on: Meep builds the simulation, and the add-on time-steps it
   with an array module (NumPy or CuPy) plus Triton kernels and CUDA C kernels (cupy.RawKernel). Route to AMD: CuPy
   for ROCm (hipRTC compiles RawKernel source) and the AMD backend of Triton. About 250k lines of Python with tests.
 - gpmeep: a fork of the Meep C++ core (1.35.0-beta) with about 19k lines of CUDA and C++. Route to AMD: HIPify.
-- fdtdx (MIT, JAX): already runs on this card. A Meep-compatible front end on it is the third route.
+- fdtdx (MIT, JAX): already runs on this card. A front end on it in the style of the MIT package is the third
+  route: `fdtd_gpu/` (2026-10-30, version 0.1: Simulation, geometry, sources, flux and mode monitors, Harminv;
+  checked against a Bragg transfer matrix, exact ring resonances, the analytic dipole power and a current sheet).
+  It needs no third-party GPL code.
 - Probe result (2026-10-30, `tools/probe_cupy_triton.sh`, `tools/probe/`): YES. PyTorch 2.14.1 for ROCm 7.2 runs
   on gfx1100; Triton 3.8.0 (AMD) runs a kernel; CuPy 14.2 (cupy-rocm-7-0) compiles and runs a RawKernel, with
   versioned links to the HIP libraries of the PyTorch wheel and hipcc from the ROCm 10.1 pip SDK.
@@ -82,7 +89,9 @@ propagation.
   eta 0.889 at focus, with a focus scan (14 um mode window; an 8 um window cut the mode tails).
 - Optiland's ray trace on the GPU (PyTorch backend, float64; `tools/env/optics_rocm.sh`): equal to the NumPy trace
   (difference 0); at 1e7 rays 7.3x faster than one-thread NumPy (4.5x with the copy to the host); not faster below about 1e5 rays.
-- Next: the Jacobian and the weights on the GPU, so that a GPU trace does not go back to the host.
+- The whole pipeline on the GPU (trace, weights, image sum; focus and lateral scans from one trace): 1.4x to 1.85x
+  faster than the NumPy pipeline from 1e6 rays; the image sum is now 93 % to 97 % of the time.
+- Next: a faster image sum (for example a non-uniform FFT).
 
 **6. charge-gpu (reverse-biased PN junctions for depletion modulators): version 0.1 works.** Folder:
 `charge_gpu/`.
@@ -99,7 +108,10 @@ propagation.
 - Drift-diffusion (Scharfetter-Gummel, SRH; coupled Newton with SuperLU on the CPU, or Gummel with the Poisson step
   on the GPU): the long-base diode within 1 % of Shockley (0.60 to 0.75 V); a PIN phase shifter at 0.9 V with a carrier lifetime of 1 ns:
   L_pi 1.07 mm, P_pi 3.7 mW.
-- Next: the continuity equations on the device (BiCGSTAB), so that forward bias runs on the GPU.
+- The Gummel continuity solves on the GPU (BiCGSTAB with a multigrid preconditioner, SuperLU fallback): at 5 nm
+  and 0.6 V the device Gummel path is the fastest (1.64 s against 4.76 s for Newton); Newton with SuperLU stays the
+  fastest in high injection.
+- Next: the coupled Newton step on the device.
 
 **Shared: aggregation multigrid** (`thermal_gpu/src/thermal_gpu/multigrid.py`), used by thermal-gpu (steady and
 transient) and charge-gpu (Newton steps). Heater stack: 17 to 27 CG iterations from 50 to 5 nm cells (Jacobi: 809
@@ -135,7 +147,7 @@ The user asked to start with Meep and meow. After those two, the order is by com
 | # | Tool | Open-source base | GPU path on AMD | Complexity | Notes |
 |---|---|---|---|---|---|
 | 1 | meow (EME) | meow (Apache-2) + own FDE solver | JAX on ROCm | medium | v0.1 done; improvements open |
-| 2 | Meep (FDTD) | Meep (GPL-2); GPU forks: Erised add-on (Triton/CUDA), gpmeep (CUDA C++) | CuPy-ROCm + Triton-AMD, HIP, or fdtdx | very high | probe passed; **waits for the user** (third-party code) |
+| 2 | Meep (FDTD) | Meep (GPL-2); GPU forks: Erised add-on (Triton/CUDA), gpmeep (CUDA C++) | CuPy-ROCm + Triton-AMD, HIP, or fdtdx | very high | fdtdx route v0.1 done (`fdtd_gpu/`); the add-on route: probe passed, **waits for the user** (third-party code) |
 | 3 | MPB (band and mode solver) | MPB (GPL-2) | plane-wave basis: FFT + block eigensolver in JAX | medium-high | v0.1 done (own code: `bands_gpu/`) |
 | 4 | Thermal | own finite-volume solver (femwell / scikit-fem as references) | CG on GPU (JAX) | medium | v0.1 done (`thermal_gpu/`) |
 | 5 | ZEMAX (ray + physical optics) | Optiland (MIT, PyTorch) + own physical optics | PyTorch on ROCm | medium | v0.1 done (`optics_gpu/`) |
@@ -172,3 +184,10 @@ These do not block the work. The agent continues with the default in brackets.
   find_k and the mixed-precision refinement of meow-gpu, each with its single review (one review found a
   blocker: the refinement could return the wrong mode of a near-degenerate pair; fixed and tested). New rule
   (user): every test and bench runs on the Ubuntu GPU computer, never on the Mac (`tools/gpu_run.sh`, a GPU lock).
+- 2026-10-30: third wave of four agents: bend modes in meow-gpu, the whole optics pipeline on the GPU, the Gummel
+  continuity solves of charge-gpu on the GPU, and `fdtd_gpu/` (an FDTD front end on fdtdx, the third FDTD route).
+  The reviews found blockers: a wrong H half-step shift in fdtd_gpu, no convergence of the charge device at 5 V
+  reverse bias and above (a pseudo-inverse on the coarsest level, now LU), warm starts across member kinds in the
+  bend batch. The optics agent found a regression of the meow refinement (SiN tip of the coupling example); the
+  fix adds an admission rule and a fallback to the earlier polish (one review; it found that the first fallback
+  could return a wrong 4th mode as converged; fixed and tested on the grid of the example).

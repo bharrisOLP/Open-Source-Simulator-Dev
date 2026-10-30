@@ -21,4 +21,8 @@ Ryzen 7 7800X3D, 16 threads; ROCm 10.1 pip wheels, JAX 0.11.1). "device" is the 
 | `charge-dd.jsonl` | `charge_gpu/bench/bench_dd.py --dx 10e-9 5e-9 --no-diode` (GPU and `CHARGE_GPU_DEVICE=cpu`), `charge_gpu/examples/pin_phase_shifter.py --modes --tau 1e-9 1e-8` | charge README: drift-diffusion timings and the PIN phase-shifter table |
 | `thermal-transient.jsonl` | `thermal_gpu/bench/bench_transient3d.py`, `thermal_gpu/bench/bench_kappa_t.py` (GPU and `THERMAL_GPU_DEVICE=cpu`), and the `--dt-scan 3` rows at the end | thermal README: the transient and kappa(T) tables, the time-step check |
 | `bands-findk.jsonl` | `bands_gpu/bench/bench_find_k.py` (strip, pcw, slab with `--sub`; GPU and `BANDS_GPU_DEVICE=cpu`) | bands README: find_k timings and the slab sub-sample study |
-| `meow-refine.jsonl` | `meow_gpu/bench/bench_refine.py --repeat 2` (final code of the refinement) | meow README: mixed 11.77 s against 19.48 s, 10.8x fewer complex128 applies |
+| `meow-refine.jsonl` | `meow_gpu/bench/bench_refine.py --repeat 2` (final code of the refinement) | meow README: mixed 11.72 s against 19.48 s, 10.8x fewer complex128 applies (rerun after the fallback fix, with the `polish_used` field) |
+| `meow-bend.jsonl` | `meow_gpu/bench/bench_bend.py` (mixed, single, double; tight bends with PML; the 40 and 20 nm and 4-mode rows of the review) | meow README: bend timings and agreement with tidy3d |
+| `optics-pipeline.jsonl` | `optics_gpu/bench/bench_pipeline.py` (singlet and 4f, 1e5 to 1e7 rays) and the last row from `optics_gpu/examples/coupling_scans_on_device.py` | optics README: the device pipeline table and the scan example |
+| `charge-dd-device.jsonl` | `charge_gpu/bench/bench_dd.py --dx 10e-9 5e-9 --no-diode --no-sweep` (final code, LU coarsest inverse) | charge README: the device continuity table |
+| `fdtd-gpu.jsonl` | `fdtd_gpu/bench/bench_fdtd.py` (Bragg, waveguide 2-D and 3-D, ring, dipole, sheet) | fdtd_gpu README: all check numbers and times |

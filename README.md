@@ -9,8 +9,9 @@ RX 7900 XT (gfx1100) with ROCm 10.1 pip wheels and JAX 0.11.1.
 | `bands_gpu/` | photonic band structures (the method of MPB) | plane waves + FFT, LOBPCG | 0.1: 11.7x the same code on 16 CPU threads (rod lattice, 128 x 128); oblique lattices; find_k |
 | `thermal_gpu/` | heat conduction (heaters), 2-D and 3-D | finite volumes, multigrid CG | 0.1: 2-D 2.9 million cells in 0.21 s on the GPU; 3-D steady: 11 million cells, CG 1.0 s (33x faster than 16 CPU threads); 3-D transients; kappa(T) |
 | `charge_gpu/` | PN junctions in reverse bias (modulators) | nonlinear Poisson, Newton + multigrid CG | 0.1: multigrid CG, 8x faster than Jacobi CG (Mac CPU); capacitance, series resistance, RC bandwidth; drift-diffusion (forward bias) |
-| `optics_gpu/` | physical optics through lenses (fiber coupling) | angular spectrum + real rays (Optiland) | 0.1: the ray trace on the GPU, 7.3x one-thread NumPy at 1e7 rays (4.5x with the copy to the host) |
+| `optics_gpu/` | physical optics through lenses (fiber coupling) | angular spectrum + real rays (Optiland) | 0.1: the whole pipeline on the GPU (trace, weights, image sum; focus and lateral scans) |
 | `suite/` | one device description for all of the above | multiphysics workflows; 3-D FDTD (fdtdx) and EME adapters; rectangles and polygons | 0.1 |
+| `fdtd_gpu/` | 3-D FDTD with an interface in the style of the MIT package | fdtdx (JAX) | 0.1: Bragg, ring, dipole and sheet checks |
 | Meep on AMD | FDTD | ROCm port of a GPU add-on | probe passed; waits for a decision (STATUS.md) |
 
 Examples (`examples/`): a thermo-optic phase shifter (P_pi), a depletion modulator (V_pi L), and chip-to-fiber
