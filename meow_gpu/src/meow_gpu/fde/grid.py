@@ -86,20 +86,26 @@ def s_factors(dls: np.ndarray, n_pml: int, near_pml: bool, k0: float, speeds: tu
     return s
 
 
-def pml_speeds(eps_diag: np.ndarray, npml: tuple[int, int]) -> np.ndarray:
-    """Relative speed of light in the four PML regions (x-, x+, y-, y+): 1 / sqrt(mean eps), with mu = 1. The mean
-    is over the three diagonal components. ``eps_diag`` has the shape (3, Nx, Ny)."""
+def pml_speeds(eps_diag: np.ndarray, npml: tuple[int, int], mu_diag: np.ndarray | None = None) -> np.ndarray:
+    """Relative speed of light in the four PML regions (x-, x+, y-, y+): 1 / sqrt(mean eps * mean mu). Each mean
+    is over the three diagonal components. ``eps_diag`` and ``mu_diag`` have the shape (3, Nx, Ny); no
+    ``mu_diag``: mu = 1 (the mean is 1)."""
     nx, ny = eps_diag.shape[1:]
 
     def mean(a: np.ndarray) -> complex:
         return complex(np.mean(a)) if a.size else 1.0
 
-    avg = np.array([
-        mean(eps_diag[:, : npml[0], :]),
-        mean(eps_diag[:, nx - npml[0] + 1:, :]),
-        mean(eps_diag[:, :, : npml[1]]),
-        mean(eps_diag[:, :, ny - npml[1] + 1:]),
-    ])
+    def sides(a: np.ndarray) -> np.ndarray:
+        return np.array([
+            mean(a[:, : npml[0], :]),
+            mean(a[:, nx - npml[0] + 1:, :]),
+            mean(a[:, :, : npml[1]]),
+            mean(a[:, :, ny - npml[1] + 1:]),
+        ])
+
+    avg = sides(eps_diag)
+    if mu_diag is not None:
+        avg = avg * sides(mu_diag)
     return 1 / np.sqrt(avg)
 
 

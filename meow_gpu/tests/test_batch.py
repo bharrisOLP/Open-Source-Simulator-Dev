@@ -215,18 +215,22 @@ def test_compute_modes_gpu_batch_equals_per_cell(batch):
     assert all(i.warm for i in s.last_batch_info) == (batch < len(css))
 
 
-def test_compute_modes_gpu_batch_with_two_grid_shapes_and_a_fallback_cell():
-    """Cells with two grid shapes and one bend cell (tidy3d fallback), in mixed order: the output keeps the order
-    of the input, each cell gets the per-cell result, and the fallback warning points at the caller."""
+def test_compute_modes_gpu_batch_with_two_grid_shapes_and_a_fallback_cell(monkeypatch):
+    """Cells with two grid shapes and one cell that falls back to tidy3d, in mixed order: the output keeps the order
+    of the input, each cell gets the per-cell result, and the fallback warning points at the caller. The fallback
+    cell is marked as not supported by a patch (the real case, angled propagation, needs the tensorial solver of
+    tidy3d-extras); it is a bend, which tidy3d solves. Bends in a batch: tests/test_bend.py."""
+    import meow_gpu.meow_backend as backend
     taper = _taper(n_cells=3)
-    bend = strip_cross_section(bend_radius=20.0)
-    css = [taper[0], strip_cross_section(width=0.5), taper[1], bend, strip_cross_section(width=0.6), taper[2]]
+    fallback = strip_cross_section(bend_radius=20.0)
+    monkeypatch.setattr(backend, "_supported", lambda cs: "angled propagation" if cs is fallback else None)
+    css = [taper[0], strip_cross_section(width=0.5), taper[1], fallback, strip_cross_section(width=0.6), taper[2]]
     assert len({tuple(np.shape(cs.nx)) for cs in css}) == 2
-    with pytest.warns(UserWarning, match="bend radius") as record:
+    with pytest.warns(UserWarning, match="angled propagation") as record:
         got = compute_modes_gpu_batch(css, num_modes=K, solver=GPUModeSolver(precision="mixed", extra=4), batch=2)
-    assert {w.filename for w in record if "bend radius" in str(w.message)} == {__file__}
+    assert {w.filename for w in record if "angled propagation" in str(w.message)} == {__file__}
     one = GPUModeSolver(precision="mixed", extra=4)
-    with pytest.warns(UserWarning, match="bend radius"):
+    with pytest.warns(UserWarning, match="angled propagation"):
         ref = [compute_modes_gpu(cs, num_modes=K, solver=one) for cs in css]
     assert len(got) == len(css)
     for a_modes, b_modes in zip(got, ref):

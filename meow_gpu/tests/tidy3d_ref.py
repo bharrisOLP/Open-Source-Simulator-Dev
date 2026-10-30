@@ -30,3 +30,38 @@ def tidy3d_matrix(eps_xx, eps_yy, eps_zz, x, y, wavelength, num_pml=(0, 0), symm
     q_ep = sp.bmat([[None, sp.spdiags(eps_tensor[1, 1], [0], n, n)], [sp.spdiags(-eps_tensor[0, 0], [0], n, n), None]])
     q_partial = sp.bmat([[-dxb @ dyf, dxb @ dxf], [-dyb @ dyf, dyb @ dxf]])
     return (p_mu @ (q_ep + q_partial) + p_partial @ q_ep).tocsr()
+
+
+class _Captured(Exception):
+    pass
+
+
+def tidy3d_solver_matrix(eps_xx, eps_yy, eps_zz, x, y, wavelength, num_pml=(0, 0), symmetry=(0, 0),
+                         bend_radius=None, bend_axis=None, plane_center=(0.0, 0.0)):
+    """The matrix that tidy3d's own ``compute_modes`` gives to its eigensolver (captured at the call of
+    ``EigSolver.solver_eigs``; the eigensolver does not run). It includes tidy3d's coordinate transform (bend),
+    its PML and its media; nothing is built here. Media without a good conductor: no tidy3d preconditioner."""
+    from types import SimpleNamespace
+
+    from tidy3d.components.mode.solver import EigSolver, compute_modes
+
+    captured = {}
+
+    def capture(cls, mat, *args, **kwargs):
+        captured["mat"] = mat
+        raise _Captured
+
+    ms = SimpleNamespace(num_modes=1, target_neff=None, num_pml=num_pml, filter_pol=None, angle_theta=0.0,
+                         angle_phi=0.0, bend_radius=bend_radius, precision="double", bend_axis=bend_axis,
+                         track_freq="central", group_index_step=False)
+    z = np.zeros_like(eps_xx)
+    original = EigSolver.__dict__["solver_eigs"]
+    EigSolver.solver_eigs = classmethod(capture)
+    try:
+        compute_modes(eps_cross=[eps_xx, z, z, z, eps_yy, z, z, z, eps_zz], coords=[x, y], freq=C_0 / wavelength,
+                      mode_spec=ms, precision="double", symmetry=symmetry, plane_center=plane_center)
+    except _Captured:
+        pass
+    finally:
+        EigSolver.solver_eigs = original
+    return sp.csr_matrix(captured["mat"])

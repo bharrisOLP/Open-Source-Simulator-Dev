@@ -113,10 +113,22 @@ def test_post_processing_equals_meow_except_the_neff():
         assert len(post_process_modes(raw + raw[:1])) == len(post_process_modes(raw))   # the duplicate is dropped
 
 
-def test_the_tidy3d_fallback_keeps_the_neff():
-    """A bend radius makes compute_modes_gpu fall back to tidy3d; the fallback uses the same post-processing."""
+def test_angled_propagation_is_not_supported():
+    from types import SimpleNamespace
+
+    from meow_gpu.meow_backend import _supported
+    assert _supported(SimpleNamespace(mesh=SimpleNamespace(angle_theta=0.1))) == "angled propagation"
+    assert _supported(strip_cross_section(bend_radius=20.0)) is None      # bends: on the GPU (tests/test_bend.py)
+
+
+def test_the_tidy3d_fallback_keeps_the_neff(monkeypatch):
+    """A cross-section that the GPU solver does not support falls back to tidy3d; the fallback uses the same
+    post-processing. The real case (angled propagation) needs the tensorial solver of tidy3d-extras, so the test
+    marks a bend as not supported (tidy3d solves bends)."""
+    import meow_gpu.meow_backend as backend
+    monkeypatch.setattr(backend, "_supported", lambda cs: "angled propagation")
     cs = strip_cross_section(bend_radius=20.0)
-    with pytest.warns(UserWarning, match="bend radius"):
+    with pytest.warns(UserWarning, match="angled propagation"):
         got = compute_modes_gpu(cs, num_modes=3)
     raw = mw.compute_modes_tidy3d(cs, num_modes=3, post_process=lambda modes: modes)
     assert [complex(m.neff) for m in got] == pytest.approx([complex(m.neff) for m in raw[: len(got)]], abs=1e-9)

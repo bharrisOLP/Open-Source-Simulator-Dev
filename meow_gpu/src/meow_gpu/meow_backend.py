@@ -11,7 +11,7 @@ average of the neff of the earlier modes, even when c is about 0 (for a 0.525 um
 taper of bench/bench_eme_taper.py, TM0 becomes 2.137 instead of 1.794). The EME then propagates the higher modes almost
 in phase with the fundamental mode, and the mode conversion of a taper adds up coherently (a 10 um taper: |S21|^2
 0.955; corrected 0.991; 3-D FDTD 0.9961 on a 20 nm grid, benchmarks/2026-10-30/fdtd-v3.jsonl).
-``meow.compute_modes_tidy3d`` has the same error; the tidy3d fallback of ``compute_modes_gpu`` (bends, angled
+``meow.compute_modes_tidy3d`` has the same error; the tidy3d fallback of ``compute_modes_gpu`` (angled
 propagation) uses the corrected post-processing too.
 
 Warm start: ``GPUModeSolver`` keeps the eigenvectors of its last solve for each grid shape. The next solve on the
@@ -24,8 +24,10 @@ is small: on an RX 7900 XT, for the 30-cell taper of bench/bench_eme_batch.py (3
 solve was about 1.2x faster in single precision and not faster in mixed precision
 (benchmarks/2026-10-30/eme-batch.jsonl). The per-cell path stays the default.
 
-Not supported yet (the call falls back to tidy3d, with a warning): bend radius and angled propagation. meow passes
-diagonal permittivity only (as for its tidy3d backend).
+Bends (``cs.mesh.bend_radius``, ``bend_axis``, ``plane_center``): the GPU solver uses the radial transform of the
+tidy3d solver (``meow_gpu.fde.operator``), so neff is the effective index at the bend radius, as in
+``meow.compute_modes_tidy3d``. Not supported yet (the call falls back to tidy3d, with a warning): angled
+propagation. meow passes diagonal permittivity only (as for its tidy3d backend).
 """
 
 from __future__ import annotations
@@ -49,7 +51,7 @@ from meow_gpu.fde.eigensolver import (
     precondition_batch,
     stack,
 )
-from meow_gpu.fde.operator import FDEProblem, fields, make_problem
+from meow_gpu.fde.operator import FDEProblem, bend_error, fields, make_problem
 
 PRECISIONS = ("single", "mixed", "double")
 TOL = {"single": 1e-5, "mixed": 1e-10, "double": 1e-10}
@@ -121,7 +123,7 @@ class GPUModeSolver:
         target = _target(problem, target_neff)
         b = num_modes + self.extra
         pc = make_preconditioner(problem)
-        key = (problem.shape, b)
+        key = _memory_key(problem, b)
         warm = self.warm_start and key in self._memory
         if warm:
             x0 = self._memory[key]
@@ -148,10 +150,12 @@ class GPUModeSolver:
         """Eigenpairs of B problems with the same grid shape, solved at the same time (``davidson_batch``): a list
         of B results (neff, E, H), each as ``solve`` gives it.
 
-        Warm start: member i starts from the last vectors of member i of the previous batch with the same grid shape
-        and the same B. If there is no such batch, all members start from the memory of ``solve``. Else each member
-        starts from the random block of ``solve``. After the solve, the memory of ``solve`` holds the vectors of the
-        last member. ``last_batch_info`` has the SolveInfo of each member; ``last_info`` is that of the last member.
+        Warm start, for each member i, from the vectors of the same kind of cross-section only (``_memory_key``:
+        straight, or a bend with the same radius, axis and shift): the last vectors of member i of the previous
+        batch with the same grid shape and the same B, if that member was of the same kind; else the memory of
+        ``solve`` for the kind of member i; else the random block of ``solve`` (a cold start). After the solve, the
+        memory of ``solve`` holds, for each kind, the vectors of the last member of that kind. ``last_batch_info``
+        has the SolveInfo of each member; ``last_info`` is that of the last member.
         """
         problems = list(problems)
         if not problems:
@@ -163,15 +167,36 @@ class GPUModeSolver:
         nbat, b = len(problems), num_modes + self.extra
         targets = np.array([_target(p, target_neff) for p in problems])
         pc = stack([make_preconditioner(p) for p in problems])
-        key, batch_key = (shape, b), (shape, b, nbat)
-        warm = self.warm_start and (batch_key in self._memory or key in self._memory)
-        if warm and batch_key in self._memory:
-            x0 = self._memory[batch_key]
-        elif warm:
-            x0 = jnp.broadcast_to(self._memory[key], (nbat,) + self._memory[key].shape)
+        kinds = [_memory_key(p, b) for p in problems]
+        batch_key = (shape, b, nbat)
+        kinds_key = ("kinds",) + batch_key
+        prev, prev_kinds = self._memory.get(batch_key), self._memory.get(kinds_key)
+        source = []                                   # for each member: "batch", "cell" or None (cold)
+        for i, kind in enumerate(kinds):
+            if not self.warm_start:
+                source.append(None)
+            elif prev is not None and prev_kinds is not None and prev_kinds[i] == kind:
+                source.append("batch")
+            elif kind in self._memory:
+                source.append("cell")
+            else:
+                source.append(None)
+        warm = [s is not None for s in source]
+        if all(s == "batch" for s in source):
+            x0 = prev
+        elif all(s == "cell" for s in source) and len(set(kinds)) == 1:
+            x0 = jnp.broadcast_to(self._memory[kinds[0]], (nbat,) + self._memory[kinds[0]].shape)
         else:
-            x = jnp.broadcast_to(self._random_block(shape, b), (nbat, b, 2) + shape)
-            x0 = precondition_batch(pc, x, put(np.repeat(targets[:, None], b, axis=1), jnp.complex64))
+            cold = None
+            if not all(warm):
+                x = jnp.broadcast_to(self._random_block(shape, b), (nbat, b, 2) + shape)
+                cold = precondition_batch(pc, x, put(np.repeat(targets[:, None], b, axis=1), jnp.complex64))
+            if not any(warm):
+                x0 = cold
+            else:
+                rows = [prev[i] if s == "batch" else self._memory[kinds[i]] if s == "cell" else cold[i]
+                        for i, s in enumerate(source)]
+                x0 = jnp.stack([r.astype(jnp.complex128) for r in rows])
         op = self._operator(problems, batched=True)
         anorms = np.asarray(jnp.max(jnp.abs(pc.lam), axis=(1, 2, 3)), dtype=float)
         tols, floors = zip(*(self._tolerance(a, t) for a, t in zip(anorms, targets)))
@@ -181,9 +206,13 @@ class GPUModeSolver:
                              precision=self.precision, polish=self.polish, switch_tol=self.switch_tol,
                              inner=self.refine_inner)
         self._memory[batch_key] = res.vectors
-        self._memory[key] = res.vectors[-1]
+        self._memory[kinds_key] = tuple(kinds)
+        for i in reversed(range(nbat)):              # the memory of solve: the last member of each kind
+            if kinds[i] not in kinds[i + 1:]:
+                self._memory[kinds[i]] = res.vectors[i]
         self.last_batch_info = [self._info(int(res.iterations[i]), int(res.matvecs[i]), bool(res.converged[i]),
-                                           warm, res.residuals[i], res.member(i).matvecs_hi) for i in range(nbat)]
+                                           warm[i], res.residuals[i], res.member(i).matvecs_hi)
+                                for i in range(nbat)]
         self.last_info = self.last_batch_info[-1]
         bad = [i for i, info in enumerate(self.last_batch_info) if not info.converged]
         if bad:
@@ -193,7 +222,7 @@ class GPUModeSolver:
         neff = np.sqrt(-res.values.astype(np.complex128))          # (B, k)
         vec = res.vectors[:, :num_modes].astype(jnp.complex128)
         op128 = op[1] if self.precision == "mixed" else (op if self.precision == "double" else
-                                                         stack([p.device(jnp.complex128) for p in problems]))
+                                                         self._operator128(problems))
         e, h = _fields_batch(op128, vec, put(neff))
         e, h = np.array(e), np.array(h)
         return [_orient(p, neff[i], e[i], h[i]) for i, p in enumerate(problems)]
@@ -212,11 +241,19 @@ class GPUModeSolver:
 
     def _operator(self, problems: list[FDEProblem], batched: bool):
         """The device operator of one problem, or (``batched``) the operator of a batch (``stack``)."""
+        bend_arrays = batched and any(p.bent for p in problems)    # one pytree structure for all members
+
         def one(dtype):
-            return stack([p.device(dtype) for p in problems]) if batched else problems[0].device(dtype)
+            if batched:
+                return stack([p.device(dtype, bend_arrays=bend_arrays) for p in problems])
+            return problems[0].device(dtype)
         if self.precision == "mixed":
             return one(jnp.complex64), one(jnp.complex128)
         return one(jnp.complex64 if self.precision == "single" else jnp.complex128)
+
+    def _operator128(self, problems: list[FDEProblem]):
+        bend_arrays = any(p.bent for p in problems)
+        return stack([p.device(jnp.complex128, bend_arrays=bend_arrays) for p in problems])
 
     def _tolerance(self, anorm: float, target: float) -> tuple[float, float | None]:
         """The tolerance, and the complex64 floor when the cap applies (else None). ``anorm``: max |lambda| of the
@@ -238,9 +275,23 @@ class GPUModeSolver:
 _fields_batch = jax.jit(jax.vmap(fields))
 
 
+def _memory_key(problem: FDEProblem, b: int) -> tuple:
+    """The key of the warm-start memory: the grid shape and the block size; for a bend also the radius, the bend
+    axis and the shift R - plane_center (these define the transform). A cross-section starts only from the modes of
+    the same kind (straight, or the same bend): a warm start from the modes of a 5 um bend did not converge for the
+    straight strip of tests/test_bend.py (4 modes, box modes in the mode set; review of 2026-10-30, test
+    ``test_batch_warm_start_keeps_each_kind``)."""
+    if not problem.bent:
+        return (problem.shape, b)
+    return (problem.shape, b, "bend", problem.bend_radius, problem.bend_axis, problem.bend_shift)
+
+
 def _target(problem: FDEProblem, target_neff: float | None) -> float:
     """The eigenvalue target -(n_target^2); default n_target: the largest index of the problem (as tidy3d)."""
-    nmax = float(np.sqrt(np.max(np.abs(np.stack([problem.eps_xx, problem.eps_yy, problem.eps_zz])))))
+    eps_max = problem.eps_max
+    if eps_max is None:
+        eps_max = float(np.max(np.abs(np.stack([problem.eps_xx, problem.eps_yy, problem.eps_zz]))))
+    nmax = float(np.sqrt(eps_max))   # of the physical media (a bend: before the radial transform), as tidy3d
     n_target = (target_neff if target_neff is not None else nmax) * (1 + 10 * np.finfo(float).eps)
     return -(n_target**2)
 
@@ -275,10 +326,13 @@ def default_solver() -> GPUModeSolver:
 
 
 def _supported(cs) -> str | None:
-    if not (np.isinf(cs.mesh.bend_radius) or np.isnan(cs.mesh.bend_radius)):
-        return "bend radius"
     if cs.mesh.angle_theta != 0:
         return "angled propagation"
+    radius = _bend_radius(cs)
+    if radius is not None:
+        why = bend_error(cs.mesh.x, cs.mesh.y, radius, cs.mesh.bend_axis, tuple(cs.mesh.plane_center))
+        if why:
+            return f"this bend ({why})"
     return None
 
 
@@ -303,7 +357,8 @@ def compute_modes_gpu_batch(css, num_modes: int = 10, target_neff: float | None 
 
     Order: the cross-sections of one grid shape (in the order of css) are divided into ``batch`` runs of
     neighbouring cells, and batch j solves cell j of each run. So member i of a batch starts from the modes of the
-    previous cell of its run (the warm start of ``solve_batch``). When the last run is shorter, its member solves
+    previous cell of its run when that cell is of the same kind (straight, or the same bend; else from the memory of
+    its kind, or cold: the warm start of ``solve_batch``). When the last run is shorter, its member solves
     the last cell again (the result is not used), so that all batches have the same size (one JIT compile).
     Cross-sections that the GPU solver does not support use ``compute_modes_gpu`` (the tidy3d fallback).
     """
@@ -342,9 +397,15 @@ def _tidy3d_fallback(cs, why: str, num_modes: int, target_neff: float | None, po
     return mw.compute_modes_tidy3d(cs, num_modes=num_modes, target_neff=target_neff, post_process=post_process)
 
 
+def _bend_radius(cs) -> float | None:
+    r = cs.mesh.bend_radius
+    return None if (np.isinf(r) or np.isnan(r)) else float(r)
+
+
 def _problem(cs) -> FDEProblem:
     return make_problem(cs.nx**2, cs.ny**2, cs.nz**2, cs.mesh.x, cs.mesh.y, cs.env.wl,
-                        num_pml=tuple(cs.mesh.num_pml))
+                        num_pml=tuple(cs.mesh.num_pml), bend_radius=_bend_radius(cs), bend_axis=cs.mesh.bend_axis,
+                        plane_center=tuple(cs.mesh.plane_center))
 
 
 def _modes(cs, neff, e, h, post_process: Callable):
