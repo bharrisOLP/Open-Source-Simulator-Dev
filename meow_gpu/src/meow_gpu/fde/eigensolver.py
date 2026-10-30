@@ -21,10 +21,16 @@ All device arrays have fixed shapes (the subspace is a buffer of ``max_subspace`
 kernel once per grid size, block size and precision.
 
 A warm start (the modes of the previous cell of a taper, or of the previous wavelength) is the initial block.
+
+Batched solve (``davidson_batch``): B problems with the same grid shape at the same time. The device kernels have a
+leading batch axis; each member keeps its own host state (projected matrix, subspace size, stop). See the section
+"Batched solve" below.
 """
 
 from __future__ import annotations
 
+import os
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from functools import partial
 
@@ -32,7 +38,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
-from meow_gpu.device import put
+from meow_gpu.device import put, solver_device
 from meow_gpu.fde.operator import DeviceOperator, FDEProblem, apply
 
 PC_DTYPE = jnp.complex64
@@ -155,8 +161,14 @@ def _insert(buf: jax.Array, block: jax.Array, start: jax.Array) -> jax.Array:
 def _svqb(t: jax.Array, drop: float) -> tuple[jax.Array, int]:
     """Orthonormalize the block t (b, ...) with SVQB (Stathopoulos and Wu 2002). The result has the same shape;
     the first ``kept`` rows are orthonormal and the other rows are zero."""
-    b = t.shape[0]
     g = np.array(_gram(t, t), dtype=np.complex128)   # host math in double (float32 underflows the guard)
+    coef, kept = _svqb_coef(g, drop)
+    return _combine(put(coef, t.dtype), t), kept
+
+
+def _svqb_coef(g: np.ndarray, drop: float) -> tuple[np.ndarray, int]:
+    """The SVQB coefficients (b, b) and the number of kept directions, from the Gram matrix g (host, complex128)."""
+    b = g.shape[0]
     diag = np.real(np.diag(g))
     # rows with no norm (masked columns) keep the scale 1: 1/tiny overflows complex64 and inf * 0 = nan
     d = np.where(diag > 1e-30 * max(diag.max(), 1e-300), np.sqrt(np.maximum(diag, 0.0)), 1.0)
@@ -167,7 +179,7 @@ def _svqb(t: jax.Array, drop: float) -> tuple[jax.Array, int]:
     kept = int(keep.sum())
     if kept:
         coef[:, :kept] = (u[:, keep] / np.sqrt(s[keep])[None, :]) / d[:, None]
-    return _combine(put(coef, t.dtype), t), kept
+    return coef, kept
 
 
 @dataclass
@@ -284,3 +296,271 @@ def davidson(op: DeviceOperator | tuple[DeviceOperator, DeviceOperator], pc: Pre
     return _davidson_fixed(op, pc, k, target, x0.astype(dtype), tol, max_iter, max_subspace, verbose,
                            stall_iters=12 if precision == "single" else 0)
 
+
+# ---------------------------------------------------------------------------------------------------------------
+# Batched solve: B problems with the same grid shape at the same time.
+#
+# The kernels above, vectorized with jax.vmap over a leading batch axis. The operators and the preconditioners are
+# pytrees with a leading axis B on each leaf (``stack``); the blocks are (B, b, 2, Nx, Ny) and the subspace buffers
+# are (B, M, 2, Nx, Ny). The small projected eigenproblems and the SVQB stay on the host, one for each member, in a
+# thread pool (LAPACK releases the GIL). Each member has its own subspace size, restarts, stall counter and stop
+# (the kept count of SVQB is different in each member). When a member stops, its result is kept. After that its
+# rows of the block are zero: the inserts write zero rows into its buffers (rows that it does not use), and its
+# result does not change. The kernels still run on these rows (fixed shapes): a batch costs as many iterations as
+# its slowest member.
+# ---------------------------------------------------------------------------------------------------------------
+
+HOST_THREADS = max(1, min(8, os.cpu_count() or 1))
+_POOL: ThreadPoolExecutor | None = None
+
+
+def _host_map(f, args: list[tuple]) -> list:
+    """[f(*a) for a in args], in the host thread pool when there is more than one item."""
+    global _POOL
+    if len(args) < 2 or HOST_THREADS < 2:
+        return [f(*a) for a in args]
+    if _POOL is None:
+        _POOL = ThreadPoolExecutor(HOST_THREADS, thread_name_prefix="meow-gpu-host")
+    return list(_POOL.map(lambda a: f(*a), args))
+
+
+def stack(trees):
+    """One pytree with a new leading batch axis, from B pytrees with the same structure and shapes (the device
+    operators or the preconditioners of B problems with the same grid shape)."""
+    return jax.tree.map(lambda *a: jnp.stack(a), *trees)
+
+
+_gram_b = jax.jit(jax.vmap(_gram))
+_combine_b = jax.jit(jax.vmap(_combine))
+_ritz_b = jax.jit(jax.vmap(_ritz))
+_project_out_b = jax.jit(jax.vmap(_project_out))
+_apply_b = jax.jit(jax.vmap(apply))
+
+
+@jax.jit
+def precondition_batch(pc: Preconditioner, r: jax.Array, theta: jax.Array) -> jax.Array:
+    """``precondition`` for each member: pc batched (``stack``), r (B, b, 2, Nx, Ny), theta (B, b)."""
+    return jax.vmap(precondition)(pc, r, theta)
+
+
+@jax.jit
+def _expand_b(pc: Preconditioner, r: jax.Array, theta: jax.Array, active: jax.Array) -> jax.Array:
+    """The preconditioned residuals of the active rows; the other rows are zero."""
+    t = jax.vmap(precondition)(pc, r, theta)
+    return jnp.where(active[:, :, None, None, None], t, 0)
+
+
+@partial(jax.jit, donate_argnums=(0,))
+def _insert_b(buf: jax.Array, block: jax.Array, start: jax.Array) -> jax.Array:
+    """The block of member i into its buffer at the row start[i]."""
+    return jax.vmap(lambda bf, bl, s: jax.lax.dynamic_update_slice_in_dim(bf, bl, s, axis=0))(buf, block, start)
+
+
+@partial(jax.jit, donate_argnums=(0,))
+def _reset_b(buf: jax.Array, block: jax.Array, flag: jax.Array) -> jax.Array:
+    """For each member with ``flag``: the block in the first rows of the buffer, zero in the other rows. The
+    buffers of the other members do not change."""
+    def one(bf, bl, f):
+        return jnp.where(f, jax.lax.dynamic_update_slice_in_dim(jnp.zeros_like(bf), bl, 0, axis=0), bf)
+    return jax.vmap(one)(buf, block, flag)
+
+
+@jax.jit
+def _select_b(flag: jax.Array, new: jax.Array, old: jax.Array) -> jax.Array:
+    return jnp.where(flag[:, None, None, None, None], new, old)
+
+
+@jax.jit
+def _h_new_b(v: jax.Array, at: jax.Array, t: jax.Array, w: jax.Array):
+    """The new columns <v_i, A t_j> (B, M, b) and rows <t_i, A v_j> (B, b, M) of the projected matrices."""
+    return jax.vmap(_gram)(v, at), jax.vmap(_gram)(t, w)
+
+
+def _svqb_b(t: jax.Array, drop: float, members: np.ndarray) -> tuple[jax.Array, np.ndarray]:
+    """SVQB of the block of each member in ``members`` (bool, (B,)); the blocks of the other members become zero."""
+    g = np.array(_gram_b(t, t), dtype=np.complex128)
+    coef = np.zeros(g.shape, dtype=np.complex128)
+    kept = np.zeros(t.shape[0], dtype=int)
+    idx = np.flatnonzero(members)
+    for i, (c, n) in zip(idx, _host_map(_svqb_coef, [(g[i], drop) for i in idx])):
+        coef[i], kept[i] = c, n
+    return _combine_b(put(coef, t.dtype), t), kept
+
+
+def _ritz_coef(h: np.ndarray, m: int, target: complex, b: int) -> tuple[np.ndarray, np.ndarray]:
+    """The (at most b) Ritz values of h[:m, :m] nearest the target, and their coefficient vectors (m, nb)."""
+    vals, y = np.linalg.eig(h[:m, :m])
+    order = np.argsort(np.abs(vals - target))[:b]
+    return vals[order], y[:, order]
+
+
+@dataclass
+class BatchEigResult:
+    values: np.ndarray        # (B, k) complex eigenvalues of each member, sorted by distance to its target
+    vectors: jax.Array        # (B, b, 2, Nx, Ny): the k wanted Ritz vectors of each member first
+    residuals: np.ndarray     # (B, k) relative residual norms
+    iterations: np.ndarray    # (B,) iterations of each member
+    matvecs: np.ndarray       # (B,)
+    converged: np.ndarray     # (B,) bool
+
+    def __len__(self) -> int:
+        return len(self.iterations)
+
+    def member(self, i: int) -> EigResult:
+        """The result of member i, as ``davidson`` gives it."""
+        return EigResult(self.values[i], self.vectors[i], self.residuals[i], int(self.iterations[i]),
+                         int(self.matvecs[i]), bool(self.converged[i]))
+
+
+def _davidson_batch_fixed(op: DeviceOperator, pc: Preconditioner, k: int, target: np.ndarray, x0: jax.Array,
+                          tol: np.ndarray, max_iter: np.ndarray, max_subspace: int, verbose: bool,
+                          stall_iters: int = 0) -> BatchEigResult:
+    """``_davidson_fixed`` for each member of a batch, in the dtype of x0 (B, b, 2, Nx, Ny). ``target``, ``tol``
+    and ``max_iter`` have one value for each member."""
+    dtype = x0.dtype
+    nbat, b = x0.shape[:2]
+    big_m = max_subspace
+    drop = 1e-4 if dtype == jnp.complex64 else 1e-10      # as in _davidson_fixed
+    target = np.broadcast_to(np.asarray(target, dtype=complex), (nbat,))
+    tol = np.broadcast_to(np.asarray(tol, dtype=float), (nbat,))
+    max_iter = np.broadcast_to(np.asarray(max_iter, dtype=int), (nbat,))
+    x0 = put(x0)
+    v = jnp.zeros((nbat, big_m) + x0.shape[2:], dtype, device=solver_device())
+    w = jnp.zeros((nbat, big_m) + x0.shape[2:], dtype, device=solver_device())
+    h = np.zeros((nbat, big_m, big_m), dtype=np.complex128)
+    m = np.zeros(nbat, dtype=int)                          # the subspace size of each member
+    matvecs = np.zeros(nbat, dtype=int)
+
+    def restart(block, flag):
+        nonlocal v, w
+        q, kept = _svqb_b(block, drop, flag)
+        aq = _apply_b(op, q)
+        fl = put(flag)
+        v = _reset_b(v, q, fl)
+        w = _reset_b(w, aq, fl)
+        g = np.asarray(_gram_b(q, aq))
+        for i in np.flatnonzero(flag):
+            n = kept[i]
+            h[i] = 0
+            h[i, :n, :n] = g[i, :n, :n]
+            m[i] = n
+            matvecs[i] += n
+
+    restart(x0, np.ones(nbat, dtype=bool))
+    values = np.zeros((nbat, k), dtype=complex)
+    resid = np.full((nbat, k), np.inf)
+    iters = np.zeros(nbat, dtype=int)
+    conv = np.zeros(nbat, dtype=bool)
+    xf = x0                                                # the vectors of the members that stopped
+    done = max_iter <= 0                                   # a new (writable) array
+    best, best_it = np.full(nbat, np.inf), np.zeros(nbat, dtype=int)
+    rows = np.arange(b)[None, :]
+
+    def finish(flag):
+        """Keep the current Ritz pairs of the members with ``flag`` as their result; they stop."""
+        nonlocal xf
+        values[flag], resid[flag], iters[flag], conv[flag] = theta[flag, :k], rn[flag, :k], it, ok[flag]
+        xf = _select_b(put(flag), x, xf)
+        done[flag] = True
+
+    for it in range(1, int(max_iter.max(initial=0)) + 1):
+        live = np.flatnonzero(~done)
+        theta = np.zeros((nbat, b), dtype=complex)
+        ypad = np.zeros((nbat, big_m, b), dtype=np.complex128)
+        nb = np.zeros(nbat, dtype=int)
+        for i, (vals, y) in zip(live, _host_map(_ritz_coef, [(h[i], m[i], target[i], b) for i in live])):
+            nb[i] = len(vals)
+            theta[i, : nb[i]] = vals
+            ypad[i, : m[i], : nb[i]] = y
+        theta_dev = put(theta, dtype)
+        x, r, rn_dev = _ritz_b(put(ypad, dtype), theta_dev, v, w)
+        rn = np.array(rn_dev, dtype=np.float64)            # a writable copy
+        rn[rows >= nb[:, None]] = np.inf
+        rn[done] = np.inf                                  # stopped members: x = 0 and rn = 0/0
+        worst = rn[:, :k].max(axis=1)
+        ok = ~done & np.all(rn[:, :k] < tol[:, None], axis=1)
+        # the stall rule of _davidson_fixed, for each member
+        better = ~done & ~ok & (worst < 0.5 * best)
+        best[better], best_it[better] = worst[better], it
+        stalled = ~done & ~ok & ~better & (stall_iters > 0) & (best < STALL_FLOOR) & (it - best_it >= stall_iters)
+        stop = ok | stalled
+        # at the iteration limit, _davidson_fixed expands the subspace once more (its loop ends after that step) and
+        # returns the Ritz pairs of this iteration: these members stop after the expansion, with the same matvecs
+        limit = ~done & ~stop & (it >= max_iter)
+        if verbose:
+            print(f"  it {it:3d} live {len(live):3d} m {m[live].max():4d} max res {worst[live].max():.2e}",
+                  flush=True)
+        if stop.any():
+            finish(stop)
+        if done.all():
+            break
+        active = (rn >= tol[:, None]) & ~done[:, None]
+        t = _expand_b(pc, r, theta_dev, put(active))
+        full = ~done & (m + b > big_m)
+        if full.any():
+            restart(x, full)
+        t = _project_out_b(t, v)                           # two passes (CGS2), as in _davidson_fixed
+        t, kept = _svqb_b(t, drop, ~done)
+        empty = ~done & (kept == 0)
+        if empty.any():
+            finish(empty)                                  # as the "break" of _davidson_fixed (ok is False here)
+        if done.all():
+            break
+        at = _apply_b(op, t)
+        start = put(np.minimum(m, big_m - b).astype(np.int32))   # stopped members: rows that are not used
+        v = _insert_b(v, t, start)
+        w = _insert_b(w, at, start)
+        hcol, hrow = jax.device_get(_h_new_b(v, at, t, w))
+        for i in np.flatnonzero(~done):
+            mi, n = m[i], kept[i]
+            h[i, : mi + n, mi: mi + n] = hcol[i, : mi + n, :n]
+            h[i, mi: mi + n, :mi] = hrow[i, :n, :mi]
+            m[i] += n
+            matvecs[i] += n
+        limit &= ~done
+        if limit.any():
+            finish(limit)                                  # the Ritz pairs of this iteration (x, theta, rn)
+    return BatchEigResult(values, xf, resid, iters, matvecs, conv)
+
+
+def davidson_batch(op: DeviceOperator | tuple[DeviceOperator, DeviceOperator], pc: Preconditioner, k: int,
+                   target, x0: jax.Array, tol=1e-10, max_iter=300, max_subspace: int | None = None,
+                   precision: str = "mixed", switch_tol: float = 2e-5, verbose: bool = False) -> BatchEigResult:
+    """The k eigenpairs nearest the target of each of B problems with the same grid shape, solved at the same time.
+
+    op: a batched device operator (``stack`` of B operators) in complex128 ("double"), complex64 ("single"), or a
+        pair (complex64, complex128) for "mixed".
+    pc: a batched preconditioner (``stack`` of B preconditioners).
+    target, tol, max_iter: one value for all members, or an array of B values.
+    x0: (B, b, 2, Nx, Ny), b >= k: the initial block of each member.
+
+    Each member does the steps of ``davidson`` on its own problem (the same precision modes and stall rule); the
+    device kernels run on all members together.
+    """
+    nbat, b = x0.shape[:2]
+    if b < k:
+        raise ValueError("the initial block needs at least k vectors")
+    max_subspace = max_subspace or max(4 * b, b + 2 * k)
+    target = np.broadcast_to(np.asarray(target, dtype=complex), (nbat,))
+    tol = np.broadcast_to(np.asarray(tol, dtype=float), (nbat,))
+    max_iter = np.broadcast_to(np.asarray(max_iter, dtype=int), (nbat,))
+    if precision == "mixed":
+        op32, op64 = op
+        lo = _davidson_batch_fixed(op32, pc, k, target, x0.astype(jnp.complex64), np.maximum(switch_tol, tol),
+                                   max_iter, max_subspace, verbose, stall_iters=12)
+        left = np.maximum(0, max_iter - lo.iterations)
+        polish = left > 0                    # members with no iterations left keep the complex64 result
+        if not polish.any():
+            return lo
+        hi = _davidson_batch_fixed(op64, pc, k, target, lo.vectors.astype(jnp.complex128), tol, left, 3 * b,
+                                   verbose)
+        keep = ~polish
+        hi.values[keep] = lo.values[keep]
+        hi.residuals[keep] = lo.residuals[keep]
+        hi.converged[keep] = lo.converged[keep]
+        hi.iterations = hi.iterations + lo.iterations
+        hi.matvecs = np.where(polish, hi.matvecs + lo.matvecs, lo.matvecs)
+        return hi
+    dtype = jnp.complex64 if precision == "single" else jnp.complex128
+    return _davidson_batch_fixed(op, pc, k, target, x0.astype(dtype), tol, max_iter, max_subspace, verbose,
+                                 stall_iters=12 if precision == "single" else 0)

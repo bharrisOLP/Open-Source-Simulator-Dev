@@ -5,7 +5,7 @@ import meow as mw
 import numpy as np
 import pytest
 
-from meow_gpu.meow_backend import GPUModeSolver, compute_modes_gpu, post_process_modes
+from meow_gpu.meow_backend import GPUModeSolver, compute_modes_gpu, compute_modes_gpu_batch, post_process_modes
 
 
 def strip_cross_section(width=0.5, wl=1.55, dx=0.04, bend_radius=None, num_pml=(0, 0)):
@@ -52,8 +52,9 @@ def test_solver_arrays_ignore_the_cpu_default_of_klujax():
         assert solver_device() == gpu
 
 
-def _below_cutoff_eme(solver):
-    """A width step with more modes than the window guides: several modes are below cutoff (evanescent)."""
+def _below_cutoff_eme(solver, batch=None):
+    """A width step with more modes than the window guides: several modes are below cutoff (evanescent).
+    ``batch``: solve the cells with ``compute_modes_gpu_batch``."""
     oxide = mw.IndexMaterial(name="sio2", n=1.444)
     si = mw.IndexMaterial(name="si", n=3.476)
     clad = mw.Structure(material=oxide, geometry=mw.Box(x_min=-2, x_max=2, y_min=-2, y_max=2, z_min=-1, z_max=3))
@@ -66,6 +67,8 @@ def _below_cutoff_eme(solver):
     css = [mw.CrossSection.from_cell(cell=c, env=mw.Environment(wl=1.55, T=25.0)) for c in cells]
     if solver is None:
         modes = [mw.compute_modes_tidy3d(cs, num_modes=16, post_process=post_process_modes) for cs in css]
+    elif batch:
+        modes = compute_modes_gpu_batch(css, num_modes=16, solver=solver, batch=batch)
     else:
         modes = [compute_modes_gpu(cs, num_modes=16, solver=solver) for cs in css]
     S, pm = mw.compute_s_matrix(modes, cells=cells)
