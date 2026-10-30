@@ -1,0 +1,32 @@
+"""The tidy3d matrix of the diagonal mode solver, built with tidy3d's own derivative and PML functions (reference)."""
+import numpy as np
+import scipy.sparse as sp
+from tidy3d.components.mode.derivatives import create_d_matrices, create_s_matrices
+from tidy3d.constants import C_0
+
+
+def tidy3d_matrix(eps_xx, eps_yy, eps_zz, x, y, wavelength, num_pml=(0, 0), symmetry=(0, 0)):
+    nx, ny = eps_xx.shape
+    n = nx * ny
+    freq = C_0 / wavelength
+    omega = 2 * np.pi * freq
+    k0 = omega / C_0
+    eps_tensor = np.zeros((3, 3, n), dtype=complex)
+    mu_tensor = np.zeros((3, 3, n), dtype=complex)
+    for i, e in enumerate((eps_xx, eps_yy, eps_zz)):
+        eps_tensor[i, i] = np.asarray(e, dtype=complex).ravel()
+        mu_tensor[i, i] = 1.0
+    dl_f = [np.diff(c) for c in (x, y)]
+    dl_b = [np.hstack((d[0], (d[:-1] + d[1:]) / 2)) for d in dl_f]
+    dls = (dl_f, dl_b)
+    dmin_pmc = [s == 1 for s in symmetry]
+    d = create_d_matrices((nx, ny), dls, dmin_pmc)
+    s = create_s_matrices(omega, (nx, ny), num_pml, dls, eps_tensor, mu_tensor, np.array(symmetry) == 0)
+    dxf, dxb, dyf, dyb = [S.dot(D) / k0 for S, D in zip(s, d)]
+    iez = sp.spdiags(1 / eps_tensor[2, 2], [0], n, n)
+    eye = sp.eye(n)
+    p_mu = sp.bmat([[None, eye], [-eye, None]])
+    p_partial = sp.bmat([[-dxf @ iez @ dyb, dxf @ iez @ dxb], [-dyf @ iez @ dyb, dyf @ iez @ dxb]])
+    q_ep = sp.bmat([[None, sp.spdiags(eps_tensor[1, 1], [0], n, n)], [sp.spdiags(-eps_tensor[0, 0], [0], n, n), None]])
+    q_partial = sp.bmat([[-dxb @ dyf, dxb @ dxf], [-dyb @ dyf, dyb @ dxf]])
+    return (p_mu @ (q_ep + q_partial) + p_partial @ q_ep).tocsr()
