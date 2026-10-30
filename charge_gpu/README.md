@@ -25,6 +25,8 @@ pin = rib_pin()                                           # lateral PIN rib, p+ 
 sols = dd.sweep(pin, [0.0, 0.9], tau_n=1e-9, tau_p=1e-9)  # forward bias V = v_p - v_n, continuation from 0 V
 sols[1].current                                           # A/m (= mA/mm) out of the n contact
 rib_index_change(pin, sols[1], sols[0])                   # mean n, p, index change and loss change in the rib
+g = dd.solve(pin, 0.0, 0.95, guess=sols[1], method="gummel", linear="device", tau_n=1e-9, tau_p=1e-9)
+g.converged, g.linear_error, g.linear_fallbacks          # Gummel with all steps on the JAX device (continuity.py)
 ```
 
 ## Method
@@ -92,13 +94,62 @@ and the results of `poisson.py` and `rc.py` do not change):
     carrier density changes by at most a factor exp(10) per step and stays positive.
   - `method="gummel"`: the decoupled Gummel iteration. The Poisson step (symmetric positive definite: the nonlinear
     Poisson equation with the quasi-Fermi levels of the last carriers per cell) runs on the JAX device with the
-    multigrid-preconditioned CG of `poisson.py`. The two continuity steps (nonsymmetric, linear at fixed psi, with
-    R linearized at the last carriers) use the sparse direct LU on the CPU. Fast at low bias, slow at high
-    injection (linear convergence).
+    multigrid-preconditioned CG of `poisson.py` (the hierarchy of `continuity.hierarchy`, below). The two continuity
+    steps (nonsymmetric, linear at fixed psi, with R linearized at the last carriers) use the solver `linear`:
+    - `linear="superlu"` (default, the reference): the sparse direct LU on the CPU;
+    - `linear="device"`: BiCGSTAB with a multigrid preconditioner, one jitted loop on the JAX device
+      (`continuity.py`, next section).
+
+    Linear convergence: more iterations than Newton (42 against 6 on the PIN rib at 0.9 V).
 - `sweep()`: bias continuation from 0 V (started from `poisson.solve`) in steps of at most 50 mV, each solve
-  started from the last converged solution; a failed step is halved.
+  started from the last converged solution; a failed step is halved. `sweep(dev, biases, method="gummel",
+  linear="device")` runs the whole continuation on the device path.
 - `injection.py`: a graded 1-D grid, the 1-D diode, the Shockley J0, the lateral PIN rib and the plasma dispersion
   of the rib (`modulator.plasma_dispersion`).
+
+### The continuity steps on the device (`continuity.py`)
+
+The matrix M of a Gummel continuity step is a nonsymmetric M-matrix. The choice: the Slotboom form, which makes it
+symmetric, as the preconditioner, and BiCGSTAB in row-relative residuals as the Krylov method.
+
+- Slotboom form: B(-d) = exp(d) B(d), so the SG electron flux of a face is
+  c (B(d) n_b - B(-d) n_a) = W_ab (u_b - u_a), with u = n / E, E = exp((psi - psi_ref) / V_T) and
+  W_ab = c B(-|d|) exp((min(psi_a, psi_b) - psi_ref) / V_T) = W_ba > 0. So M = -S E^-1 exactly, where S is a
+  symmetric positive definite 5-point operator (face weights W plus the contact and recombination diagonal):
+  the form of the multigrid of thermal-gpu. Holes: p = F v, F = exp(-(psi - psi_ref) / V_T).
+- Why not CG on S alone: W and u span many decades (exp(V / V_T) across a junction, 1e16 and more). The 2-norm of
+  the residual is then the residual of the majority-carrier rows only, and CG stops before the minority-carrier
+  rows converge. So BiCGSTAB solves in row-relative residuals, r_a = (b - S u)_a / (|S| |u0| + |b|)_a (the
+  componentwise backward error of each row): all rows have the same weight.
+- Preconditioner: one V-cycle of the aggregation multigrid (the 2 x 2 coarsening and the symmetric V-cycle of
+  thermal-gpu) on S, as a right preconditioner. In strong drift (a junction) the Jacobi-scaled S is nearly diagonal
+  (off-diagonals about exp(-|d| / 2)); in the neutral regions S is a diffusion operator, where the multigrid removes
+  the (L / h)^2 growth of the condition number. ILU(0) or line relaxation were not used: they are sequential
+  (triangular solves) and slow on a GPU, and the multigrid was already there.
+- The coarsest operator (at most 256 cells) is inverted with an LU factorization after a symmetric diagonal scaling.
+  The first version used a pseudo-inverse (SVD). The SVD gives the entries of the inverse only to about 1e-16 of the
+  largest entry, and the true entries between the two sides of a reverse-biased junction are far smaller: the noise
+  moved residuals of the large rows into the small rows, and the solve diverged from 5 V reverse on the 1e18 cm^-3
+  junction (the review of this change found it). The coarsest operator is an M-matrix, so its LU inverse adds only
+  terms of one sign, and its small entries keep their relative accuracy. With it, the same solves converge at 5,
+  10 and 25 V (45, 48 and 57 BiCGSTAB iterations per Gummel solve of 3 iterations).
+- The grid of the solve is the bounding box of the semiconductor cells (the PIN rib: 22 of 122 rows at 10 nm).
+- Stop: the max row-relative residual below 1e-14, or 10 iterations without halving its best value (the round-off
+  floor); the result is the vector of the smallest residual. Convergence flag: the componentwise backward error of
+  the true residual (recomputed after the loop), at most 1e-11; above it, up to 3 restarts from the last vector.
+- A device solve that is not converged, or that cannot run (the span limit below), is not used: the Gummel
+  iteration solves that step with SuperLU and counts it in `DDSolution.linear_fallbacks`. `linear_error` (the
+  largest backward error of the last continuity steps; also measured for `linear="superlu"`, and None for Newton),
+  `linear_converged` and `krylov_iterations` report the solves; a Gummel solve is converged only when its last
+  continuity steps are.
+- Range: E and F must stay in the float64 range, so the psi span in the semiconductor may be at most 1200 V_T
+  (31 V at 300 K; above it `continuity.SpanError`, and the steps use SuperLU). Tested: forward bias to 1.0 V (PIN
+  rib), reverse bias to 25 V (the 1-D junction: 1e18 cm^-3, 2.5 nm cells, up to 12 V_T per cell).
+- Shared code: `continuity.py` imports the coarsening of thermal-gpu (`thermal_gpu.multigrid._coarsen`, a private
+  helper, and `vcycle`), and the Gummel Poisson step uses `continuity.hierarchy` (the coarsening down to 256 cells
+  and the LU coarsest inverse; it replaced the 1024-cell pseudo-inverse of `build_hierarchy`, whose host time was
+  most of the Gummel time). A change of `thermal_gpu.multigrid` can change both Gummel paths: the tests of
+  `tests/test_dd_device.py` and `tests/test_drift_diffusion.py` cover them.
 
 ## Checks (`tests/test_junction.py`, `tests/test_rc.py`)
 
@@ -132,11 +183,11 @@ the RX 7900 XT). The 1-D junction is the one of `test_junction.py` (1e18 cm^-3 b
 
 | Case | Reference | Agreement |
 |---|---|---|
-| 1-D junction, 0 V, started from a perturbed state (20 mV on psi, 30 % on n and p) | `poisson.solve` (equilibrium) | Newton: psi 3.3e-16 V, n and p 1.4e-14; Gummel: 6.8e-15 V, 7.3e-13 (tests: 1e-11 V, 1e-9) |
-| the same | no current | below 8e-11 A/m at every face (the round-off floor, see the limits; test 1e-9 A/m) |
+| 1-D junction, 0 V, started from a perturbed state (20 mV on psi, 30 % on n and p) | `poisson.solve` (equilibrium) | Newton: psi 3.3e-16 V, n and p 1.4e-14; Gummel (SuperLU continuity): 2.6e-15 V, 5.0e-13 (tests: 1e-11 V, 1e-9). These Gummel values changed with the multigrid of its Poisson step (`continuity.hierarchy`; before: 6.8e-15 V, 7.3e-13) |
+| the same | no current | Newton: below 8e-11 A/m at every face; Gummel: contact currents 3.7e-11 A/m, faces up to 1.0e-10 A/m (before the change of its Poisson multigrid: below 8e-11 A/m; the value changes from run to run at this level). The round-off floor, see the limits; test 1e-9 A/m |
 | 1-D junction, 1 V and 3 V reverse, by continuation from 0 V | `poisson.solve` | psi 3.6e-15 and 8.0e-15 V; the majority carriers wherever they exceed n_i: 1.2e-8 and 3.6e-8 (test 1e-7) |
 | the same | the minority carriers far from the junction | the equilibrium value n_i^2 / N_A (0.27 % lower in the first cell: the linear decrease toward the depletion edge), so exp(V/V_T) above `poisson.solve`, which keeps phi_n at the n-contact voltage |
-| 1-D junction, 0.6 V forward and 1 V reverse | Gummel against Newton (two solvers, two linear solvers; the Gummel Poisson step on rocm:0) | psi 5e-15 V, n and p 8e-13, current 2.7e-8 at 0.6 V |
+| 1-D junction, 0.6 V forward and 1 V reverse | Gummel against Newton (two solvers, two linear solvers; the Gummel Poisson step on rocm:0) | psi 5.0e-15 and 4.2e-15 V, n and p at most 7.2e-13, current 2.7e-8 at 0.6 V (I = 4.48e-4 A/m) |
 | 1-D long-base diode, 1e18 cm^-3 both sides, tau 100 us, contacts 6 L from the junction (910 cells, 1 nm at the junction, 3 % growth) | Shockley ideal diode J0 (exp(V/V_T) - 1), J0 = q n_i^2 (D_n / (L_n N_A) + D_p / (L_p N_D)) = 7.55e-15 A/cm^2 (Sze and Ng, Ch. 2) | J / J_Shockley = 1.0099, 1.0041, 1.0015, 0.9994, 0.9908 at 0.55, 0.60, 0.65, 0.70, 0.75 V (tests: 1 % from 0.60 to 0.75 V; 1.5 % at 0.55 V, where the depletion recombination adds the expected 0.9 to 1 %) |
 | the same, outside that range | the known deviations | 1.897 at 0.3 V, 1.144 at 0.4 V, 1.024 at 0.5 V: recombination in the depletion region (Sah-Noyce-Shockley, ~ exp(V / 2 V_T): the excess 2.39, 0.99, 0.41 % at 0.50, 0.55, 0.60 V falls by 0.41 per 50 mV against exp(-0.05 V / 2 V_T) = 0.38; test 0.3 to 0.5); 0.939 at 0.8 V: high injection (n_p / N_A = 2.8e-3) and ohmic drop |
 | the same | current continuity: the total current through each of the 909 cross-sections and both contacts | contact currents sum to below 1.2e-14 A/m; cross-sections within 2.5e-10 A/m (relative 3.8e-5 at 0.65 V, 1.3e-7 at 0.8 V) |
@@ -155,6 +206,34 @@ tau); here they reduce J by 0.9 % at n_p / N = 4e-4 (0.75 V) and 6 % at 2.8e-3 (
 (1e17 cm^-3) the two effects
 overlap: J / J_Shockley = 1.063, 1.027, 1.009, 0.984, 0.877 at 0.50, 0.55, 0.60, 0.65, 0.70 V (a scratch run on the
 GPU computer; not a test). A long lifetime makes the window where the Shockley assumptions hold.
+
+## Checks of the device continuity solver (`tests/test_dd_device.py`)
+
+All values from the GPU computer (the device path on the RX 7900 XT, rocm:0). The PIN rib of these tests has
+10 nm cells and contacts 1 um from the center (2450 semiconductor cells, a 200 x 22 grid of the solve); tau 1 ns.
+
+| Case | Reference | Agreement |
+|---|---|---|
+| The Slotboom operator, PIN rib at 1.0 V, electrons and holes | S u = -M (E u) and S_p v = M_p (F v), with M the SG matrix of the SuperLU path; b = -rhs and rhs | tests: 1e-13 of \|M\| \|n\| per row; 1e-14 |
+| One continuity solve, PIN rib at 1.0 V, started 30 % off | SuperLU of the same matrix | 11 and 12 BiCGSTAB iterations (n, p); backward error of the true residual 3.1e-15 and 8.0e-15 (3.2e-15 and 8.1e-15 on the host with the SG matrix); carriers 6.8e-13 and 1.1e-13 (tests 1e-11); with 1 iteration and no restart the flag is False |
+| PIN rib at 0.9 and 1.0 V (high injection: rib n 2.2e17 and 6.3e17 cm^-3), Gummel on the device path from the Newton solution 50 mV lower | Newton with SuperLU | 31 and 37 Gummel iterations, no fallback; psi 5.2e-13 and 2.2e-12 V; n 1.2e-11 and 7.8e-11; p 1.4e-11 and 8.8e-11; contact currents 4.0e-11 and 2.3e-11; rib index change 1.9e-12 and 3.6e-11 (9.0e-11 in the run of the review) (tests 1e-11 V, 1e-8, 1e-8, 1e-8, 1e-8) |
+| the same | current continuity: the total current through each column | 6.3e-11 and 2.2e-11 of I (test 1e-9) |
+| 1-D junction (1e18 cm^-3, 2.5 nm cells) at 0.6 V forward and 1, 3, 5, 10, 25 V reverse; Gummel from `poisson.solve` | Newton with SuperLU, by continuation | 3 Gummel iterations each, 38, 38, 41, 45, 48, 57 BiCGSTAB iterations, no fallback; psi 7.4e-15, 4.7e-15, 4.4e-15, 1.1e-14, 8.9e-15, 6.8e-14 V; n 2.4e-13, 3.5e-13, 1.4e-13, 5.1e-13, 7.1e-13, 2.5e-12; p 4.5e-13, 3.2e-13, 2.1e-13, 3.8e-13, 6.1e-13, 8.5e-13 (tests 1e-12 V, 1e-9) |
+| the same, 0.6 V | the current (I = 4.48e-4 A/m) | 3.0e-7 of I from the Newton continuation, 5.5e-8 from a direct Newton solve: the two Newton solutions differ at the face-current floor, about 1e-10 A/m (test 5e-9 A/m, the device floor below) |
+| 1-D junction, 0 V, from the perturbed state of the Newton test | `poisson.solve` | psi 9.5e-15 V; n 7.0e-13, p 4.3e-13 (tests 1e-11 V, 1e-9); contact currents up to 3.0e-10 A/m, faces up to 4.7e-10 A/m (the run of the review: 2.3e-10 and 4.1e-10; the values change from run to run). Test 5e-9 A/m: the majority drift and diffusion terms of a face are about 4.6e4 A/m (q D N / h for 1 um), and the device solve leaves relative errors of about 1e-14, so its floor is about 5e-10 A/m; the limit is 10x that. The SuperLU path: 3.7e-11 and 1.0e-10 A/m |
+| 1-D junction, 1 V reverse, every device solve replaced by a result flagged not converged; then `SPAN_MAX` below the psi span | the Newton solution | each step solved with SuperLU (`linear_fallbacks` = 2 per Gummel iteration), psi to 1e-12 V (test); `SpanError` names the span and the limit |
+| 1-D junction, 0.6 V | `linear_error` of both linear solvers | SuperLU below 1e-14, device below 1e-11, Newton None (tests) |
+| Short-base diode: 1e18 cm^-3, tau 100 us, contacts 10 um from the junction (580 cells); sweep 0 to 0.7 V on the device path | Shockley with the neutral widths W' = 10 um - W_dep / 2 (J0 with coth(W' / L), Sze and Ng, Ch. 2; L = 270 um) | test 1e-3 at 0.6, 0.65, 0.7 V; Newton gives 1.00017, 1.00006, 0.99992 (a scratch run) |
+| the same | Newton current; sum of the contact currents; each cross-section | test 5e-9 A/m (I = 2.2e-5 to 1.0e-3 A/m). A scratch run: dI / I = -1.8e-5, 8.3e-7, -6.1e-7, sums up to 9.1e-10 A/m, cross-sections up to 9.4e-10 A/m (an earlier run: -3.5e-5, 1.6e-6, -3.1e-7). The Gummel path with SuperLU has the same floor: -5.0e-6, -8.2e-6, 9.1e-7, sums and cross-sections up to 1.5e-9 A/m |
+
+- The floor of the diode current is a floor of the Gummel iteration, not of the linear solver: with either linear
+  solver the relative updates do not fall much below 1e-11 (tol 1e-12 fails at 0 V), and a contact current is the
+  difference of majority drift and diffusion terms about 2e4 times larger.
+- The long-base diode of the Shockley check (contacts 1.6 mm from the junction, cells up to 50 um) is not a test of
+  the device path: Gummel stalls on it with both linear solvers. A scratch run at 0.65 V from the 0.6 V Newton
+  solution: after 50, 200 and 800 iterations the relative update is still 2e-9 to 6e-9, and the current is
+  1.9e-4, 1.7e-4, 1.5e-4 from Newton (SuperLU) and 3.4e-5, 7.9e-5, 2.2e-5 (device, no fallback). Use Newton for
+  such devices.
 
 ## Example: depletion modulator (`examples/pn_modulator.py`)
 
@@ -269,35 +348,59 @@ GPU computer (the Newton solves on its CPU; `benchmarks/2026-10-30/charge-dd.jso
 
 ## Drift-diffusion bench (`bench/bench_dd.py`)
 
-One JSON line per case: the long-base diode (Newton, J / J_Shockley at 0.55, 0.65, 0.75 V), the PIN rib with
-Newton (0 to 1.0 V), and one Gummel solve of the PIN rib at 0.6 V (the device part: the Poisson step).
+One JSON line per case:
+- `env`: the JAX device and the CPU count;
+- `diode`: the long-base diode (Newton sweep, J / J_Shockley at 0.55, 0.65, 0.75 V); skip with `--no-diode`;
+- `pin-newton`: the PIN rib of the example (contacts 1.5 um from the center), Newton sweep 0 to 1.0 V; skip with
+  `--no-sweep`;
+- at each bias of `--biases` (default 0.6 and 0.9 V), from the Newton solution 50 mV lower (the same start for all
+  rows): `pin-newton-step` (one Newton solve, SuperLU, the reference), `pin-gummel-superlu` (Gummel, the continuity
+  steps with SuperLU), `pin-gummel-device` (Gummel, all steps on the JAX device), `pin-gummel-device-cpu` (the same
+  code with JAX on the CPU; skip with `--no-cpu`). The Gummel rows give the time of the solve, a one-iteration
+  warm-up apart (the JIT compile of the mesh), the times of the Poisson and the continuity steps, the iterations,
+  the backward error of the linear solves and the differences to the Newton solution (current, psi, n, p).
 
 ```
 bash tools/remote.sh sh <<'EOF'
-bash tools/gpu_run.sh charge_gpu python bench/bench_dd.py                            # diode and 10 nm (run)
-bash tools/gpu_run.sh charge_gpu python bench/bench_dd.py --dx 10e-9 5e-9 --no-diode # larger (run, below)
+bash tools/gpu_run.sh charge_gpu python bench/bench_dd.py --dx 10e-9 --biases 0.9 --no-diode --no-sweep  # small
+GPU_RUN_TIMEOUT=3600 bash tools/gpu_run.sh charge_gpu python bench/bench_dd.py --dx 10e-9 5e-9 --no-diode --no-sweep
 EOF
 ```
 
-Default run on the GPU computer: diode 910 cells 2.2 s (J / J_Shockley 1.0099, 1.0015, 0.9908); the PIN rows at
-10 nm are the same as in the table below (Newton 16.5 s, Gummel 2.6 s, the same currents).
+The full run (`bench_dd.py --dx 10e-9 5e-9 --no-diode --no-sweep`; rows in
+`benchmarks/2026-10-30/charge-dd-device.jsonl`, with the LU coarsest inverse). Each Gummel row: total time, then the
+Poisson and the continuity steps; 16 Gummel iterations at 0.6 V and 42 at 0.9 V, from the Newton solution 50 mV
+lower; no linear fallback in any row:
 
-Larger cases (`benchmarks/2026-10-30/charge-dd.jsonl`; the Gummel Poisson step on the RX 7900 XT, or on the CPU with
-`CHARGE_GPU_DEVICE=cpu`; the Newton solve always on the CPU):
+| Cells (silicon) | Bias | Newton, SuperLU | Gummel, SuperLU continuity | Gummel, all on rocm:0 | Gummel, all with JAX on the CPU |
+|---|---|---|---|---|---|
+| 36 600 (3350), 10 nm | 0.6 V | 0.76 s | 0.80 s (0.67 + 0.12) | 0.93 s (0.71 + 0.20) | 3.81 s (3.14 + 0.65) |
+| 36 600 (3350), 10 nm | 0.9 V | 0.76 s | 2.83 s (2.49 + 0.32) | 3.14 s (2.63 + 0.50) | 9.51 s (8.24 + 1.25) |
+| 146 400 (13 400), 5 nm | 0.6 V | 4.76 s | 1.97 s (1.43 + 0.52) | 1.64 s (1.37 + 0.24) | 21.59 s (20.29 + 1.27) |
+| 146 400 (13 400), 5 nm | 0.9 V | 4.78 s | 18.34 s (16.97 + 1.34) | 20.67 s (19.94 + 0.70) | 347.98 s (344.23 + 3.72) |
+
+- All Gummel rows equal the Newton current to 3.7e-10 or better (psi 8.5e-13 V, n and p 2.1e-11 or better); the
+  backward error of the linear solves is 4e-16 to 5e-16 (SuperLU) and 4e-15 to 7e-15 (device).
+- Continuity steps, per solve (the continuity time over 2 solves per Gummel iteration): at 10 nm the device is slower
+  than SuperLU (6.3 and 5.9 ms against 3.9 and 3.8 ms: only 3350 silicon cells, and a device solve has a fixed cost
+  of some milliseconds for the host setup of the hierarchy, the transfers and the kernel launches); at 5 nm it is
+  faster (7.7 and 8.3 ms against 16.2 and 16.0 ms).
+- Whole bias step: at 10 nm Newton is the fastest at both biases (the Gummel rows are 1.1x to 4.1x slower). At 5 nm
+  and 0.6 V the device Gummel path is the fastest (1.64 s against 4.76 s for Newton: 2.9x); at 5 nm and 0.9 V (high
+  injection, 42 Gummel iterations, each with a nonlinear Poisson solve) Newton is the fastest (4.78 s against
+  18.34 s).
+- The device code on the GPU is 3.0x to 16.8x faster than the same code with JAX on the CPU (total times).
+
+Earlier version (v1: the Poisson step with the 1024-cell coarsest level of thermal-gpu, the continuity steps on the
+CPU; `benchmarks/2026-10-30/charge-dd.jsonl`):
 
 | Cells | Newton, 0 to 1.0 V (SuperLU, CPU) | Gummel at 0.6 V, GPU | Gummel at 0.6 V, CPU |
 |---|---|---|---|
 | 36 600 (10 nm) | 17.2 s | 2.6 s (14 iterations) | 3.9 s |
 | 146 400 (5 nm) | 96.3 s | 3.3 s | 6.6 s |
 
-- The Gummel current equals the Newton current to 9.5e-11 relative with the Poisson step on the GPU (10 and 5 nm),
-  and to 3.3e-10 (10 nm) and 5.6e-10 (5 nm) with it on the CPU.
-- With the Poisson step on the GPU, the whole Gummel solve (14 iterations: the CPU continuity steps and the JIT
-  compile of the first call included) is 1.5x (10 nm) and 2.0x (5 nm) faster than with it on the CPU.
-- The GPU path is not faster than Newton yet. One Newton continuation step on the CPU costs about 0.8 s at 10 nm
-  (17.2 s for 21 steps) and 4.6 s at 5 nm (96.3 s); one Gummel solve costs 2.6 s and 3.3 s. At 0.6 V Gummel
-  needs 14 iterations; at high injection it needs many more (linear convergence), so Newton stays the default.
-- A device solver for the continuity equations (BiCGSTAB) is the next step.
+In that version the Gummel current equalled the Newton current to 9.5e-11 relative with the Poisson step on the
+GPU (10 and 5 nm), and to 3.3e-10 (10 nm) and 5.6e-10 (5 nm) with it on the CPU.
 
 ## Known limits and next steps
 
@@ -308,9 +411,19 @@ Larger cases (`benchmarks/2026-10-30/charge-dd.jsonl`; the Gummel Poisson step o
   doping): 2.6 to 4.4 s per doping for 73k cells on the RX 7900 XT against 2.6 to 3.4 s on the Mac CPU, and 5.3 s
   against 8.6 s for 293k cells (`benchmarks/2026-10-30/charge-rc.jsonl`): no GPU gain at 73k cells.
 - No 3-D, no temperature dependence.
-- Drift-diffusion: the Newton method and the continuity steps of Gummel use a sparse direct LU on the CPU (v1);
-  only the Gummel Poisson step runs on the GPU. Next: a device BiCGSTAB with an incomplete-LU or multigrid
-  preconditioner for the nonsymmetric systems. Gummel needs many iterations at high injection; use Newton there.
+- Drift-diffusion solvers: the Gummel iteration can run fully on the device (`linear="device"`), but the Newton
+  method still uses SuperLU on the CPU. On the SOI rib (the bench above) Newton is the fastest path at 10 nm (0.76 s
+  against 0.93 s and 3.14 s for the device Gummel path at 0.6 and 0.9 V) and at 5 nm in high injection (4.78 s
+  against 20.67 s at 0.9 V); the device Gummel path is the fastest at 5 nm and 0.6 V (1.64 s against 4.76 s).
+  Gummel converges linearly (16 iterations at 0.6 V, 42 at 0.9 V) and stalls on long devices with large cells (the
+  1.6 mm long-base diode). The continuity systems of an SOI rib are small (the silicon only: 3350 cells at 10 nm,
+  13 400 at 5 nm): SuperLU solves them faster than the device at 10 nm, the device is faster at 5 nm.
+- The device continuity solver is tested from 1.0 V forward (PIN rib) to 25 V reverse (1-D junction, 1e18 cm^-3);
+  its limit is a psi span of 1200 V_T (31 V) in the semiconductor (float64 range of the Slotboom scaling). A solve
+  that does not converge, or a span above the limit, falls back to SuperLU for that step (`linear_fallbacks`).
+- Next: the coupled Newton step on the device (GMRES with a block preconditioner: the Poisson multigrid and the
+  Slotboom multigrid of `continuity.py`), and the setup of the hierarchies on the device (no host round trip per
+  solve).
 - Drift-diffusion physics: Boltzmann statistics, SRH with constant lifetimes and a midgap trap, the Masetti
   mobility constant in the field (no velocity saturation, no carrier-carrier scattering), no Auger recombination,
   no band-gap narrowing, no surface recombination at the oxide, 300 K only, ideal ohmic contacts, steady state only

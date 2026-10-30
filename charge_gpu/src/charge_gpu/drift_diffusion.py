@@ -30,16 +30,19 @@ Models:
   recombination), so the use cases give their lifetime. No Auger recombination, no band-gap narrowing, no
   Fermi-Dirac statistics (Boltzmann only), no surface recombination at the oxide.
 
-Solvers (state of v1):
+Solvers:
 - "newton": the coupled Newton method on (psi, n, p). The Jacobian is assembled on the host (scipy) and solved with
   the sparse direct LU of SuperLU, on the CPU. The columns of n and p are scaled with n and p (so the linear unknowns
   are the relative changes dn/n and dp/p), the rows are equilibrated. Damping: the step of psi is limited to
   10 V_T, a decrease of a carrier density is applied as n exp(dn/n) (it stays positive).
 - "gummel": the decoupled Gummel iteration. The Poisson step is the nonlinear Poisson equation of poisson.py with
   the quasi-Fermi levels of the last carriers per cell: symmetric positive definite, solved on the device (JAX) with
-  the multigrid-preconditioned CG of poisson.py. The continuity steps (nonsymmetric) are linear systems for n and
-  then for p, with the recombination linearized at the last carriers; sparse direct LU on the CPU. Robust at low
-  bias, slow at high injection (linear convergence).
+  multigrid-preconditioned CG. The continuity steps (nonsymmetric) are linear systems for n and then for p, with the
+  recombination linearized at the last carriers. Their linear solver is the option ``linear``: "superlu" (sparse
+  direct LU on the CPU, the reference) or "device" (continuity.py: the Slotboom form of the SG matrix, BiCGSTAB with
+  a multigrid preconditioner as one jitted loop on the JAX device, and a convergence flag from the componentwise
+  backward error of the true residual; a device solve that is not converged is replaced by SuperLU for that step
+  and counted in DDSolution.linear_fallbacks). Robust at low bias; linear convergence (more iterations than Newton).
 - sweep(): bias continuation from 0 V in steps of at most ``step``, with a halved step after a failed solve.
 
 SI units throughout (doping and carriers in m^-3, currents in A per m of device length along z).
@@ -48,6 +51,7 @@ SI units throughout (doping and carriers in m^-3, currents in A per m of device 
 from __future__ import annotations
 
 import dataclasses
+import time
 from dataclasses import dataclass, field
 
 import jax
@@ -340,8 +344,11 @@ def _continuity_matrix(m: _Mesh, psi, carrier: str, other, den, ns):
 
 def _poisson_qf(dev: Device, m: _Mesh, psi, phi_n, phi_p, tol, cg_tol, max_newton=100):
     """The Gummel Poisson step on the device: nonlinear Poisson with fixed quasi-Fermi levels per cell (poisson.py),
-    multigrid-preconditioned CG per Newton step, log damping."""
-    from thermal_gpu.multigrid import build_hierarchy
+    multigrid-preconditioned CG per Newton step, log damping. The hierarchy (rebuilt per Newton step: the Newton
+    term changes the diagonal) is that of continuity.hierarchy: the coarsening of thermal_gpu.multigrid down to 256
+    cells, so the dense coarsest inverse is cheap (the host cost of the 1024-cell pseudo-inverse of build_hierarchy
+    was most of the Gummel time)."""
+    from charge_gpu.continuity import hierarchy as build_hierarchy
 
     d = poisson.solver_device()
     put = lambda a: jax.device_put(jnp.asarray(a, jnp.float64), d)  # noqa: E731
@@ -361,27 +368,71 @@ def _poisson_qf(dev: Device, m: _Mesh, psi, phi_n, phi_p, tol, cg_tol, max_newto
     return np.asarray(x).ravel(), cg
 
 
-def _gummel(dev, m: _Mesh, psi, n, p, tau_n, tau_p, tol, max_iter):
+def _gummel(dev, m: _Mesh, psi, n, p, tau_n, tau_p, tol, max_iter, linear="superlu"):
+    """The Gummel iteration. linear: "superlu" (the continuity steps with the sparse direct LU on the CPU, the
+    reference) or "device" (continuity.Solver: BiCGSTAB with the Slotboom multigrid on the JAX device). A device solve
+    that is not converged (backward error above continuity.CHECK) or that cannot run (continuity.SpanError) is not
+    used: that step is solved with SuperLU and counted in stats["fallbacks"]. Returns psi, n, p, the iterations, the
+    convergence flag, the last metric and a dict of the linear-solve statistics (the backward error of the last
+    continuity steps, for both linear solvers)."""
+    from charge_gpu.continuity import CHECK
+
     ns, vt, ni = m.n_semi, m.vt, m.n_i
     phi_n, phi_p = np.zeros(m.n_cells), np.zeros(m.n_cells)
-    err, cg = np.inf, 0
+    err = np.inf
+    stats = {"cg": 0, "krylov": 0, "backward_error": 0.0, "linear_converged": True, "fallbacks": 0,
+             "t_poisson": 0.0, "t_continuity": 0.0}
+    dev_solver = None
+    if linear == "device":
+        from charge_gpu.continuity import Solver, SpanError
+
+        dev_solver = Solver(m)
+    tiny = 1e-300
+
+    def superlu(carrier, other, den):
+        mat, rhs = _continuity_matrix(m, psi_new, carrier, other, den, ns)
+        c = spl.spsolve(mat, rhs)
+        with np.errstate(invalid="ignore", divide="ignore"):
+            omega = float(np.max(np.abs(rhs - mat @ c) / (abs(mat) @ np.abs(c) + np.abs(rhs))))
+        return c, omega
+
+    def step(carrier, other, den, c_old):
+        res = None
+        if dev_solver is not None:
+            try:
+                res = dev_solver.solve(psi_new, carrier, other, den, c_old)
+                stats["krylov"] += res.iterations
+            except SpanError:
+                res = None
+        if res is not None and res.converged:
+            c, omega = res.c, res.backward_error
+        else:
+            if dev_solver is not None:
+                stats["fallbacks"] += 1
+            c, omega = superlu(carrier, other, den)
+        stats["backward_error"] = max(stats["backward_error"], omega)
+        return np.maximum(c, tiny), bool(omega <= CHECK)
+
     for it in range(1, max_iter + 1):
-        tiny = 1e-300
         phi_n[m.sflat] = psi[m.sflat] - vt * np.log(np.maximum(n, tiny) / ni)
         phi_p[m.sflat] = psi[m.sflat] + vt * np.log(np.maximum(p, tiny) / ni)
+        t0 = time.perf_counter()
         psi_new, k = _poisson_qf(dev, m, psi, phi_n, phi_p, tol=max(min(1e-3 * tol * vt, 1e-12), 1e-14), cg_tol=1e-12)
-        cg += k
+        t1 = time.perf_counter()
+        stats["cg"] += k
+        stats["backward_error"] = 0.0                       # the value of the last iteration
         den = tau_p * (n + ni) + tau_n * (p + ni)
-        mat, rhs = _continuity_matrix(m, psi_new, "n", p, den, ns)
-        n_new = np.maximum(spl.spsolve(mat, rhs), tiny)
+        n_new, ok_n = step("n", p, den, n)
         den = tau_p * (n_new + ni) + tau_n * (p + ni)
-        mat, rhs = _continuity_matrix(m, psi_new, "p", n_new, den, ns)
-        p_new = np.maximum(spl.spsolve(mat, rhs), tiny)
+        p_new, ok_p = step("p", n_new, den, p)
+        stats["linear_converged"] = ok_n and ok_p
+        stats["t_poisson"] += t1 - t0
+        stats["t_continuity"] += time.perf_counter() - t1
         err = _converged_metric(m, psi_new - psi, n_new / n - 1, p_new / p - 1, n_new, p_new)
         psi, n, p = psi_new, n_new, p_new
-        if err < tol:
-            return psi, n, p, it, True, err, cg
-    return psi, n, p, max_iter, False, err, cg
+        if err < tol and stats["linear_converged"]:
+            return psi, n, p, it, True, err, stats
+    return psi, n, p, max_iter, False, err, stats
 
 
 @dataclass
@@ -398,10 +449,17 @@ class DDSolution:
     converged: bool
     error: float             # the last convergence metric (relative update)
     method: str
-    device: str              # where the Poisson step ran (gummel); the Newton solve runs on the host CPU
+    device: str              # where the solves ran
     tau_n: float
     tau_p: float
     mesh: _Mesh = field(repr=False)
+    linear: str = "superlu"        # the linear solver of the continuity steps (gummel): "superlu" or "device"
+    krylov_iterations: int = 0     # BiCGSTAB iterations of all continuity steps (linear="device")
+    linear_error: float | None = None  # gummel: the largest componentwise backward error of the last continuity
+    #                                    steps (both linear solvers); newton: None (no continuity steps)
+    linear_converged: bool = True  # gummel: the last continuity steps have a backward error of at most 1e-11
+    linear_fallbacks: int = 0      # linear="device": continuity steps solved with SuperLU (device solve not converged)
+    timings: dict = field(default_factory=dict)   # gummel: the wall time (s) of the Poisson and continuity steps
 
     @property
     def bias(self) -> float:
@@ -446,16 +504,22 @@ class DDSolution:
 
 def solve(dev: Device, v_n: float, v_p: float, guess=None, method: str = "newton", tau_n: float = TAU_SI,
           tau_p: float = TAU_SI, mobility=None, tol: float = 1e-10, max_iter: int | None = None,
-          dpsi_max: float | None = None) -> DDSolution:
+          dpsi_max: float | None = None, linear: str = "superlu") -> DDSolution:
     """Drift-diffusion at one bias: the n contacts at v_n, the p contacts at v_p (forward bias: v_p > v_n). Each
     contact takes v_n when the net doping under it is positive, else v_p (as poisson.solve).
 
     guess: an earlier solution (DDSolution or poisson.Solution: psi, n, p). None: poisson.solve at this bias (the
-    constant quasi-Fermi solution). method: "newton" (coupled, CPU direct LU) or "gummel" (Poisson on the device,
-    continuity with CPU direct LU). mobility: (mu_n, mu_p) in m^2/(V s), per cell or scalar; None: Masetti.
-    tol: convergence on the relative update (psi / V_T, n / n, p / p)."""
+    constant quasi-Fermi solution). method: "newton" (coupled, CPU direct LU) or "gummel" (Poisson on the device;
+    continuity with the solver ``linear``). linear (gummel only): "superlu" (CPU direct LU, the reference) or
+    "device" (BiCGSTAB with the Slotboom multigrid on the JAX device, continuity.py). mobility: (mu_n, mu_p) in
+    m^2/(V s), per cell or scalar; None: Masetti. tol: convergence on the relative update (psi / V_T, n / n, p / p).
+    """
     if method not in ("newton", "gummel"):
         raise ValueError(f"method must be 'newton' or 'gummel', not {method!r}")
+    if linear not in ("superlu", "device"):
+        raise ValueError(f"linear must be 'superlu' or 'device', not {linear!r}")
+    if method == "newton" and linear != "superlu":
+        raise ValueError("method='newton' solves with SuperLU only: use method='gummel' for linear='device'")
     if guess is None:
         guess = poisson.solve(dev, v_n, v_p)
     m = _mesh(dev, v_n, v_p, mobility)
@@ -463,13 +527,15 @@ def solve(dev: Device, v_n: float, v_p: float, guess=None, method: str = "newton
     psi = np.asarray(guess.psi, float).ravel().copy()
     n = np.maximum(np.asarray(guess.n, float).ravel()[semi_flat], CARRIER_MIN)
     p = np.maximum(np.asarray(guess.p, float).ravel()[semi_flat], CARRIER_MIN)
+    stats = {"krylov": 0, "backward_error": None, "linear_converged": True, "fallbacks": 0}
     if method == "newton":
         psi, n, p, it, conv, err = _newton(m, psi, n, p, tau_n, tau_p, tol, max_iter or 60,
                                            dpsi_max or 10 * m.vt)
         where = "cpu (scipy SuperLU)"
     else:
-        psi, n, p, it, conv, err, _ = _gummel(dev, m, psi, n, p, tau_n, tau_p, tol, max_iter or 1000)
-        where = f"poisson: {poisson.solver_device()}; continuity: cpu (scipy SuperLU)"
+        psi, n, p, it, conv, err, stats = _gummel(dev, m, psi, n, p, tau_n, tau_p, tol, max_iter or 1000, linear)
+        cont = "cpu (scipy SuperLU)" if linear == "superlu" else f"{poisson.solver_device()} (BiCGSTAB, multigrid)"
+        where = f"poisson: {poisson.solver_device()}; continuity: {cont}"
     _, (_, _, _, jnc, jpc) = _fluxes(m, psi, n, p)
     currents = Q * np.bincount(m.cid, jnc + jpc, len(dev.contacts))
     nf, pf = np.zeros(m.n_cells), np.zeros(m.n_cells)
@@ -477,7 +543,10 @@ def solve(dev: Device, v_n: float, v_p: float, guess=None, method: str = "newton
     return DDSolution(psi=psi.reshape(m.shape), n=nf.reshape(m.shape), p=pf.reshape(m.shape), v_n=v_n, v_p=v_p,
                       contact_currents=currents, contact_kinds=m.kinds,
                       contact_sides=[c.side for c in dev.contacts], iterations=it, converged=conv, error=err,
-                      method=method, device=where, tau_n=tau_n, tau_p=tau_p, mesh=m)
+                      method=method, device=where, tau_n=tau_n, tau_p=tau_p, mesh=m, linear=linear,
+                      krylov_iterations=stats["krylov"], linear_error=stats["backward_error"],
+                      linear_converged=stats["linear_converged"], linear_fallbacks=stats["fallbacks"],
+                      timings={k[2:] + "_s": v for k, v in stats.items() if k.startswith("t_")})
 
 
 def sweep(dev: Device, biases, step: float = 0.05, min_step: float = 1e-3, method: str = "newton",

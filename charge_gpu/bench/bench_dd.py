@@ -3,14 +3,22 @@
 Cases:
 - diode: the 1-D long-base diode of the Shockley check (1e18 cm^-3, tau 100 us), Newton sweep 0 to 0.75 V.
 - pin-newton: the PIN rib of examples/pin_phase_shifter.py (tau 1 ns), Newton sweep 0 to 1.0 V (CPU direct LU).
-- pin-gummel: the same rib, Gummel at --gummel-bias from the Newton solution at the bias below (the Poisson step
-  runs on the JAX device: multigrid CG; the continuity steps on the CPU). This case shows the device part.
+  Skipped with --no-sweep.
+- At each bias of --biases, from the Newton solution 50 mV lower (the same start for all rows):
+  - pin-newton-step: one Newton solve (SuperLU on the CPU), the reference of the other rows;
+  - pin-gummel-superlu: Gummel, the Poisson step on the JAX device, the continuity steps with SuperLU on the CPU;
+  - pin-gummel-device: Gummel, the Poisson step and the continuity steps (BiCGSTAB, Slotboom multigrid) on the
+    JAX device (the GPU when there is one);
+  - pin-gummel-device-cpu: the same code with JAX on the CPU (CHARGE_GPU_DEVICE=cpu).
+  The Gummel rows give the wall time of a one-iteration warm-up (the JIT compile for this mesh) apart from the
+  timed solve, the times of the Poisson and continuity steps, and the differences to the Newton solution.
 
-    bash tools/gpu_run.sh charge_gpu python bench/bench_dd.py                             (diode and 10 nm)
-    bash tools/gpu_run.sh charge_gpu python bench/bench_dd.py --dx 10e-9 5e-9 --no-diode  (CHARGE_GPU_DEVICE=cpu: CPU)
+    bash tools/gpu_run.sh charge_gpu python bench/bench_dd.py                                   (diode and 10 nm)
+    bash tools/gpu_run.sh charge_gpu python bench/bench_dd.py --dx 10e-9 5e-9 --no-diode --no-sweep
 """
 import argparse
 import json
+import os
 import time
 
 import jax
@@ -22,6 +30,8 @@ from charge_gpu import drift_diffusion as dd  # noqa: E402
 from charge_gpu.injection import diode_1d, rib_index_change, rib_pin, shockley_j0  # noqa: E402
 from charge_gpu.poisson import solver_device, thermal_voltage  # noqa: E402
 from charge_gpu.rc import masetti_mobility  # noqa: E402
+
+TAU = 1e-9
 
 
 def diode_case():
@@ -39,40 +49,87 @@ def diode_case():
                                 for v, s in zip(biases, sols)]}
 
 
-def pin_cases(dx, gummel_bias):
+def _diff(sol, ref):
+    m = ref.mesh
+    n, p = sol.n.ravel()[m.sflat], sol.p.ravel()[m.sflat]
+    nr, pr = ref.n.ravel()[m.sflat], ref.p.ravel()[m.sflat]
+    kn, kp = nr > dd.CARRIER_FLOOR, pr > dd.CARRIER_FLOOR
+    return {"I_rel_vs_newton": float(sol.current / ref.current - 1),
+            "dpsi_V": float(np.max(np.abs(sol.psi - ref.psi))),
+            "dn_rel": float(np.max(np.abs(n[kn] / nr[kn] - 1))), "dp_rel": float(np.max(np.abs(p[kp] / pr[kp] - 1)))}
+
+
+def _gummel_row(dev, case, bias, start, ref, linear, cpu=False):
+    old = os.environ.get("CHARGE_GPU_DEVICE")
+    if cpu:
+        os.environ["CHARGE_GPU_DEVICE"] = "cpu"
+    try:
+        kw = dict(guess=start, method="gummel", linear=linear, tau_n=TAU, tau_p=TAU)
+        t0 = time.perf_counter()
+        dd.solve(dev, 0.0, bias, max_iter=1, **kw)                 # warm-up: the JIT compile of this mesh
+        t_warm = time.perf_counter() - t0
+        t0 = time.perf_counter()
+        g = dd.solve(dev, 0.0, bias, max_iter=4000, **kw)
+        t = time.perf_counter() - t0
+        where = str(solver_device())
+    finally:
+        if cpu:
+            if old is None:
+                os.environ.pop("CHARGE_GPU_DEVICE", None)
+            else:
+                os.environ["CHARGE_GPU_DEVICE"] = old
+    return {"case": case, "bias_V": bias, "method": "gummel", "linear": linear, "jax_device": where,
+            "time_s": round(t, 3), "warmup_1_iteration_s": round(t_warm, 3),
+            "poisson_s": round(g.timings["poisson_s"], 3), "continuity_s": round(g.timings["continuity_s"], 3),
+            "iterations": g.iterations, "krylov_iterations": g.krylov_iterations, "converged": g.converged,
+            "linear_converged": g.linear_converged, "linear_backward_error": g.linear_error,
+            "linear_fallbacks": g.linear_fallbacks, **_diff(g, ref)}
+
+
+def pin_cases(dx, biases, sweep=True, cpu=True):
     dev = rib_pin(dx=dx)
-    biases = [0.8, 0.9, 1.0]
-    t0 = time.perf_counter()
-    sols = dd.sweep(dev, [0.0] + biases, tau_n=1e-9, tau_p=1e-9)
-    t = time.perf_counter() - t0
-    r = [rib_index_change(dev, s, sols[0]) for s in sols[1:]]
-    yield {"case": "pin-newton", "dx_nm": dx * 1e9, "cells": int(dev.n_net.size),
-           "unknowns": int(dev.n_net.size + 2 * dev.semiconductor.sum()), "method": "newton",
-           "device": sols[-1].device, "time_s": round(t, 3),
-           "newton_last": sols[-1].iterations, "converged": all(s.converged for s in sols),
-           "I_mA_per_mm": [round(s.current, 6) for s in sols[1:]],
-           "n_rib_cm3": [float(f"{x['n_mean'] * 1e-6:.5g}") for x in r]}
-    start = dd.sweep(dev, [gummel_bias - 0.05], tau_n=1e-9, tau_p=1e-9)[0]
-    ref = dd.solve(dev, 0.0, gummel_bias, guess=start, tau_n=1e-9, tau_p=1e-9)
-    t0 = time.perf_counter()
-    g = dd.solve(dev, 0.0, gummel_bias, guess=start, method="gummel", tau_n=1e-9, tau_p=1e-9, tol=1e-8,
-                 max_iter=3000)
-    yield {"case": "pin-gummel", "dx_nm": dx * 1e9, "cells": int(dev.n_net.size), "method": "gummel",
-           "device": str(solver_device()), "bias_V": gummel_bias, "time_s": round(time.perf_counter() - t0, 3),
-           "iterations": g.iterations, "converged": g.converged,
-           "I_rel_vs_newton": float(g.current / ref.current - 1)}
+    common = {"dx_nm": dx * 1e9, "cells": int(dev.n_net.size), "semiconductor_cells": int(dev.semiconductor.sum())}
+    if sweep:
+        vs = [0.8, 0.9, 1.0]
+        t0 = time.perf_counter()
+        sols = dd.sweep(dev, [0.0] + vs, tau_n=TAU, tau_p=TAU)
+        t = time.perf_counter() - t0
+        r = [rib_index_change(dev, s, sols[0]) for s in sols[1:]]
+        yield {"case": "pin-newton", **common, "unknowns": int(dev.n_net.size + 2 * dev.semiconductor.sum()),
+               "method": "newton", "device": sols[-1].device, "time_s": round(t, 3),
+               "newton_last": sols[-1].iterations, "converged": all(s.converged for s in sols),
+               "I_mA_per_mm": [round(s.current, 6) for s in sols[1:]],
+               "n_rib_cm3": [float(f"{x['n_mean'] * 1e-6:.5g}") for x in r]}
+    for bias in biases:
+        start = dd.sweep(dev, [round(bias - 0.05, 6)], tau_n=TAU, tau_p=TAU)[0]
+        t0 = time.perf_counter()
+        ref = dd.solve(dev, 0.0, bias, guess=start, tau_n=TAU, tau_p=TAU)
+        yield {"case": "pin-newton-step", **common, "bias_V": bias, "method": "newton", "linear": "superlu",
+               "time_s": round(time.perf_counter() - t0, 3), "iterations": ref.iterations,
+               "converged": ref.converged, "I_mA_per_mm": round(ref.current, 6)}
+        rows = [("pin-gummel-superlu", "superlu", False), ("pin-gummel-device", "device", False)]
+        if cpu:
+            rows.append(("pin-gummel-device-cpu", "device", True))
+        for case, linear, on_cpu in rows:
+            row = _gummel_row(dev, case, bias, start, ref, linear, on_cpu)
+            row.update(common)
+            yield row
 
 
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--dx", type=float, nargs="+", default=[10e-9])
-    ap.add_argument("--gummel-bias", type=float, default=0.6)
+    ap.add_argument("--biases", type=float, nargs="+", default=[0.6, 0.9])
     ap.add_argument("--no-diode", action="store_true")
+    ap.add_argument("--no-sweep", action="store_true", help="skip the Newton sweep 0 to 1.0 V")
+    ap.add_argument("--no-cpu", action="store_true", help="skip the device path with JAX on the CPU")
     a = ap.parse_args()
+    print(json.dumps({"case": "env", "jax_default_device": str(solver_device()), "cpu_count": os.cpu_count(),
+                      "jax": jax.__version__}), flush=True)
     if not a.no_diode:
         print(json.dumps(diode_case()), flush=True)
     for dx in a.dx:
-        for row in pin_cases(dx, a.gummel_bias):
+        for row in pin_cases(dx, a.biases, sweep=not a.no_sweep, cpu=not a.no_cpu):
             print(json.dumps(row), flush=True)
 
 
