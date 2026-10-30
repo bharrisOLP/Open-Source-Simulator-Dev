@@ -23,8 +23,28 @@ mixed-precision eigenpair refinement (the FP64 polish is slow on RDNA3); bends a
   for ROCm (hipRTC compiles RawKernel source) and the AMD backend of Triton. About 250k lines of Python with tests.
 - gpmeep: a fork of the Meep C++ core (1.35.0-beta) with about 19k lines of CUDA and C++. Route to AMD: HIPify.
 - fdtdx (MIT, JAX): already runs on this card. A Meep-compatible front end on it is the third route.
-- First step: a probe on the GPU computer. Do CuPy for ROCm and Triton for AMD work on gfx1100 with the ROCm pip
-  wheels?
+- Probe result (2026-10-30, `tools/probe_cupy_triton.sh`, `tools/probe/`): YES. PyTorch 2.14.1 for ROCm 7.2 runs
+  on gfx1100; Triton 3.8.0 (AMD) runs a kernel; CuPy 14.2 (cupy-rocm-7-0) compiles and runs a RawKernel, with
+  versioned links to the HIP libraries of the PyTorch wheel and hipcc from the ROCm 10.1 pip SDK.
+- **Blocked, waits for the user:** the next step clones the Erised add-on from GitHub and runs it on the GPU
+  computer (`tools/env/fdtd_gpu.sh`). The auto-mode classifier blocked that ("Code from External"). See
+  "Decisions for the user". Until then the work continues with item 3.
+
+**3. bands-gpu (the method of MPB): version 0.1 works.** Folder: `bands_gpu/` (`bands_gpu/README.md`).
+- Plane-wave operator with FFTs, anisotropic subpixel averaging, block LOBPCG (stabilized), warm start on the k
+  path, TE/TM for 2-D cells.
+- Checks: exact homogeneous and 1-D Bragg bands; the rod-lattice TM gap agrees with an independent
+  finite-difference solver to 2e-4 (both are 0.7 % below the resolution-32 numbers of the MPB tutorial).
+- Next: GPU timings (running), oblique lattices, find_k for waveguide modes, a comparison with MPB itself.
+
+**4. thermal-gpu: version 0.1 works.** Folder: `thermal_gpu/` (`thermal_gpu/README.md`).
+- Cell-centered finite volumes (series face conductance), Jacobi CG as one device loop, steady and implicit
+  transient solves.
+- Checks: exact parabola, exact two-layer series resistance, sparse direct solve (1e-7 of the rise), slab decay
+  time constant (1 %).
+- Example `examples/thermo_optic_phase_shifter.py`: thermal-gpu + meow-gpu give P_pi = 19.0 mW for a synthetic SOI
+  heater (published devices of this type: typically 20 to 30 mW).
+- Next: multigrid preconditioner; 3-D; GPU timings.
 
 ## Queue (in order of work)
 
@@ -33,9 +53,9 @@ The user asked to start with Meep and meow. After those two, the order is by com
 | # | Tool | Open-source base | GPU path on AMD | Complexity | Notes |
 |---|---|---|---|---|---|
 | 1 | meow (EME) | meow (Apache-2) + own FDE solver | JAX on ROCm | medium | v0.1 done; improvements open |
-| 2 | Meep (FDTD) | Meep (GPL-2); GPU forks: Erised add-on (Triton/CUDA), gpmeep (CUDA C++) | CuPy-ROCm + Triton-AMD, HIP, or fdtdx | very high | **next** |
-| 3 | MPB (band and mode solver) | MPB (GPL-2) | plane-wave basis: FFT + block eigensolver in JAX | medium-high | Reuses the eigensolver of item 1 |
-| 4 | Thermal | femwell / scikit-fem; torch-fem; jax-fem | FEM with CG + AMG/FFT preconditioner on GPU | medium | Heater cross-sections, 3D transients |
+| 2 | Meep (FDTD) | Meep (GPL-2); GPU forks: Erised add-on (Triton/CUDA), gpmeep (CUDA C++) | CuPy-ROCm + Triton-AMD, HIP, or fdtdx | very high | probe passed; **waits for the user** (third-party code) |
+| 3 | MPB (band and mode solver) | MPB (GPL-2) | plane-wave basis: FFT + block eigensolver in JAX | medium-high | v0.1 done (own code: `bands_gpu/`) |
+| 4 | Thermal | own finite-volume solver (femwell / scikit-fem as references) | CG on GPU (JAX) | medium | v0.1 done (`thermal_gpu/`) |
 | 5 | ZEMAX (ray + physical optics) | Optiland (MIT, PyTorch); prysm; dLux (JAX) | PyTorch / JAX on ROCm | medium | No open tool replaces Zemax POP; POP is FFT work |
 | 6 | Charge (drift-diffusion) | DEVSIM (Apache-2) | GPU sparse solver through the DEVSIM solver callback | high | FP64 and sparse LU: a poor fit for an RDNA3 card |
 | 7 | Tidy3D-like suite | fdtdx (MIT, JAX, ROCm) + items 1, 3, 4, 6 | JAX on ROCm | very high | One API over FDTD, mode, EME, heat and charge |
@@ -47,6 +67,11 @@ The user asked to start with Meep and meow. After those two, the order is by com
 These do not block the work. The agent continues with the default in brackets.
 
 - License of the new code in this public repository. [No LICENSE file yet. Upstream licenses stay with their code.]
+- **Meep on AMD (item 2): may the agent clone the third-party GitHub repository Erised-AI-Inc/meep-gpu
+  (GPL-2.0-or-later) at commit 8993426, install it and run it on the GPU computer?** The auto-mode classifier
+  blocked this. To approve: say so in the session, or allow `bash tools/remote.sh setup-env` with
+  `tools/env/fdtd_gpu.sh`. [Waiting. Item 3 continues meanwhile. Other routes: HIPify the gpmeep C++ fork, or a
+  front end on fdtdx (PyPI).]
 
 ## Log
 
