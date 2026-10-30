@@ -20,8 +20,8 @@ uv pip install --quiet --python "$PY" --index-url "$AMD_INDEX" \
   "jax_rocm10_plugin==$JAX_VERSION+rocm$ROCM_VERSION" "jax_rocm10_pjrt==$JAX_VERSION+rocm$ROCM_VERSION"
 # The jax pins stay in each install, so that the resolver keeps the version that AMD validated for gfx1100.
 uv pip install --quiet --python "$PY" "jax==$JAX_VERSION" "jaxlib==$JAX_VERSION" \
-  "meow-sim==0.15.0" tidy3d pytest
-uv pip install --quiet --python "$PY" --no-deps -e ./meow_gpu -e ./bands_gpu -e ./thermal_gpu -e ./charge_gpu
+  "meow-sim==0.15.0" tidy3d pytest "fdtdx==0.6.3"
+uv pip install --quiet --python "$PY" --no-deps -e ./meow_gpu -e ./bands_gpu -e ./thermal_gpu -e ./charge_gpu -e ./suite
 mkdir -p .local
 uv pip freeze --python "$PY" > .local/env-rocm-freeze.txt
 

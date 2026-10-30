@@ -50,6 +50,33 @@ class Rect:
 
 
 @dataclass(frozen=True)
+class Polygon:
+    """A polygon (vertices (x, y) in um, in order) of one material, for example a rib with sloped sidewalls.
+
+    The same edge rule as Rect: a sample is tested at (X + EDGE_TOL, Y + EDGE_TOL), strictly inside. So a sample on
+    a horizontal or vertical edge is inside on the left or bottom side and outside on the right or top side, whatever
+    the rounding of the grid; an axis-aligned polygon samples exactly like the Rect of the same corners."""
+
+    vertices: tuple
+    material: Material
+    doping: float = 0.0
+    tag: str = ""
+
+    def __post_init__(self):
+        import shapely
+        verts = tuple((float(x), float(y)) for x, y in self.vertices)      # hashable, also from a list or an array
+        object.__setattr__(self, "vertices", verts)
+        poly = shapely.Polygon(verts) if len(verts) >= 3 else None
+        if poly is None or not poly.is_valid or poly.area == 0:
+            why = shapely.is_valid_reason(poly) if poly is not None else "fewer than 3 vertices"
+            raise ValueError(f"Polygon: not a valid simple polygon ({why})")
+
+    def contains(self, X, Y):
+        import shapely
+        return shapely.contains_xy(shapely.Polygon(self.vertices), np.asarray(X) + EDGE_TOL, np.asarray(Y) + EDGE_TOL)
+
+
+@dataclass(frozen=True)
 class CrossSection:
     background: Material
     shapes: tuple = field(default_factory=tuple)

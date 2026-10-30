@@ -53,7 +53,8 @@ and the preconditioner setup (first call: about 1 to 5 s more); the tidy3d time 
 **EME of a taper** (`bench/bench_eme_taper.py`: Si strip 0.5 -> 2.0 um over 10 um, 30 cells, 10 modes,
 20 nm grid, 36k unknowns per cell). The times include the compile, the setup and meow's post-processing of all
 cells. The 8-process tidy3d run scales only 1.55x over 1 process (process start and imports included), so the
-fairer CPU baseline is between the two rows:
+fairer CPU baseline is between the two rows. These runs used meow's own post-processing on both sides (before the
+neff correction below), so the |S21| values compare the two mode solvers, not the physics:
 
 | Mode solver | Mode solves | \|S21\| (fundamental) |
 |---|---|---|
@@ -67,6 +68,19 @@ discretization error of a 20 nm grid (neff changes by about 4e-3 between a 20 nm
 fields are less accurate than neff in single precision (field errors up to about 7e-4 at a 10 nm grid, found by
 the review): use `mixed` when field accuracy matters. On fine grids the complex64 floor rises as 1/dx^2; the
 tolerance is capped at 1e-3 with a warning.
+
+## Correction of meow's post-processing (each mode keeps its neff)
+
+In meow 0.15, `Mode.__add__` averages the neff of the two modes, and the Gram-Schmidt step of
+`post_process_modes` uses it. So after meow's post-processing, every mode after the first has an average of the
+neff of the earlier modes (a 0.525 um strip, the first cell of the taper: TM0 2.137 instead of 1.794). The EME then propagates the higher modes
+almost in phase with the fundamental mode, and the mode conversion of a taper adds up coherently.
+`compute_modes_gpu` therefore uses `meow_gpu.meow_backend.post_process_modes`: the same filter, normalization and
+Gram-Schmidt, but each mode keeps its own neff (test `test_post_processing_keeps_the_neff_of_each_mode`; details in
+`docs/upstream-issues.md`). For the taper above (mixed precision, 10 modes): |S21|^2 = 0.987 / 0.990 at 30 / 60
+cells instead of 0.952 / 0.955, and the 3-D FDTD of the same taper gives 0.9945 on a 20 nm grid
+(`suite/README.md`).
+`bench_eme_taper.py --post-process meow` gives the old numbers.
 
 ## Known limits and next steps
 

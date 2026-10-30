@@ -8,6 +8,6 @@ import jax
 
 jax.config.update("jax_enable_x64", True)
 
-from photonsuite.geometry import CrossSection, Material, Rect  # noqa: E402
+from photonsuite.geometry import CrossSection, Material, Polygon, Rect  # noqa: E402
 
-__all__ = ["CrossSection", "Material", "Rect"]
+__all__ = ["CrossSection", "Material", "Polygon", "Rect"]

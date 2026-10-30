@@ -1,8 +1,17 @@
 """A drop-in FDE backend for meow: ``compute_modes_gpu(cs, num_modes)`` returns ``meow.Modes``.
 
 It solves the same discrete eigenproblem as ``meow.compute_modes_tidy3d`` (the tidy3d local mode solver), with the
-GPU Davidson solver of ``meow_gpu.fde``, and then applies the same meow post-processing (filters and
-orthonormalization). The rest of meow (overlaps, S-matrices, SAX cascade) works without a change.
+GPU Davidson solver of ``meow_gpu.fde``, and then applies meow's post-processing (filters and orthonormalization),
+with one correction: each mode keeps its own neff (``post_process_modes``, below). The rest of meow (overlaps,
+S-matrices, SAX cascade) works without a change.
+
+The neff correction: in meow 0.15, ``Mode.__add__`` returns neff = (a.neff + b.neff) / 2, and the Gram-Schmidt step
+of ``meow.fde.post_process.orthonormalize_modes`` computes ``current - c * b``. So every mode after the first gets an
+average of the neff of the earlier modes, even when c is about 0 (for a 0.525 um Si strip, the first cell of the
+taper of bench/bench_eme_taper.py, TM0 becomes 2.137 instead of 1.794). The EME then propagates the higher modes almost
+in phase with the fundamental mode, and the mode conversion of a taper adds up coherently (a 10 um taper: |S21|^2
+0.955; corrected 0.991; 3-D FDTD 0.9945). ``meow.compute_modes_tidy3d`` has the same error; the tidy3d fallback of
+``compute_modes_gpu`` (bends, angled propagation) uses the corrected post-processing too.
 
 Warm start: ``GPUModeSolver`` keeps the eigenvectors of its last solve for each grid shape. The next solve on the
 same grid (the next cell of a taper, the next wavelength) starts from them. Call ``reset()`` for a new device.
@@ -31,6 +40,28 @@ TOL_POWER_FLOW = 1e2 * float(np.finfo(np.float32).eps) / 10   # = tidy3d TOL_POW
 SINGLE_FLOOR = 1e-3
 SINGLE_TOL_CAP = 1e-3   # the adaptive single-precision tolerance never goes above this (warning when capped)   # complex64: a stall below this residual is convergence to working precision
 FLOOR_FACTOR = 10.0   # single precision: tol >= FLOOR_FACTOR * eps32 * |A| / |theta|
+
+
+def post_process_modes(modes, inner_product: Callable | None = None, gm_tolerance: float = 0.01):
+    """meow's default post-processing (filter PML and lossy modes, normalize, Gram-Schmidt with a drop tolerance),
+    but each kept mode keeps the neff of the eigenmode that it comes from (see the module docstring)."""
+    import meow as mw
+    from meow.fde.post_process import filter_modes, normalize_modes
+    from meow.mode import inner_product as default_inner_product
+
+    ip = inner_product or default_inner_product
+    basis = []
+    for mode in normalize_modes(filter_modes(modes), ip):
+        current = mode
+        for b in basis:
+            current = current - (ip(b, current) / ip(b, b)) * b
+        norm_sq = ip(current, current)
+        if abs(norm_sq) < gm_tolerance:
+            continue
+        current = current / np.sqrt(norm_sq)
+        basis.append(mw.Mode(neff=mode.neff, cs=current.cs, Ex=current.Ex, Ey=current.Ey, Ez=current.Ez,
+                             Hx=current.Hx, Hy=current.Hy, Hz=current.Hz))
+    return basis
 
 
 @dataclass
@@ -134,13 +165,12 @@ def compute_modes_gpu(cs, num_modes: int = 10, target_neff: float | None = None,
                       solver: GPUModeSolver | None = None, post_process: Callable | None = None):
     """``meow.Modes`` of a ``meow.CrossSection`` from the GPU solver (the signature of meow.compute_modes)."""
     import meow as mw
-    from meow.fde.post_process import post_process_modes
 
     post_process = post_process or post_process_modes
     why = _supported(cs)
     if why:
         warnings.warn(f"meow_gpu: {why} is not supported yet; using the tidy3d CPU solver", stacklevel=2)
-        return mw.compute_modes_tidy3d(cs, num_modes=num_modes, target_neff=target_neff)
+        return mw.compute_modes_tidy3d(cs, num_modes=num_modes, target_neff=target_neff, post_process=post_process)
     solver = solver or _DEFAULT
     problem = make_problem(cs.nx**2, cs.ny**2, cs.nz**2, cs.mesh.x, cs.mesh.y, cs.env.wl,
                            num_pml=tuple(cs.mesh.num_pml))

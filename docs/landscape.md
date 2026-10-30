@@ -85,6 +85,9 @@ AMD Radeon RX 7900 XT (gfx1100, RDNA3, 20 GB). FP64 runs at 1/32 of the FP32 rat
 
 ## Not verified
 
-- ROCm behaviour of Optiland, torcwa, flaport/fdtd, jax-fem, torch-fem and fdtdx on gfx1100.
+- ROCm behaviour of Optiland, torcwa, flaport/fdtd, jax-fem and torch-fem on gfx1100. (fdtdx 0.6.3 with JAX 0.11.1
+  runs on gfx1100 in this repository: a 3.3 M-cell straight guide in 10.7 s; with 9943 time steps (computed from the simulated time and the Courant
+  step), about
+  3e9 cell updates per second; `suite/bench/fdtd_straight.py`, `benchmarks/2026-10-30/fdtd.jsonl`.)
 - Complex non-symmetric `eig` on the GPU under PyTorch or JAX on ROCm.
 - GPU support in Charon, Elmer, LightPipes and diffractio.

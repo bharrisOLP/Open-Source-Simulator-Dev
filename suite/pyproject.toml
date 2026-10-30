@@ -3,7 +3,7 @@ name = "photonsuite"
 version = "0.1.0"
 description = "One device description for the GPU solvers of this repository: modes, heat, carriers (multiphysics)"
 requires-python = ">=3.12,<3.13"
-dependencies = ["numpy", "scipy", "jax>=0.11", "meow-gpu", "thermal-gpu", "charge-gpu"]
+dependencies = ["numpy", "scipy", "shapely>=2", "jax>=0.11", "meow-gpu", "thermal-gpu", "charge-gpu"]
 
 [dependency-groups]
 dev = ["pytest>=8"]

@@ -6,6 +6,9 @@
 Synthetic structure (textbook indices): Si core 220 nm thick, width 0.5 -> 2.0 um over 10 um, SiO2 cladding,
 wavelength 1.55 um. Prints one JSON line: the mode-solve time, the S-matrix time, |S| of the fundamental mode
 from the left port to the right port, and the neff of the first and the last cell.
+
+--post-process meow_gpu (default) keeps the neff of each mode; --post-process meow uses meow's own post-processing,
+which averages the neff of the higher modes (meow 0.15; see meow_gpu/meow_backend.py), for a comparison.
 """
 from __future__ import annotations
 
@@ -34,11 +37,19 @@ def build(n_cells: int, dx: float, w0: float = 0.5, w1: float = 2.0, length: flo
     return cells, [mw.CrossSection.from_cell(cell=c, env=env) for c in cells]
 
 
+def _post_process(name: str):
+    if name == "meow":
+        from meow.fde.post_process import post_process_modes
+    else:
+        from meow_gpu.meow_backend import post_process_modes
+    return post_process_modes
+
+
 def _tidy3d_one(args):
-    n_cells, dx, i, num_modes = args
+    n_cells, dx, i, num_modes, pp = args
     import meow as mw
     _, css = build(n_cells, dx)
-    return mw.compute_modes_tidy3d(css[i], num_modes=num_modes)
+    return mw.compute_modes_tidy3d(css[i], num_modes=num_modes, post_process=_post_process(pp))
 
 
 def main():
@@ -51,13 +62,16 @@ def main():
     ap.add_argument("--dx", type=float, default=0.02)
     ap.add_argument("--tol", type=float, default=None)
     ap.add_argument("--extra", type=int, default=8)
+    ap.add_argument("--post-process", choices=["meow_gpu", "meow"], default="meow_gpu")
     a = ap.parse_args()
+    pp = _post_process(a.post_process)
 
     import jax
     import meow as mw
     cells, css = build(a.cells, a.dx)
     row = {"backend": a.backend, "precision": a.precision if a.backend == "gpu" else "double", "procs": a.procs,
-           "tol": a.tol, "extra": a.extra, "cells": a.cells, "modes": a.modes, "grid": list(css[0].nx.shape), "device": str(jax.devices()[0])}
+           "tol": a.tol, "extra": a.extra, "cells": a.cells, "modes": a.modes, "grid": list(css[0].nx.shape), "device": str(jax.devices()[0]),
+           "post_process": a.post_process}
     t0 = time.perf_counter()
     if a.backend == "gpu":
         jax.config.update("jax_enable_x64", True)
@@ -65,18 +79,18 @@ def main():
         solver = GPUModeSolver(precision=a.precision, tol=a.tol, extra=a.extra)
         modes, its = [], []
         for cs in css:
-            modes.append(compute_modes_gpu(cs, num_modes=a.modes, solver=solver))
+            modes.append(compute_modes_gpu(cs, num_modes=a.modes, solver=solver, post_process=pp))
             its.append(solver.last_info.iterations)
         row["iterations"] = its
         row["mean_iterations"] = float(np.mean(its[1:]))
         from meow_gpu.meow_backend import device_summary
         row["solver_device"] = device_summary()
     elif a.procs == 1:
-        modes = [mw.compute_modes_tidy3d(cs, num_modes=a.modes) for cs in css]
+        modes = [mw.compute_modes_tidy3d(cs, num_modes=a.modes, post_process=pp) for cs in css]
     else:
         import multiprocessing as mp
         with ProcessPoolExecutor(a.procs, mp_context=mp.get_context("spawn")) as ex:
-            modes = list(ex.map(_tidy3d_one, [(a.cells, a.dx, i, a.modes) for i in range(len(css))]))
+            modes = list(ex.map(_tidy3d_one, [(a.cells, a.dx, i, a.modes, a.post_process) for i in range(len(css))]))
     row["modes_s"] = time.perf_counter() - t0
     t0 = time.perf_counter()
     with jax.default_device(jax.devices("cpu")[0]):
@@ -85,6 +99,9 @@ def main():
     S = np.asarray(S)
     row["S21_00"] = float(abs(S[port_map["left@0"], port_map["right@0"]]))
     row["S11_00"] = float(abs(S[port_map["left@0"], port_map["left@0"]]))
+    # power of the fundamental input mode into all kept modes of each side (|S|^2 sums; 1 = no loss in the EME)
+    row["P_right"] = float(sum(abs(S[port_map["left@0"], port_map[k]]) ** 2 for k in port_map if k.startswith("right")))
+    row["P_left"] = float(sum(abs(S[port_map["left@0"], port_map[k]]) ** 2 for k in port_map if k.startswith("left")))
     row["neff_first"] = [round(float(np.real(m.neff)), 8) for m in modes[0][:4]]
     row["neff_last"] = [round(float(np.real(m.neff)), 8) for m in modes[-1][:4]]
     row["n_modes_kept"] = [len(m) for m in modes]

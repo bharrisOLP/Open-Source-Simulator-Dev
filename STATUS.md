@@ -14,6 +14,9 @@ Done:
   than tidy3d on one core; EME taper (30 cells) 3.3x faster than one core and 2.1x faster than 8 processes,
   |dS21| about 2e-5.
 
+- Correction of meow's post-processing: each mode keeps its own neff (meow 0.15 averages them in Gram-Schmidt;
+  this changed the EME of a taper from 0.955 to 0.991, see item 7).
+
 Open (later, in this order): batched Davidson over several cells (small sections are overhead-bound);
 mixed-precision eigenpair refinement (the FP64 polish is slow on RDNA3); bends and angled propagation.
 
@@ -78,7 +81,15 @@ CG iterations per bias point instead of 11k to 36k; 2.1 s instead of 17.7 s on t
 - `CrossSection` of rectangles with multiphysics materials; `mode_index`, `temperature`, `carriers`,
   `phase_shifter_ppi`, `modulator_vpil`; reproduces both examples within 1e-3. Every solve is checked (a solve
   that does not converge raises `ConvergenceError`); the import enables float64.
-- Next: polygons and layer stacks, EME (meow-gpu) and FDTD (fdtdx) for 3-D devices.
+- `Polygon` shapes. 3-D FDTD adapter on fdtdx (`suite/src/photonsuite/fdtd.py`) and EME adapter on meow +
+  meow-gpu (`suite/src/photonsuite/eme.py`), on the same segment description. FDTD straight strip: T = 0.9999995
+  in 10.7 s on the GPU.
+- **Finding (resolved): EME against FDTD on a 10 um Si taper (0.5 -> 2.0 um).** meow EME gave T00 = 0.955 and the
+  calibrated FDTD 0.997. Cause: meow 0.15 averages the neff of the higher modes in its Gram-Schmidt step
+  (`docs/upstream-issues.md`). With the correction in meow-gpu: EME 0.9867 / 0.9900 / 0.9912 at 30 / 60 / 120
+  cells; FDTD 0.9945 at 20 nm (0.997 to 0.998 at 25 nm, where its flux transmission is 1.0014). Agreement within
+  about 0.5 %. Also found: meow drops polygon prisms along z (corrected in the EME adapter).
+- Next: layer stacks from a GDS cross-section; Polygon in the FDTD adapter.
 
 ## Queue (in order of work)
 
@@ -92,7 +103,7 @@ The user asked to start with Meep and meow. After those two, the order is by com
 | 4 | Thermal | own finite-volume solver (femwell / scikit-fem as references) | CG on GPU (JAX) | medium | v0.1 done (`thermal_gpu/`) |
 | 5 | ZEMAX (ray + physical optics) | Optiland (MIT, PyTorch) + own physical optics | PyTorch on ROCm | medium | v0.1 done (`optics_gpu/`) |
 | 6 | Charge | own nonlinear Poisson (reverse bias); DEVSIM (Apache-2) for full drift-diffusion | CG on GPU (JAX) | high | v0.1 done for reverse bias (`charge_gpu/`) |
-| 7 | Tidy3D-like suite | items 1, 3, 4, 6 (+ fdtdx later) | JAX on ROCm | very high | v0.1 done for cross-sections (`suite/`); FDTD next |
+| 7 | Tidy3D-like suite | items 1, 3, 4, 6 + fdtdx | JAX on ROCm | very high | v0.1 for cross-sections; 3-D FDTD (fdtdx) and EME adapters (`suite/`) |
 
 "EME" and "FDTD" in the request of the user are items 1 and 2.
 
@@ -115,3 +126,5 @@ These do not block the work. The agent continues with the default in brackets.
   permission dialogs (the hook denies instead).
 - 2026-10-30: bands-gpu, thermal-gpu 0.1; then optics-gpu, charge-gpu 0.1 and the three examples.
 - 2026-10-30: shared multigrid (thermal, charge), photonsuite 0.1, benchmark logs (`benchmarks/2026-10-30/`).
+- 2026-10-30: FDTD (fdtdx) and EME adapters in photonsuite; two meow 0.15 errors found and corrected
+  (`docs/upstream-issues.md`).

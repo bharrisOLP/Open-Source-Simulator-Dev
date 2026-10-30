@@ -1,19 +1,22 @@
 """compute_modes_gpu gives the meow modes of compute_modes_tidy3d: the same neff and (after meow's own
-normalization and phase) the same fields."""
+normalization and phase) the same fields. Both use the post-processing of meow_gpu, which keeps the neff of each
+mode (meow 0.15 averages them in its Gram-Schmidt step)."""
 import meow as mw
 import numpy as np
 import pytest
 
-from meow_gpu.meow_backend import GPUModeSolver, compute_modes_gpu
+from meow_gpu.meow_backend import GPUModeSolver, compute_modes_gpu, post_process_modes
 
 
-def strip_cross_section(width=0.5, wl=1.55, dx=0.04):
+def strip_cross_section(width=0.5, wl=1.55, dx=0.04, bend_radius=None, num_pml=(0, 0)):
     oxide = mw.IndexMaterial(name="sio2", n=1.444)
     si = mw.IndexMaterial(name="si", n=3.476)
     clad = mw.Structure(material=oxide, geometry=mw.Box(x_min=-2, x_max=2, y_min=-2, y_max=2, z_min=-1, z_max=2))
     core = mw.Structure(material=si, mesh_order=1,
                         geometry=mw.Box(x_min=-width / 2, x_max=width / 2, y_min=0, y_max=0.22, z_min=-1, z_max=2))
-    mesh = mw.Mesh2D(x=np.arange(-1.2, 1.2 + dx / 2, dx), y=np.arange(-0.7, 0.92 + dx / 2, dx))
+    extra = {} if bend_radius is None else {"bend_radius": bend_radius}
+    mesh = mw.Mesh2D(x=np.arange(-1.2, 1.2 + dx / 2, dx), y=np.arange(-0.7, 0.92 + dx / 2, dx), num_pml=num_pml,
+                     **extra)
     cell = mw.Cell(structures=[clad, core], mesh=mesh, z_min=0.0, z_max=1.0)
     return mw.CrossSection.from_cell(cell=cell, env=mw.Environment(wl=wl, T=25.0))
 
@@ -21,7 +24,7 @@ def strip_cross_section(width=0.5, wl=1.55, dx=0.04):
 @pytest.mark.parametrize("precision,tol", [("mixed", 1e-8), ("single", 2e-5)])
 def test_modes_match_tidy3d(precision, tol):
     cs = strip_cross_section()
-    ref = mw.compute_modes_tidy3d(cs, num_modes=4)
+    ref = mw.compute_modes_tidy3d(cs, num_modes=4, post_process=post_process_modes)
     got = compute_modes_gpu(cs, num_modes=4, solver=GPUModeSolver(precision=precision, extra=4))
     assert len(got) == len(ref)
     for a, b in zip(got, ref):
@@ -62,7 +65,7 @@ def _below_cutoff_eme(solver):
     cells = mw.create_cells([clad, narrow, wide], mesh, np.array([1.0, 1.0]))
     css = [mw.CrossSection.from_cell(cell=c, env=mw.Environment(wl=1.55, T=25.0)) for c in cells]
     if solver is None:
-        modes = [mw.compute_modes_tidy3d(cs, num_modes=16) for cs in css]
+        modes = [mw.compute_modes_tidy3d(cs, num_modes=16, post_process=post_process_modes) for cs in css]
     else:
         modes = [compute_modes_gpu(cs, num_modes=16, solver=solver) for cs in css]
     S, pm = mw.compute_s_matrix(modes, cells=cells)
@@ -77,3 +80,40 @@ def test_modes_below_cutoff_follow_the_tidy3d_direction_rule():
         got, modes = _below_cutoff_eme(GPUModeSolver(precision="double", extra=4, seed=seed, warm_start=False))
         assert all(np.imag(m.neff) >= -1e-9 for ms in modes for m in ms), "no growing modes"
         assert got == pytest.approx(ref, abs=3e-6), seed   # before the fix: up to 3e-3, seed-dependent
+
+
+def test_post_processing_keeps_the_neff_of_each_mode():
+    """meow 0.15: Mode.__add__ averages neff, so its Gram-Schmidt gives the TM0 mode of this strip about 2.12 (the
+    mean of TE0 and TM0). The post-processing of meow_gpu keeps the eigenvalue of each mode."""
+    cs = strip_cross_section()
+    raw = mw.compute_modes_tidy3d(cs, num_modes=4, post_process=lambda modes: modes)
+    meow_pp = mw.compute_modes_tidy3d(cs, num_modes=4)
+    ours = compute_modes_gpu(cs, num_modes=4, solver=GPUModeSolver(precision="double", extra=4))
+    assert [complex(m.neff) for m in ours] == pytest.approx([complex(m.neff) for m in raw[: len(ours)]], abs=1e-9)
+    assert abs(meow_pp[1].neff - raw[1].neff) > 0.1          # the upstream averaging (remove when meow fixes it)
+
+
+
+def test_post_processing_equals_meow_except_the_neff():
+    """The same fields as meow's own post-processing (filter, normalization, Gram-Schmidt); with PML (the filter
+    drops PML modes) and with a duplicate mode (the Gram-Schmidt drop branch)."""
+    from meow.fde.post_process import post_process_modes as meow_post_process
+
+    for cs in (strip_cross_section(), strip_cross_section(num_pml=(5, 5))):
+        raw = mw.compute_modes_tidy3d(cs, num_modes=8, post_process=lambda modes: modes)
+        for modes in (raw, raw + raw[:1]):
+            ours, theirs = post_process_modes(modes), meow_post_process(modes)
+            assert len(ours) == len(theirs)
+            for a, b in zip(ours, theirs):
+                for c in ("Ex", "Ey", "Ez", "Hx", "Hy", "Hz"):
+                    assert np.allclose(np.asarray(getattr(a, c)), np.asarray(getattr(b, c)), rtol=0, atol=1e-12)
+        assert len(post_process_modes(raw + raw[:1])) == len(post_process_modes(raw))   # the duplicate is dropped
+
+
+def test_the_tidy3d_fallback_keeps_the_neff():
+    """A bend radius makes compute_modes_gpu fall back to tidy3d; the fallback uses the same post-processing."""
+    cs = strip_cross_section(bend_radius=20.0)
+    with pytest.warns(UserWarning, match="bend radius"):
+        got = compute_modes_gpu(cs, num_modes=3)
+    raw = mw.compute_modes_tidy3d(cs, num_modes=3, post_process=lambda modes: modes)
+    assert [complex(m.neff) for m in got] == pytest.approx([complex(m.neff) for m in raw[: len(got)]], abs=1e-9)

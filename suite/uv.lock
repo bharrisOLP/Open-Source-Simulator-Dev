@@ -1288,6 +1288,7 @@ dependencies = [
     { name = "meow-gpu" },
     { name = "numpy" },
     { name = "scipy" },
+    { name = "shapely" },
     { name = "thermal-gpu" },
 ]
 
@@ -1303,6 +1304,7 @@ requires-dist = [
     { name = "meow-gpu", editable = "../meow_gpu" },
     { name = "numpy" },
     { name = "scipy" },
+    { name = "shapely", specifier = ">=2" },
     { name = "thermal-gpu", editable = "../thermal_gpu" },
 ]
 
