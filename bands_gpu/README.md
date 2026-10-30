@@ -28,6 +28,20 @@ res = solve_bands(cell, triangular_path(8), num_bands=6, polarization="te")  # G
 cell.lattice, cell.reciprocal, cell.k_cartesian(TRIANGULAR_POINTS["K"])    # a_i, b_i (a_i . b_j = delta_ij), k
 ```
 
+Waveguide modes at a fixed frequency (as MPB's `find-k`), and group velocities:
+
+```python
+import numpy as np
+from bands_gpu.geometry import Block
+from bands_gpu.findk import find_k, group_velocity
+
+slab = Cell(size=(1, 5, 1), shape=(1, 1025, 1), eps_background=1.45**2,     # supercell along y, waveguide axis x
+            objects=(Block(size=(np.inf, 0.5, np.inf), eps=3.5**2),))
+res = find_k(slab, omega=0.5, band_min=1, band_max=1, kdir=(1, 0, 0), polarization="tm", parity="even")
+res.kmag, res.group_velocity, res.kpoints              # |k| (units 2 pi / a), d omega / dk (units c), k (as MPB)
+freqs, vg = group_velocity(cell, [0.3, 0.1, 0], num_bands=4, direction=(1, 0, 0), polarization="te")  # one k
+```
+
 ## Method
 
 - **Lattice.** Lattice vectors a_i = size_i basis_i / |basis_i| (rows of `Cell.lattice`), reciprocal vectors b_i
@@ -61,6 +75,39 @@ cell.lattice, cell.reciprocal, cell.k_cartesian(TRIANGULAR_POINTS["K"])    # a_i
   one review of this commit found it). A stall detector stops a solve whose residual no longer falls; it counts
   as converged only within 100 x tol. The block of one k point starts the next one (rod lattice, 10 k points,
   double precision: 284 iterations against 341 without the warm start).
+- **find_k** (`bands_gpu/findk.py`). The k along a direction at which the bands band_min..band_max have the
+  frequency omega. Units as MPB: omega in 2 pi c / a; `kdir` and `korig` in reciprocal-lattice coordinates; k =
+  korig + kmag k_hat, with kmag the Cartesian length in units of 2 pi / a. Root finding: Newton on g(k) = f_b(k) -
+  omega, one band solve per step, inside a bracket g(lo) < 0 < g(hi) that every solve narrows; a step out of the
+  bracket (or a band that does not rise) becomes a bisection, and an end of [kmag_min, kmag_max] is solved only when
+  a step needs it. Default kmag_max = 1.01 omega n_max + |korig| (no band reaches omega at |k| > 1.01 omega n_max
+  along an axis without lattice periodicity, and |k| >= kmag - |korig|); along a periodic axis (a photonic-crystal
+  waveguide), give the zone edge. Default tolerance of kmag (relative): 1e-8 in double precision, 1e-5 in single
+  (the noise of single-precision bands). The bands are found from
+  band_max down (as MPB); each solve gives all bands up to band_max, and these values bracket and start the lower
+  bands. The eigenvector block of the last k starts the next solve (warm start; slab at 255 points, TE0 and TE1:
+  99 eigensolver iterations against 150 without it (`test_no_root_and_warm_start`); line-defect waveguide:
+  111 against 167 (`bench/bench_find_k.py --case pcw`, with and without `--cold`)).
+- **Group velocity** (Hellmann-Feynman, as MPB): v_g = <H| dTheta/dk |H> / (2 omega), with <H| dTheta/dk |H> =
+  2 Re <d x H| F eps_inv F^-1 |q x H> (d: the unit vector of the derivative). The derivative is taken on the
+  operator on all 3-vector fields, whose nonzero eigenpairs are the transverse ones, so the k dependence of the
+  transverse basis does not enter. Degenerate bands get the eigenvalues of the derivative matrix in their subspace,
+  in ascending order (the right derivative of the sorted bands).
+- **Parity** (`parity="even"` or `"odd"`, mirror plane through the cell center normal to `mirror_axis`): the
+  definition of MPB, E(r) = +/- R E(R r) (E polar, R the mirror), so H(r) = -/+ R H(R r) (H a pseudovector). In a
+  2-D cell: "tm" (E_z) even = E_z even (the TE0 slab mode); "te" (H_z) even = H_z odd (TM0 has H_z even, so it is
+  "odd"); the TE-like mode of a strip along x is odd in y. The eigensolver works in the range of the projector
+  P = (1 +/- M) / 2 on the plane-wave coefficients ((M c)(G) = T(G) c(R G), T from the transverse bases at G and
+  R G). The mirror axis needs an odd grid: then G and R G are both in the basis and the discrete operator commutes
+  with M (an even grid has a Nyquist plane without a mirror image; a ValueError). The structure must be symmetric
+  at the subpixel samples: eps at each sample r and at its exact mirror point R r must be equal (else a ValueError;
+  a shift smaller than the sample spacing that moves no sample across a face passes). The samples of the grid are
+  mirror images only to rounding, so a face exactly on a sample can be inside on one side and outside on the other;
+  eps_inv is therefore made symmetric, (eps_inv + R eps_inv R) / 2 on mirror voxels, which changes only such face
+  voxels (`BandEvaluator.mirror_asymmetry` gives the largest change). Also a ValueError: a k with a component along
+  the mirror axis, and a parity subspace with fewer dimensions than the eigensolver block (num_bands + extra), for
+  example "tm" with the z mirror (a 2-D TM field is odd in z) or too few grid points; without this check the solve
+  returned frequencies 0 as converged.
 
 ## Checks (`tests/test_bands.py`)
 
@@ -119,6 +166,95 @@ Order of convergence with the two normals (`bench/normal_order.py`, CPU): square
 | 192 | 4.66e-5 | 1.11e-4 | 2.04e-4 | 5.62e-4 | The tests marked `slow`
 (the two gap tests and the order test) take 5 to 16 s each on the CPU.
 
+## Checks of find_k (`tests/test_findk.py`, 12 tests, 30 s on the GPU computer)
+
+| Case | Reference | Agreement |
+|---|---|---|
+| homogeneous eps 2.25, omega 0.2: 2-D TE and TM (kdir (1, 0.5)), triangular cell (kdir b2), 3-D (the degenerate pair), start 0.05 to 0.12 | k = n omega, v_g = 1 / n, exact | 4.4e-16 (2 solves each) |
+| slab n 3.5 / 1.45, d 0.5 a, period 5 a, omega 0.5, 1025 points, with parity: TE0, TE1 (E_z), TM0, TM1 (H_z) | the exact supercell at Bloch K = 0 (transfer matrix) | kmag 1.17e-5, 4.38e-5, 2.72e-5, 1.34e-5 (relative); 3 to 6 solves |
+| the same | the isolated slab (transcendental equations) | 1.17e-5, 4.38e-5, 2.72e-5, 4.18e-5 |
+| the same, group velocity (Hellmann-Feynman) | the slope of the exact supercell dispersion | 1.0e-5, 6.0e-5, 1.1e-5, 1.0e-4 (relative) |
+| the same, bands 1 and 2 without parity | the two parity results | 2.8e-16 (TE), 1.5e-16 (TM) |
+| consistency: solve_bands (no parity) at the found k | omega | 2.2e-16 to 6.7e-16 |
+| v_g of rods (eps 12, r 0.2 a, 32 x 32), TE and TM, 4 bands at k = (0.3, 0.1), d = (0.6, 0.8); spheres (eps 12, r 0.3 a, 10^3), 4 bands | central differences of omega(k), Richardson (h 2e-3, 1e-3) | 2.6e-11 (TE), 4.1e-11 (TM), 2.2e-11 (3-D) |
+| line-defect waveguide: rods (eps 12, r 0.2 a), one row removed, 1 x 7 supercell, 15 x 105, TM, omega 0.34, even band 4, kmag_max 0.5 | solve_bands band 7 at the found k (0.189185) | 3.9e-16 |
+| the same | an independent finite-difference TM solver (`tests/fd_tm_reference.py`) at the found k, 64 and 128 points per a | omega 2.8e-4 (the FD values at 64 and 128 agree to 1e-6) |
+| the same, v_g = 0.39839 | central difference (h 1e-3) | 9.0e-7 |
+| strip (n 3.48, 0.5 x 0.22, in n 1.444), cell 1 x 3 x 2, grid 1 x 25 x 15, 3-D vectors (T a 2 x 2 matrix), k 1.5, 6 bands; mirror y and mirror z | the bands without parity (even and odd together) | 1.4e-15 (y), 1.6e-15 (z); band 1 (TE-like) odd in y, even in z |
+| the same, v_g of each parity | central difference (h 1e-4) | 1.1e-8 |
+| slab with its faces exactly on subpixel samples (d 0.325 to 0.675, 25 points, sub 8), even and odd | the bands without parity of the same (symmetrized) eps_inv | 8.9e-16; 2 voxels changed, by 0.049 to 0.179 |
+| homogeneous, korig (-0.1, 0, 0), default kmag_max | kmag 0.4, exact | 2.2e-16 |
+| slab, 255 points, TE0, single precision, default tolerance | double precision | kmag 1.0e-7; 3 solves |
+
+The supercell couples the slab to its images: the exact supercell and the isolated slab differ by less than 2e-11
+for TE0, TE1 and TM0, and by 2.84e-5 for TM1 (n_eff 1.588, near the cladding index 1.45; it decays slowly). The
+derivative of the discrete operator is exact (the Richardson check, 2e-11); the errors of v_g against the exact
+slab are the discretization error of the band solver.
+
+Discretization error of the slab (`bench/bench_find_k.py --case slab --n N --sub S`, double precision, on the GPU
+computer; the rows are in `benchmarks/2026-10-30/bands-findk.jsonl`). Relative error of kmag against the exact
+supercell, TE0, TE1, TM0, TM1, with `--sub 256`:
+
+| N (points in 5 a) | TE0 | TE1 | TM0 | TM1 |
+|---|---|---|---|---|
+| 257 | -7.29e-5 | -1.75e-4 | -2.37e-4 | -2.00e-5 |
+| 513 | -7.51e-5 | -2.92e-4 | -1.86e-4 | -1.14e-4 |
+| 1025 | -1.17e-5 | -4.38e-5 | -2.72e-5 | -1.34e-5 |
+| 2049 | -5.74e-6 | -2.38e-5 | -1.36e-5 | -1.02e-5 |
+| 4097 | +7.16e-7 | +5.31e-6 | +1.87e-6 | +4.68e-6 |
+
+Most of the irregular convergence comes from the subpixel samples, not from the averaging formula. The fill fraction
+of a face voxel is a multiple of 1/sub, so a flat face at a general position moves by up to dx / (2 sub): with the
+default `sub = 8`, a flat face is placed only to 1/16 of a voxel. The bench gives the position of the face in its
+voxel, the error of the slab thickness that the samples see, and the error against the exact supercell with that
+sampled thickness (largest of the 4 modes):
+
+| N | face in voxel | sub | sampled thickness - d (a) | error against the exact supercell | error against the exact supercell of the sampled thickness |
+|---|---|---|---|---|---|
+| 257 | 0.85 | 256 | +6.1e-5 | 2.4e-4 | 2.8e-4 |
+| 513 | 0.65 | 256 | -3.05e-5 | 2.9e-4 | 2.4e-4 |
+| 1025 | 0.25 | 8, 256 | 0 | 4.4e-5 | 4.4e-5 |
+| 2049 | 0.45 | 8 | +2.4e-4 | 4.0e-4 | 1.8e-5 |
+| 2049 | 0.45 | 256 | -3.8e-6 | 2.4e-5 | 1.7e-5 |
+| 2049 | 0.45 | 2048 | +9.5e-7 | 1.6e-5 | 1.7e-5 |
+| 4097 | 0.85 | 8 | +6.1e-5 | 1.0e-4 | 6.9e-7 |
+| 4097 | 0.85 | 256 | +3.8e-6 | 5.3e-6 | 1.1e-6 |
+| 4097 | 0.85 | 2048 | +2.4e-7 | 7.7e-7 | 1.2e-6 |
+
+At 1025 points the face is at exactly 1/4 of a voxel, so 8 samples give the exact fill fraction (sub 8 and sub 256
+agree to 10 digits); that is a property of this grid, not of sub 8. With sub 8, the errors at 2049 and 4097 points
+are larger than at 1025 and have the other sign: the slab is 2.4e-4 a and 6.1e-5 a too thick. Against the exact
+supercell of the sampled thickness, the error does not depend on sub (2049: 1.7e-5 to 1.8e-5; 4097: 6.9e-7 to
+1.2e-6) and falls from 2.8e-4 (257) to 1.2e-6 (4097), 240x over 16x in N (a second order gives 256x), but not
+evenly at each step (the coefficient changes with the position of the face in its voxel). For a flat face at a
+general position, use a larger sub, or put the face at the center or the edge of a voxel.
+
+Small bench cases of find_k (`bench/bench_find_k.py`, one JSON line per case, on the RX 7900 XT, device rocm:0;
+double precision unless noted; the rows are in `benchmarks/2026-10-30/bands-findk.jsonl`). The double-precision
+results are the same as on the CPU to the digits shown.
+
+| Case | Result | Solves | Eigensolver iterations |
+|---|---|---|---|
+| `--case slab --n 1025` (4 modes) | the errors above | 3, 3, 4, 6 | 55, 53, 79, 121 |
+| `--case pcw --n 15` | kmag 0.189185, v_g 0.398385 | 4 | 111 |
+| `--case pcw --n 15 --cold` (no warm start) | kmag the same to 3e-15, v_g to 4e-11 | 4 | 167 |
+| `--case pcw --n 15 --precision single` | kmag 0.18919, v_g 0.39840 | 3 | 46 |
+| `--case strip --n 16 --precision single` (Si 0.5 x 0.22 in silica, wavelength 1.55, 3-D vectors, 49 x 32) | n_eff 2.4315, group index 4.020 | 2 | 26 |
+
+These cases are small (1-D, 15 x 105, 49 x 32 points): the GPU is not loaded, and the times in the rows are not a
+speed-up measurement. The strip case has no reference value (a coarse grid; a timing case).
+
+Larger cases (`benchmarks/2026-10-30/bands-findk.jsonl`; time of the second call, single precision unless noted):
+
+| Case | GPU (RX 7900 XT) | CPU (16 threads, `BANDS_GPU_DEVICE=cpu`) | Result |
+|---|---|---|---|
+| `--case strip --n 64` | 0.28 s | 1.71 s (6.1x) | n_eff 2.4443, group index 4.050 (27 iterations on both) |
+| `--case pcw --n 31` | 0.58 s (80 iterations) | 0.93 s (56 iterations) | kmag 0.18975 on both (unequal iterations: 2.3x per iteration) |
+| `--case slab --n 4097` (default sub 8), double precision | 4.05 s | not run | errors +1.6e-5 to +1.0e-4 (the slab is 6.1e-5 a too thick at sub 8; see the sub table above) |
+| `--case slab --n 4097 --sub 256`, double precision | 4.25 s | not run | errors +7.2e-7 to +5.3e-6 |
+
+The strip value moves from n_eff 2.4315 at n 16 to 2.4443 at n 64 (grid convergence, no reference).
+
 ## GPU timings (RX 7900 XT against the same algorithm on the 16 CPU threads of the same PC)
 
 Single precision, full k paths (`bench/bench_bands.py`; the JSON rows are in `benchmarks/2026-10-30/`). After the
@@ -165,4 +301,21 @@ run (32.5 s) shared the GPU with another test run and is not used.
   once to wrong bands (the triangular lattice, K to a general k). `solve_bands` therefore turns the warm start off
   there (test: the empty triangular lattice with the default warm start). A very weak contrast couples the plane
   waves only weakly; if bands look wrong there, use `warm_start=False`.
-- No `find_k` (waveguide modes at fixed frequency) yet; no field output except `operator.fields_h`.
+- No field output except `operator.fields_h`.
+- find_k finds one root per band in [kmag_min, kmag_max]. The bracket assumes that the band rises with k at the
+  root (a forward mode); a band with several roots there (a folded photonic-crystal band) gives one of them, so give
+  a range with one root. Roots of supercell bands of the cladding are also found: a mode is guided only if
+  kmag > n_clad omega. Band solves that do not reach the eigensolver tolerance are counted in
+  `unconverged_solves`. kmag is NaN (and `converged` False) when the band does not cross omega in the range, or
+  when the search did not converge in `max_steps` (default 40) solves.
+- A backward mode (a band that falls with k at the root, for example the folded band of a photonic-crystal
+  waveguide past its maximum) gives NaN: the bracket needs g < 0 below the root and g > 0 above it (from the
+  code; no test).
+- Parity: one mirror plane at a time, through the cell center, normal to a lattice vector along a Cartesian axis,
+  with an odd number of grid points on that axis. The symmetry check is at the resolution of the subpixel samples:
+  a structure that is asymmetric by less than the sample spacing, and moves no sample across a face, passes.
+- The subpixel samples place a flat face to dx / (2 sub) only (1/16 of a voxel with the default sub 8). For
+  converged waveguide numbers, use a larger sub, or put the faces at voxel centers or edges (the slab table).
+- Degenerate bands: bands closer than 1e-9 (relative, in omega^2; 1e-5 in single precision) count as one cluster
+  for the group velocity. Bands that are nearly degenerate but not in a cluster get the Hellmann-Feynman value of
+  each vector, which is correct only for a separated band.
