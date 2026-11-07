@@ -1,0 +1,100 @@
+== OMP_NUM_THREADS=1
+grid (200, 91) n 36400 b 18 M 72 device rocm:0
+Gram <v_i, t_j> (72 x 18), complex64:
+  _gram (current)                             0.348 ms
+  _gram t,t (18 x 18)                         0.219 ms
+  fused multiply-reduce                       0.402 ms
+    max rel diff 8.7e-07
+  fused multiply-reduce (t,t)                 0.167 ms
+  split P=16                                  0.356 ms
+    max rel diff 0.0e+00
+  split P=16 (t,t)                            0.216 ms
+  split P=64                                  0.359 ms
+    max rel diff 0.0e+00
+  split P=64 (t,t)                            0.219 ms
+  split P=256                                 0.359 ms
+    max rel diff 9.5e-07
+  split P=256 (t,t)                           0.218 ms
+  split, chunk axis first P=16                0.352 ms
+    max rel diff 4.9e-07
+  split, chunk axis first P=16 (t,t)          0.262 ms
+  split, chunk axis first P=64                0.333 ms
+    max rel diff 7.5e-07
+  split, chunk axis first P=64 (t,t)          0.206 ms
+  split, chunk axis first P=256               0.323 ms
+    max rel diff 9.4e-07
+  split, chunk axis first P=256 (t,t)         0.190 ms
+vmap over B = 8 members:
+  vmap _gram (current)                        1.592 ms
+  vmap split P=16                             1.617 ms
+  vmap split P=64                             1.625 ms
+  vmap split P=256                            1.620 ms
+  vmap _project_out (current)                 3.974 ms
+  _project_out (one member)                   0.652 ms
+  _combine (one member)                       0.121 ms
+refinement kernels (b = 18, 20 steps):
+  _correction_krylov, (steps+1, b, n) basis   77.864 ms
+  _correction_krylov, (b, steps+1, n) basis   34.997 ms
+    max |dH| 9.1e-05  |H| 1.9e+00
+refinement kernels, vmap over B = 8 members (a batched refinement):
+  vmap _correction_krylov, (steps+1, b, n)  623.082 ms
+  vmap _correction_krylov, (b, steps+1, n)  271.410 ms
+  precondition                                0.596 ms
+  _apply_block                                0.092 ms
+host eig of the projected matrix (complex, 72 x 72):
+  serial, 8 members    31.147 ms
+  pool of 2, 8 members   15.957 ms
+  pool of 4, 8 members    8.099 ms
+  pool of 8, 8 members    5.400 ms
+  one stacked call     30.913 ms
+  scipy serial         31.009 ms
+== default OpenBLAS threads
+grid (200, 91) n 36400 b 18 M 72 device rocm:0
+Gram <v_i, t_j> (72 x 18), complex64:
+  _gram (current)                             0.313 ms
+  _gram t,t (18 x 18)                         0.214 ms
+  fused multiply-reduce                       0.388 ms
+    max rel diff 8.7e-07
+  fused multiply-reduce (t,t)                 0.166 ms
+  split P=16                                  0.352 ms
+    max rel diff 0.0e+00
+  split P=16 (t,t)                            0.212 ms
+  split P=64                                  0.355 ms
+    max rel diff 0.0e+00
+  split P=64 (t,t)                            0.214 ms
+  split P=256                                 0.357 ms
+    max rel diff 9.5e-07
+  split P=256 (t,t)                           0.212 ms
+  split, chunk axis first P=16                0.339 ms
+    max rel diff 4.9e-07
+  split, chunk axis first P=16 (t,t)          0.264 ms
+  split, chunk axis first P=64                0.325 ms
+    max rel diff 7.5e-07
+  split, chunk axis first P=64 (t,t)          0.202 ms
+  split, chunk axis first P=256               0.313 ms
+    max rel diff 9.4e-07
+  split, chunk axis first P=256 (t,t)         0.189 ms
+vmap over B = 8 members:
+  vmap _gram (current)                        1.595 ms
+  vmap split P=16                             1.614 ms
+  vmap split P=64                             1.615 ms
+  vmap split P=256                            1.619 ms
+  vmap _project_out (current)                 3.981 ms
+  _project_out (one member)                   0.647 ms
+  _combine (one member)                       0.119 ms
+refinement kernels (b = 18, 20 steps):
+  _correction_krylov, (steps+1, b, n) basis   77.914 ms
+  _correction_krylov, (b, steps+1, n) basis   34.963 ms
+    max |dH| 1.1e-04  |H| 1.9e+00
+refinement kernels, vmap over B = 8 members (a batched refinement):
+  vmap _correction_krylov, (steps+1, b, n)  623.754 ms
+  vmap _correction_krylov, (b, steps+1, n)  271.470 ms
+  precondition                                0.598 ms
+  _apply_block                                0.088 ms
+host eig of the projected matrix (complex, 72 x 72):
+  serial, 8 members    47.754 ms
+  pool of 2, 8 members   93.340 ms
+  pool of 4, 8 members   49.962 ms
+  pool of 8, 8 members  101.739 ms
+  one stacked call     46.185 ms
+  scipy serial         59.109 ms

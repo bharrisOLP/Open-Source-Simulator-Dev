@@ -323,10 +323,6 @@ DAVIDSON_SWITCH_TOL = 2e-5  # the complex64 Davidson of the "davidson" polish st
 POLISHES = ("refine", "davidson")
 
 
-def _flat3(a: jax.Array) -> jax.Array:
-    return a.reshape(a.shape[0], a.shape[1], -1)
-
-
 @partial(jax.jit, static_argnums=(5,))
 def _correction_krylov(op: DeviceOperator, pc: Preconditioner, q: jax.Array, theta: jax.Array, rhs: jax.Array,
                        steps: int):
@@ -335,31 +331,38 @@ def _correction_krylov(op: DeviceOperator, pc: Preconditioner, q: jax.Array, the
     right preconditioner is P M_i, with M_i = ``precondition`` at theta_i.
 
     q: (b, 2, Nx, Ny), orthonormal rows (zero rows have no effect); the rows of rhs must be orthogonal to q; a zero
-    row of rhs gives zero results. Returns the Krylov basis (steps + 1, b, ...), the Hessenberg matrices
+    row of rhs gives zero results. Returns the Krylov basis (b, steps + 1, n), the Hessenberg matrices
     (b, steps + 1, steps) and the norms of the rows of rhs (b,). The solution is ``_correction_solution``.
+
+    The basis has the block axis first: the Gram-Schmidt products are then batched products with the batch axis
+    first, and XLA does not transpose the basis. With the basis as (steps + 1, b, n) (before 2026-10-30), one call
+    of 20 steps took 78 ms on the RX 7900 XT for b = 18 and 36k unknowns, 35 ms with this layout
+    (bench/kernel_reduce.py).
     """
     b = rhs.shape[0]
-    shape = rhs.shape[1:]
-    beta = jnp.sqrt(jnp.sum(jnp.abs(_flat(rhs)) ** 2, axis=1))
-    v0 = rhs / jnp.where(beta > 0, beta, 1.0).astype(rhs.dtype)[:, None, None, None]
-    vb = jnp.zeros((steps + 1, b) + shape, rhs.dtype).at[0].set(v0)
+    shape = rhs.shape
+    fr = _flat(rhs)
+    beta = jnp.sqrt(jnp.sum(jnp.abs(fr) ** 2, axis=1))
+    v0 = fr / jnp.where(beta > 0, beta, 1.0).astype(rhs.dtype)[:, None]
+    vb = jnp.zeros((b, steps + 1, fr.shape[1]), rhs.dtype).at[:, 0].set(v0)
     hb = jnp.zeros((b, steps + 1, steps), rhs.dtype)
     th = theta[:, None, None, None]
 
     def body(j, carry):
         vb, hb = carry
-        z = _project_out(precondition(pc, vb[j], theta), q)
-        wv = _project_out(apply(op, z) - th * z, q)
+        vj = jax.lax.dynamic_index_in_dim(vb, j, axis=1, keepdims=False).reshape(shape)
+        z = _project_out(precondition(pc, vj, theta), q)
+        wv = _flat(_project_out(apply(op, z) - th * z, q))
         for _ in range(2):                    # classical Gram-Schmidt, two passes; rows > j of vb are zero
             # <v_j, w> = conj(sum v_j conj(w)): the conjugate goes on the small operand
-            hj = jnp.einsum("jbn,bn->bj", _flat3(vb), _flat(wv).conj()).conj()
-            wv = wv - jnp.einsum("bj,jbn->bn", hj, _flat3(vb)).reshape(wv.shape)
+            hj = jnp.einsum("bjn,bn->bj", vb, wv.conj()).conj()
+            wv = wv - jnp.einsum("bj,bjn->bn", hj, vb)
             hb = hb.at[:, :, j].add(hj)
-        hn = jnp.sqrt(jnp.sum(jnp.abs(_flat(wv)) ** 2, axis=1))
+        hn = jnp.sqrt(jnp.sum(jnp.abs(wv) ** 2, axis=1))
         hb = hb.at[:, j + 1, j].set(hn.astype(hb.dtype))
         ok = hn > 1e-30                       # after a breakdown the next basis vectors are zero
         scale = jnp.where(ok, hn, 1.0).astype(wv.dtype)
-        vb = vb.at[j + 1].set(jnp.where(ok[:, None, None, None], wv / scale[:, None, None, None], 0))
+        vb = jax.lax.dynamic_update_index_in_dim(vb, jnp.where(ok[:, None], wv / scale[:, None], 0), j + 1, 1)
         return vb, hb
 
     vb, hb = jax.lax.fori_loop(0, steps, body, (vb, hb))
@@ -370,9 +373,9 @@ def _correction_krylov(op: DeviceOperator, pc: Preconditioner, q: jax.Array, the
 def _correction_solution(pc: Preconditioner, q: jax.Array, theta: jax.Array, y: jax.Array,
                          vb: jax.Array) -> jax.Array:
     """t_i = P M_i (sum_j y_ij v_j,i): the GMRES solution from the coefficients y (b, steps) and the Krylov basis
-    (steps + 1, b, ...) of ``_correction_krylov`` (M_i is linear, so the preconditioned basis is not stored)."""
+    (b, steps + 1, n) of ``_correction_krylov`` (M_i is linear, so the preconditioned basis is not stored)."""
     steps = y.shape[1]
-    u = jnp.einsum("bj,jbn->bn", y, _flat3(vb[:steps])).reshape(vb.shape[1:])
+    u = jnp.einsum("bj,bjn->bn", y, vb[:, :steps]).reshape(q.shape)
     return _project_out(precondition(pc, u, theta), q)
 
 
@@ -897,7 +900,9 @@ def davidson_batch(op: DeviceOperator | tuple[DeviceOperator, DeviceOperator], p
 
     Each member does the steps of ``davidson`` on its own problem (the same precision modes and stall rule); the
     device kernels run on all members together. Exception: the "refine" polish runs member after member (``refine``
-    on the operator and the preconditioner of each member), after the batched complex64 Davidson.
+    on the operator and the preconditioner of each member), after the batched complex64 Davidson. Reason: its
+    largest cost, the GMRES kernel, takes as long under ``jax.vmap`` over 8 members as in 8 calls (RX 7900 XT, 36k
+    unknowns, b = 18; bench/kernel_reduce.py).
     """
     nbat, b = x0.shape[:2]
     if b < k:

@@ -9,7 +9,7 @@ from test_meow_backend import _below_cutoff_eme, strip_cross_section
 from meow_gpu.device import put, solver_device
 from meow_gpu.fde.eigensolver import STALL_FLOOR, davidson, davidson_batch, make_preconditioner, precondition, stack
 from meow_gpu.fde.operator import make_problem
-from meow_gpu.meow_backend import GPUModeSolver, compute_modes_gpu, compute_modes_gpu_batch
+from meow_gpu.meow_backend import GPUModeSolver, compute_modes_gpu, compute_modes_gpu_batch, post_process_modes
 
 K = 4
 # (width, wavelength): different eps, targets and 1-D preconditioner bases in one batch, with the same grid shape
@@ -213,6 +213,30 @@ def test_compute_modes_gpu_batch_equals_per_cell(batch):
             assert abs(a.neff - b.neff) < 1e-8
             assert abs(mw.inner_product(a, b)) == pytest.approx(1.0, abs=1e-6)
     assert all(i.warm for i in s.last_batch_info) == (batch < len(css))
+
+
+def test_batch_post_processing_runs_beside_the_solve():
+    """The post-processing of each cell runs in a second thread (beside the solve of the next batch), and an error
+    in it reaches the caller."""
+    import threading
+    css = _taper(n_cells=3)
+    in_main = []
+
+    def pp(modes):
+        in_main.append(threading.current_thread() is threading.main_thread())
+        return post_process_modes(modes)
+
+    got = compute_modes_gpu_batch(css, num_modes=K, solver=GPUModeSolver(precision="single", extra=4), post_process=pp,
+                                  batch=2)
+    assert len(got) == 3 and all(len(m) > 0 for m in got)
+    assert len(in_main) == 3 and not any(in_main)
+
+    def bad(modes):
+        raise RuntimeError("an error in the post-processing")
+
+    with pytest.raises(RuntimeError, match="an error in the post-processing"):
+        compute_modes_gpu_batch(css, num_modes=K, solver=GPUModeSolver(precision="single", extra=4), post_process=bad,
+                                batch=2)
 
 
 def test_compute_modes_gpu_batch_with_two_grid_shapes_and_a_fallback_cell(monkeypatch):

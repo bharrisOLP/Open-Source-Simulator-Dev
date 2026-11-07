@@ -19,10 +19,10 @@ same grid (the next cell of a taper, the next wavelength) starts from them. Call
 
 Batched solves: ``compute_modes_gpu_batch(css, num_modes, batch=B)`` solves B cross-sections with the same grid
 shape at the same time (``GPUModeSolver.solve_batch``, ``meow_gpu.fde.eigensolver.davidson_batch``). The results
-are the results of ``compute_modes_gpu`` (the same eigensolver steps, post-processing and direction rule). The gain
-is small: on an RX 7900 XT, for the 30-cell taper of bench/bench_eme_batch.py (36k unknowns per cell), the batched
-solve was about 1.2x faster in single precision and not faster in mixed precision
-(benchmarks/2026-10-30/eme-batch.jsonl). The per-cell path stays the default.
+are the results of ``compute_modes_gpu`` (the same eigensolver steps, post-processing and direction rule). On an
+RX 7900 XT, for the 30-cell taper of bench/bench_eme_batch.py (36k unknowns per cell), the batched solve with 4
+members was 1.86x faster than the per-cell solve in single precision and 1.20x in mixed precision (README, "Profile
+of the batched path"). The per-cell path stays the default.
 
 Bends (``cs.mesh.bend_radius``, ``bend_axis``, ``plane_center``): the GPU solver uses the radial transform of the
 tidy3d solver (``meow_gpu.fde.operator``), so neff is the effective index at the bend radius, as in
@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import warnings
 from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 
 import jax
@@ -57,8 +58,8 @@ from meow_gpu.fde.operator import FDEProblem, bend_error, fields, make_problem
 PRECISIONS = ("single", "mixed", "double")
 TOL = {"single": 1e-5, "mixed": 1e-10, "double": 1e-10}
 TOL_POWER_FLOW = 1e2 * float(np.finfo(np.float32).eps) / 10   # = tidy3d TOL_POWER_FLOW_DIRECTION
-SINGLE_FLOOR = 1e-3
-SINGLE_TOL_CAP = 1e-3   # the adaptive single-precision tolerance never goes above this (warning when capped)   # complex64: a stall below this residual is convergence to working precision
+SINGLE_FLOOR = 1e-3     # complex64: a stall below this residual is convergence to working precision
+SINGLE_TOL_CAP = 1e-3   # the adaptive single-precision tolerance never goes above this (warning when capped)
 FLOOR_FACTOR = 10.0   # single precision: tol >= FLOOR_FACTOR * eps32 * |A| / |theta|
 
 
@@ -364,6 +365,9 @@ def compute_modes_gpu_batch(css, num_modes: int = 10, target_neff: float | None 
     its kind, or cold: the warm start of ``solve_batch``). When the last run is shorter, its member solves
     the last cell again (the result is not used), so that all batches have the same size (one JIT compile).
     Cross-sections that the GPU solver does not support use ``compute_modes_gpu`` (the tidy3d fallback).
+
+    The post-processing (meow's normalization and Gram-Schmidt, on the CPU) of a batch runs in a second thread while
+    the GPU solves the next batch. The results do not change (the same function on the same arrays).
     """
     if batch < 1:
         raise ValueError("batch must be 1 or more")
@@ -378,17 +382,21 @@ def compute_modes_gpu_batch(css, num_modes: int = 10, target_neff: float | None 
             out[i] = _tidy3d_fallback(cs, why, num_modes, target_neff, post_process)
         else:
             groups.setdefault(tuple(np.shape(cs.nx)), []).append(i)
-    for idx in groups.values():
-        n = len(idx)
-        runs = -(-n // batch)                  # the number of batches = the length of each run
-        width = -(-n // runs)                  # the batch size (<= batch)
-        for j in range(runs):
-            pos = [i * runs + j for i in range(width)]
-            cells = [idx[min(q, n - 1)] for q in pos]
-            results = solver.solve_batch([_problem(css[c]) for c in cells], num_modes, target_neff)
-            for q, c, (neff, e, h) in zip(pos, cells, results):
-                if q < n:
-                    out[c] = _modes(css[c], neff, e, h, post_process)
+    pending = []
+    with ThreadPoolExecutor(1, thread_name_prefix="meow-gpu-post") as post:
+        for idx in groups.values():
+            n = len(idx)
+            runs = -(-n // batch)                  # the number of batches = the length of each run
+            width = -(-n // runs)                  # the batch size (<= batch)
+            for j in range(runs):
+                pos = [i * runs + j for i in range(width)]
+                cells = [idx[min(q, n - 1)] for q in pos]
+                results = solver.solve_batch([_problem(css[c]) for c in cells], num_modes, target_neff)
+                for q, c, (neff, e, h) in zip(pos, cells, results):
+                    if q < n:
+                        pending.append((c, post.submit(_modes, css[c], neff, e, h, post_process)))
+        for c, done in pending:
+            out[c] = done.result()
     return out
 
 

@@ -16,11 +16,13 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import sys
-import time
-from pathlib import Path
 
-import numpy as np
+os.environ.setdefault("OMP_NUM_THREADS", "1")   # before numpy: OpenBLAS reads it when it loads
+import sys  # noqa: E402
+import time  # noqa: E402
+from pathlib import Path  # noqa: E402
+
+import numpy as np  # noqa: E402
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from bench_eme_taper import _post_process, build  # noqa: E402
@@ -80,7 +82,8 @@ def main():
             times.append(seconds)
         row = {"case": "per_cell" if batch == 0 else "batch", "batch": batch or 1, "precision": a.precision,
                "tol": a.tol, "extra": a.extra, "cells": a.cells, "modes": a.modes, "grid": list(css[0].nx.shape),
-               "solver_device": device_summary(), "modes_s": times[-1], "modes_s_first": times[0]}
+               "solver_device": device_summary(), "modes_s": times[-1], "modes_s_first": times[0],
+               "omp_num_threads": os.environ.get("OMP_NUM_THREADS")}
         if batch == 0:
             row["iterations"] = its
             row["iterations_total"] = int(sum(its))
@@ -112,5 +115,4 @@ def main():
 
 
 if __name__ == "__main__":
-    os.environ.setdefault("OMP_NUM_THREADS", "1")
     main()
