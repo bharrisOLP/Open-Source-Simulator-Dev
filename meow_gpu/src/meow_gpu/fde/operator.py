@@ -1,3 +1,7 @@
+# SPDX-License-Identifier: MIT
+# radial_transform follows tidy3d/components/mode/transforms.py, and assemble the diagonal-media matrix of
+# tidy3d/components/mode/solver.py (MIT; Copyright (c) 2021 Flexcompute, Copyright (c) 2019 Tyler Hughes). See
+# THIRD_PARTY_NOTICES.md and LICENSES/tidy3d-mode-MIT.txt.
 """The full-vector finite-difference mode operator, matrix-free (JAX) and assembled (SciPy, the CPU reference).
 
 Unknowns: u = (Ex, Ey) on the Yee grid of the cross-section, each of shape (Nx, Ny). With the k0-normalized

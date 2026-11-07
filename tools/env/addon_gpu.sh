@@ -1,18 +1,18 @@
 #!/usr/bin/env bash
-# WAITS FOR THE APPROVAL OF THE USER: this script clones and runs third-party code from GitHub (the Erised
-# add-on). The auto-mode classifier blocked it on 2026-10-30. Do not run it before the user approves.
-# Environment .local/envs/fdtd-gpu on the AMD GPU computer (Radeon RX 7900 XT, gfx1100), without a system ROCm:
+# This script clones and runs third-party code from GitHub (the Erised add-on, GPL-2.0-or-later). The user approved
+# it on 2026-10-30 ("Meep add on route: yes clone it, fine"); STATUS.md, item 2.
+# Environment .local/envs/addon-gpu on the AMD GPU computer (Radeon RX 7900 XT, gfx1100), without a system ROCm:
 #   - Meep (conda-forge pymeep, serial "nompi" build, double precision) and Python 3.12, with micromamba;
 #   - PyTorch for ROCm 7.2 (its wheel brings the HIP runtime and the AMD build of Triton);
 #   - CuPy for ROCm 7 (cupy-rocm-7-0); it needs versioned ROCm 7 library names (links to the PyTorch libraries in
 #     .local/rocm7-compat) and hipcc for its built-in kernels (from the ROCm 10.1 pip SDK, .venv-hipcc);
 #   - the GPU time-stepping add-on of Erised (GPL-2.0-or-later), cloned at a fixed commit into .local/upstream,
-#     installed editable without dependencies, with the ROCm patches of fdtd_gpu/patches/ applied.
-# tools/env/fdtd_gpu_activate.sh sets the run-time variables. No sudo; it deletes nothing; it can run again.
+#     installed editable without dependencies, with the ROCm patches of tools/env/addon_patches/ applied.
+# tools/env/addon_gpu_activate.sh sets the run-time variables. No sudo; it deletes nothing; it can run again.
 set -euo pipefail
 cd "$(dirname "$0")/../.."
 export PATH=$HOME/.local/bin:$PATH PYTHONDONTWRITEBYTECODE=1
-ENV=$PWD/.local/envs/fdtd-gpu
+ENV=$PWD/.local/envs/addon-gpu
 PY=$ENV/bin/python
 ADDON_REPO=https://github.com/Erised-AI-Inc/meep-gpu.git
 ADDON_COMMIT=8993426
@@ -53,14 +53,14 @@ git -C "$ADDON" fetch -q --depth 1 origin "$ADDON_COMMIT" 2>/dev/null || true
 if [[ $(git -C "$ADDON" rev-parse --short=7 HEAD) != "$ADDON_COMMIT" ]]; then
   git -C "$ADDON" checkout -q "$ADDON_COMMIT"
 fi
-for p in fdtd_gpu/patches/*.patch; do
+for p in tools/env/addon_patches/*.patch; do
   [[ -e $p ]] || continue
   if git -C "$ADDON" apply --check "$PWD/$p" 2>/dev/null; then git -C "$ADDON" apply "$PWD/$p" && echo "applied $p"; fi
 done
 uv pip install --quiet --python "$PY" --no-deps -e "$ADDON"
-uv pip freeze --python "$PY" > .local/env-fdtd-gpu-freeze.txt
+uv pip freeze --python "$PY" > .local/env-addon-gpu-freeze.txt
 
-source tools/env/fdtd_gpu_activate.sh
+source tools/env/addon_gpu_activate.sh
 "$PY" - <<'PY'
 import importlib
 for m in ("torch", "triton", "cupy"):

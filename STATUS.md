@@ -4,6 +4,14 @@ Updated: 2026-10-30.
 
 ## In work
 
+**Now (fourth wave, 2026-10-30): four agents, one package each.** Each change gets one review before its commit.
+- Done: charge_gpu, the coupled Newton step on the GPU (297baf2; 5.8x to 5.9x faster than SuperLU at 5 nm) and
+  a follow-up of its review (f937f57); optics_gpu, all focus planes in one pass (0bbad9f; 3.1x per plane in
+  complex128, about 27x in complex64); meow_gpu, the profile of the batched path (88d5158; the taper in mixed
+  precision 7.9 s instead of 11.7 s per cell, single 1.86x faster at B = 4).
+- In work: fdtd_gpu, subpixel averaging of the permittivity (the logged bench, then the review); the add-on route
+  of item 2 (installed; the AMD port is in work).
+
 **1. meow-gpu (EME): version 0.1 works.** Folder: `meow_gpu/` (`meow_gpu/README.md` has the results).
 
 Done:
@@ -21,13 +29,14 @@ Done:
   on the RX 7900 XT only 1.2x in single precision and no gain in mixed precision for the 30-cell taper.
 
 - Mixed-precision refinement (the default of "mixed"): complex128 residuals and Rayleigh-Ritz, complex64 GMRES on
-  the correction equation; the 30-cell taper in 11.8 s instead of 19.5 s (10.8x fewer complex128 applies), the
+  the correction equation; the 30-cell taper in 11.7 s instead of 19.5 s (10.8x fewer complex128 applies), the
   same 1e-10 tolerance; near-degenerate pairs keep their mode identity (tested against ARPACK). When the
   refinement stalls (a weakly guided SiN tip above a dense band of window modes), a fallback runs the earlier
   polish from the complex64 block.
 
-- Bend modes on the GPU (the bent-waveguide operator of tidy3d; equal to its matrix to 1e-14); only angled
-  propagation still falls back to tidy3d.
+- Bend modes on the GPU (the bent-waveguide operator of tidy3d; equal to its matrix to 1e-14). These still fall
+  back to tidy3d: angled propagation, and a bend that the transform cannot represent (radius 0, or the center of
+  the bend inside the cross-section).
 
 Open (later, in this order): profile the batched path (the work per member is its larger cost); angled propagation.
 
@@ -39,13 +48,18 @@ Open (later, in this order): profile the batched path (the work per member is it
 - fdtdx (MIT, JAX): already runs on this card. A front end on it in the style of the MIT package is the third
   route: `fdtd_gpu/` (2026-10-30, version 0.1: Simulation, geometry, sources, flux and mode monitors, Harminv;
   checked against a Bragg transfer matrix, exact ring resonances, the analytic dipole power and a current sheet).
-  It needs no third-party GPL code.
+  It needs no third-party GPL code; the mode solver of fdtdx uses tidy3d (LGPL-2.1).
 - Probe result (2026-10-30, `tools/probe_cupy_triton.sh`, `tools/probe/`): YES. PyTorch 2.14.1 for ROCm 7.2 runs
   on gfx1100; Triton 3.8.0 (AMD) runs a kernel; CuPy 14.2 (cupy-rocm-7-0) compiles and runs a RawKernel, with
   versioned links to the HIP libraries of the PyTorch wheel and hipcc from the ROCm 10.1 pip SDK.
-- **Blocked, waits for the user:** the next step clones the Erised add-on from GitHub and runs it on the GPU
-  computer (`tools/env/fdtd_gpu.sh`). The auto-mode classifier blocked that ("Code from External"). See
-  "Decisions for the user". Until then the work continues with item 3.
+- **Add-on route: approved and installed.** The user approved it (2026-10-30: "Meep add on route: yes clone it,
+  fine"). `tools/env/addon_gpu.sh` (named `tools/env/fdtd_gpu.sh` until 2026-10-30, before the folder `fdtd_gpu/`
+  of the fdtdx route) cloned the add-on at commit 8993426 into `.local/upstream/erised-fork` on the GPU computer and
+  made `.local/envs/addon-gpu`: the solver 1.35.0 (conda-forge, serial), the add-on 1.0.0, PyTorch 2.14.1 for ROCm
+  7.2, Triton 3.8.0 and CuPy 14.2 see the RX 7900 XT. `tools/gpu_run.sh .local/upstream/erised-fork ...` (and
+  `tools/gpu_run.sh addon_gpu ...`, when the folder of the port exists) uses that environment. Next: run the
+  tests of the add-on on the AMD GPU, patch what fails (patches in `tools/env/addon_patches/`, GPL-2.0-or-later),
+  and compare the GPU time stepping with the CPU solver.
 
 **3. bands-gpu (the method of MPB): version 0.1 works.** Folder: `bands_gpu/` (`bands_gpu/README.md`).
 - Plane-wave operator with FFTs, anisotropic subpixel averaging, block LOBPCG (stabilized), warm start on the k
@@ -101,7 +115,7 @@ Open (later, in this order): profile the batched path (the work per member is it
   built-in potential as a consistency check.
 - Example `examples/pn_modulator.py`: V_pi L 1.39, 1.60, 1.96 V cm at 1, 2, 4 V for a synthetic SOI rib (published:
   typically 1.5 to 3 V cm); the loss decreases by 1.0 to 2.8 dB/cm (fewer free carriers).
-- Not covered: forward bias and currents (drift-diffusion; DEVSIM stays the tool for that).
+- Forward bias and currents: see the drift-diffusion solvers below.
 - Junction capacitance, series resistance and RC bandwidth (`charge_gpu/src/charge_gpu/rc.py`, example
   `charge_gpu/examples/pn_modulator_rc.py`): C' against eps/W to 1e-4; at 3e17 cm^-3 and 2 V: 0.197 fF/um,
   39.4 Ohm mm, 20.4 GHz intrinsic. No GPU gain at 73k cells (charge part 1.6x at 293k cells, against the Mac CPU).
@@ -114,8 +128,9 @@ Open (later, in this order): profile the batched path (the work per member is it
 - Next: the coupled Newton step on the device.
 
 **Shared: aggregation multigrid** (`thermal_gpu/src/thermal_gpu/multigrid.py`), used by thermal-gpu (steady and
-transient) and charge-gpu (Newton steps). Heater stack: 17 to 27 CG iterations from 50 to 5 nm cells (Jacobi: 809
-to 3982 from 50 to 10 nm); cells with a large aspect ratio need more. Heater stack at 5 nm (2.9 million cells):
+transient) and charge-gpu (the Poisson Newton steps, the Gummel continuity solves and the preconditioner of the
+device Newton). Heater stack: 17 to 27 CG iterations from 50 to 5 nm cells (Jacobi: 809 to 3982 from 50 to
+10 nm); cells with a large aspect ratio need more. Heater stack at 5 nm (2.9 million cells):
 0.21 s on the GPU, 1.30 s on 16 CPU threads (`benchmarks/2026-10-30/thermal-mg.jsonl`). PN modulator: 226 to 560
 CG iterations per bias point instead of 11k to 36k; 2.1 s instead of 17.7 s on the Mac CPU (review record).
 
@@ -147,11 +162,11 @@ The user asked to start with Meep and meow. After those two, the order is by com
 | # | Tool | Open-source base | GPU path on AMD | Complexity | Notes |
 |---|---|---|---|---|---|
 | 1 | meow (EME) | meow (Apache-2) + own FDE solver | JAX on ROCm | medium | v0.1 done; improvements open |
-| 2 | Meep (FDTD) | Meep (GPL-2); GPU forks: Erised add-on (Triton/CUDA), gpmeep (CUDA C++) | CuPy-ROCm + Triton-AMD, HIP, or fdtdx | very high | fdtdx route v0.1 done (`fdtd_gpu/`); the add-on route: probe passed, **waits for the user** (third-party code) |
+| 2 | Meep (FDTD) | Meep (GPL-2); GPU forks: Erised add-on (Triton/CUDA), gpmeep (CUDA C++) | CuPy-ROCm + Triton-AMD, HIP, or fdtdx | very high | fdtdx route v0.1 done (`fdtd_gpu/`); the add-on route: approved and installed, the AMD port is next |
 | 3 | MPB (band and mode solver) | MPB (GPL-2) | plane-wave basis: FFT + block eigensolver in JAX | medium-high | v0.1 done (own code: `bands_gpu/`) |
 | 4 | Thermal | own finite-volume solver (femwell / scikit-fem as references) | CG on GPU (JAX) | medium | v0.1 done (`thermal_gpu/`) |
 | 5 | ZEMAX (ray + physical optics) | Optiland (MIT, PyTorch) + own physical optics | PyTorch on ROCm | medium | v0.1 done (`optics_gpu/`) |
-| 6 | Charge | own nonlinear Poisson (reverse bias); DEVSIM (Apache-2) for full drift-diffusion | CG on GPU (JAX) | high | v0.1 done for reverse bias (`charge_gpu/`) |
+| 6 | Charge | own nonlinear Poisson (reverse bias); DEVSIM (Apache-2) for full drift-diffusion | CG on GPU (JAX) | high | v0.1 done: reverse bias, and drift-diffusion for forward bias (`charge_gpu/`) |
 | 7 | Tidy3D-like suite | items 1, 3, 4, 6 + fdtdx | JAX on ROCm | very high | v0.1 for cross-sections; 3-D FDTD (fdtdx) and EME adapters (`suite/`) |
 
 "EME" and "FDTD" in the request of the user are items 1 and 2.
@@ -160,12 +175,14 @@ The user asked to start with Meep and meow. After those two, the order is by com
 
 These do not block the work. The agent continues with the default in brackets.
 
-- License of the new code in this public repository. [No LICENSE file yet. Upstream licenses stay with their code.]
-- **Meep on AMD (item 2): may the agent clone the third-party GitHub repository Erised-AI-Inc/meep-gpu
-  (GPL-2.0-or-later) at commit 8993426, install it and run it on the GPU computer?** The auto-mode classifier
-  blocked this. To approve: say so in the session, or allow `bash tools/remote.sh setup-env` with
-  `tools/env/fdtd_gpu.sh`. [Waiting. Item 3 continues meanwhile. Other routes: HIPify the gpmeep C++ fork, or a
-  front end on fdtdx (PyPI).]
+- None open.
+
+Decided (2026-10-30):
+- License: MIT for the code of this repository (user: "Add a open source MIT license to this"). `LICENSE`; the
+  notes on upstream licenses are in `README.md` ("License"), the notices of adapted code in
+  `THIRD_PARTY_NOTICES.md` and the license texts in `LICENSES/`.
+- Add-on route of item 2: approved (user: "Meep add on route: yes clone it, fine"). Installed on the GPU computer
+  (see item 2). The other open route is to HIPify the gpmeep C++ fork.
 
 ## Log
 
@@ -186,8 +203,17 @@ These do not block the work. The agent continues with the default in brackets.
   (user): every test and bench runs on the Ubuntu GPU computer, never on the Mac (`tools/gpu_run.sh`, a GPU lock).
 - 2026-10-30: third wave of four agents: bend modes in meow-gpu, the whole optics pipeline on the GPU, the Gummel
   continuity solves of charge-gpu on the GPU, and `fdtd_gpu/` (an FDTD front end on fdtdx, the third FDTD route).
-  The reviews found blockers: a wrong H half-step shift in fdtd_gpu, no convergence of the charge device at 5 V
+  The reviews found major findings, among them: a wrong H half-step shift in fdtd_gpu, NaN fields or the wrong
+  mode for a 2-D in-plane (EVEN_Z) mode in fdtd_gpu (now an error), no convergence of the charge device at 5 V
   reverse bias and above (a pseudo-inverse on the coarsest level, now LU), warm starts across member kinds in the
-  bend batch. The optics agent found a regression of the meow refinement (SiN tip of the coupling example); the
-  fix adds an admission rule and a fallback to the earlier polish (one review; it found that the first fallback
-  could return a wrong 4th mode as converged; fixed and tested on the grid of the example).
+  bend batch, no test that detects a wrong sign of dz in the optics image sum (test added). The optics agent
+  found a regression of the meow refinement (SiN tip of the coupling example); the fix adds an admission rule and
+  a fallback to the earlier polish (one review; it found that the first fallback could return a wrong 4th mode as
+  converged; fixed and tested on the grid of the example).
+- 2026-10-30: fourth wave: charge-gpu, the coupled Newton step on the GPU (297baf2) and a follow-up (f937f57);
+  optics-gpu, all focus planes in one pass (0bbad9f; the review found a memory budget below the real use, fixed
+  with a test); meow-gpu, the profile of the batched path (88d5158). The user decided: an MIT license, and the
+  add-on route of item 2 (installed on the GPU computer). A review found that `meow_gpu/fde` follows the
+  MIT-licensed mode-solver folder of tidy3d: the notices are now in `THIRD_PARTY_NOTICES.md` and the file headers.
+- 2026-11-07: a usage limit stopped the work for some days; it continues with fdtd_gpu (subpixel averaging) and
+  the add-on port.

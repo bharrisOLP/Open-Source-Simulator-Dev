@@ -26,3 +26,9 @@ Ryzen 7 7800X3D, 16 threads; ROCm 10.1 pip wheels, JAX 0.11.1). "device" is the 
 | `optics-pipeline.jsonl` | `optics_gpu/bench/bench_pipeline.py` (singlet and 4f, 1e5 to 1e7 rays) and the last row from `optics_gpu/examples/coupling_scans_on_device.py` | optics README: the device pipeline table and the scan example |
 | `charge-dd-device.jsonl` | `charge_gpu/bench/bench_dd.py --dx 10e-9 5e-9 --no-diode --no-sweep` (final code, LU coarsest inverse) | charge README: the device continuity table |
 | `fdtd-gpu.jsonl` | `fdtd_gpu/bench/bench_fdtd.py` (Bragg, waveguide 2-D and 3-D, ring, dipole, sheet) | fdtd_gpu README: all check numbers and times |
+| `optics-image-sum.jsonl` | `optics_gpu/bench/bench_image_sum.py --rays 1e5 1e6 1e7 --planes 1 21 41` (rows 1 to 9), and the last row from `optics_gpu/examples/coupling_scans_on_device.py` | optics README: the focus-scan table and the example timings with `image_planes` |
+| `charge-newton-device.jsonl` | `charge_gpu/bench/bench_dd.py --dx 10e-9 5e-9 --no-diode --no-sweep --no-cpu --no-gummel-superlu` | charge README: the Newton comparison (SuperLU, device Newton, device Gummel) |
+| `eme-batch-profiled.jsonl` | `meow_gpu/bench/bench_eme_batch.py --precision single --batches 4,8,16 --repeat 2` and the same with `--precision mixed` (after the profile changes, `OMP_NUM_THREADS=1`) | meow README: the batched EME table |
+| `meow-refine-profiled.jsonl` | `meow_gpu/bench/bench_refine.py --cases double,mixed-refine,single --repeat 2` (after the GMRES layout change) | meow README: the refinement table after the change |
+| `meow-profile-batch.jsonl` | `meow_gpu/bench/profile_batch.py --precision single` and `mixed`, each with `--batch 8` and `--batch 0` | meow README: the "after" columns of the profile table |
+| `meow-kernel-reduce.txt` | `meow_gpu/bench/kernel_reduce.py`, once with `OMP_NUM_THREADS=1` and once without (text output) | meow README: the GMRES layout, Gram kernel and host eigenproblem timings |

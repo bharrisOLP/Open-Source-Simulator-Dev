@@ -75,5 +75,8 @@ adversarial review"). Keep each commit small, so that one review covers it.
   A new dependency must also go into the GPU environment (`tools/env/rocm_jax.sh` or `tools/env/optics_rocm.sh`).
 - Each solver has a CPU reference path and tests that compare GPU against CPU and against an independent solver
   (the upstream tool, an analytic case, or a published number).
-- Keep the license of each upstream project. A fork of a GPL project stays GPL.
+- The code of this repository is MIT-licensed (`LICENSE`; user, 2026-10-30). Keep the license of each upstream
+  project. A fork or a patch of a GPL project stays GPL, in a folder with its own license file. Do not copy code
+  of an LGPL or GPL project into MIT files; write from the published equations and cite them (`README.md`,
+  "License").
 - Write prose in ASD-STE100 Simplified Technical English.

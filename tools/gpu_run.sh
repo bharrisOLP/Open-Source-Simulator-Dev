@@ -5,7 +5,9 @@
 # large run. All tests run on the GPU computer, not on the Mac (user, 2026-10-30). Run it on the GPU computer, from
 # the repository folder:
 #   bash tools/gpu_run.sh <folder> <command...>     for example: bash tools/gpu_run.sh meow_gpu python -m pytest -q
-# The command runs in <folder> with .venv-rocm (.venv-optics for optics_gpu) first on PATH. Variables for the
+# The command runs in <folder> with .venv-rocm (.venv-optics for optics_gpu) first on PATH. For addon_gpu and for
+# the add-on clone (.local/upstream/erised-fork) it uses .local/envs/addon-gpu with the run-time variables of
+# tools/env/addon_gpu_activate.sh (tools/env/addon_gpu.sh makes that environment). Variables for the
 # command go before the script (THERMAL_GPU_DEVICE=cpu bash tools/gpu_run.sh ...). GPU_RUN_TIMEOUT (seconds,
 # default 1800) limits the run time, GPU_LOCK_WAIT (seconds, default 7200) the wait for the lock.
 set -euo pipefail
@@ -14,10 +16,17 @@ usage="usage: bash tools/gpu_run.sh <folder> <command...>"
 cd "$(dirname "$0")/.."
 root=$PWD
 folder=${1%/}
+folder=${folder#./}
 shift
 [[ -d $root/$folder ]] || { echo "gpu_run: no folder $folder" >&2; exit 2; }
 venv=$root/.venv-rocm
-[[ $folder == optics_gpu ]] && venv=$root/.venv-optics
+case $folder in
+  optics_gpu) venv=$root/.venv-optics ;;
+  addon_gpu | addon_gpu/* | .local/upstream/erised-fork | .local/upstream/erised-fork/*)
+    venv=$root/.local/envs/addon-gpu
+    [[ -x $venv/bin/python ]] || { echo "gpu_run: no $venv (run tools/env/addon_gpu.sh)" >&2; exit 2; }
+    source tools/env/addon_gpu_activate.sh ;;
+esac
 mkdir -p "$root/.local"
 export ROCR_VISIBLE_DEVICES=${ROCR_VISIBLE_DEVICES:-0} PYTHONDONTWRITEBYTECODE=1
 export XLA_PYTHON_CLIENT_MEM_FRACTION=${XLA_PYTHON_CLIENT_MEM_FRACTION:-0.8} PATH=$venv/bin:$PATH

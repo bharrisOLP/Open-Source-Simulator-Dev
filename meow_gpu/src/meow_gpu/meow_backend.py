@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: MIT AND Apache-2.0
+# post_process_modes adapts meow.fde.post_process of meow 0.15 (Apache-2.0; author Floris Laporte): each mode keeps
+# its own neff. See THIRD_PARTY_NOTICES.md and LICENSES/Apache-2.0.txt.
 """A drop-in FDE backend for meow: ``compute_modes_gpu(cs, num_modes)`` returns ``meow.Modes``.
 
 It solves the same discrete eigenproblem as ``meow.compute_modes_tidy3d`` (the tidy3d local mode solver), with the

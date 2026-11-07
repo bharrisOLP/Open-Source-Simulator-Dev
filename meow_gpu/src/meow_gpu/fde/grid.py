@@ -1,3 +1,7 @@
+# SPDX-License-Identifier: MIT
+# s_value, s_factors, pml_speeds and axis_stencils follow tidy3d/components/mode/derivatives.py (MIT;
+# Copyright (c) 2021 Flexcompute, Copyright (c) 2019 Tyler Hughes; parts derived from ceviche). See
+# THIRD_PARTY_NOTICES.md and LICENSES/tidy3d-mode-MIT.txt.
 """Yee-grid finite differences with a stretched-coordinate PML, as 1-D stencil coefficients.
 
 Each 1-D derivative operator is bidiagonal. We keep it as two coefficient vectors, so that the GPU can apply it as a

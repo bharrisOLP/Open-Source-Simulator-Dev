@@ -1,7 +1,8 @@
 # Deletion requests (for the user)
 
-The agent does not delete files outside this repository (user rule, 2026-10-30), and the permission hook does not let it delete review records. This list gives the files and
-folders that the agent wants deleted. Review each line, then delete it yourself or reject it.
+The agent does not delete files outside this repository (user rule, 2026-10-30), and the permission hook does not
+let it delete review records. This list gives the files and folders that the agent wants deleted. Review each
+line, then delete it yourself or reject it.
 
 | Date | Computer | Path | Why | Undo |
 |---|---|---|---|---|
@@ -43,3 +44,13 @@ folders that the agent wants deleted. Review each line, then delete it yourself 
 | 2026-10-30 | Mac | `reviews/2026-10-30-ab5ed297a3e6.md` (in this repository, not tracked; the permission hook does not let an agent delete a review record) | an empty review template (verdict TODO) of a diff that was never committed | not needed: the commits have other records |
 | 2026-10-30 | Mac | `reviews/2026-10-30-cd375ece8630.md` (in this repository, not tracked; the permission hook does not let an agent delete a review record) | an empty review template (verdict TODO) of a diff that was never committed | not needed: the commits have other records |
 | 2026-10-30 | Mac | `reviews/2026-10-30-e1c413f7dd06.md` (in this repository, not tracked; the permission hook does not let an agent delete a review record) | an empty review template (verdict TODO) of a diff that was never committed | not needed: the commits have other records |
+| 2026-10-30 | GPU computer | `/tmp/rev_optics4_a.py` | a scratch script of an agent or a reviewer (tests and checks) | not needed: no result depends on it |
+| 2026-10-30 | GPU computer | `/tmp/rev_optics4_mem.py` | a scratch script of an agent or a reviewer (tests and checks) | not needed: no result depends on it |
+| 2026-10-30 | GPU computer | `/tmp/rev_optics4_obs.py` | a scratch script of an agent or a reviewer (tests and checks) | not needed: no result depends on it |
+| 2026-10-30 | GPU computer | `/tmp/rev_charge4_probe.py` | a scratch script of an agent or a reviewer (tests and checks) | not needed: no result depends on it |
+| 2026-10-30 | GPU computer | `/tmp/rev_charge4_probe2.py` | a scratch script of an agent or a reviewer (tests and checks) | not needed: no result depends on it |
+| 2026-10-30 | GPU computer | `/tmp/rev_docs4_env.py` | a scratch script of an agent or a reviewer (tests and checks) | not needed: no result depends on it |
+| 2026-10-30 | GPU computer | `/tmp/rv_post_thread_check.py` | a scratch script of an agent or a reviewer (tests and checks) | not needed: no result depends on it |
+| 2026-10-30 | GPU computer | `/tmp/rv_gmres_layout_check.py` | a scratch script of an agent or a reviewer (tests and checks) | not needed: no result depends on it |
+| 2026-10-30 | GPU computer | `/tmp/rv_omp_order_check.py` | a scratch script of an agent or a reviewer (tests and checks) | not needed: no result depends on it |
+| 2026-10-30 | GPU computer | `/tmp/rev7f37/` (the folder, with `rev7f37_plugin.py` and `rev7f37_probe.py`) and `/tmp/rev7f37_full.log` | scratch files of a reviewer (tests and checks) | not needed: no result depends on them |
