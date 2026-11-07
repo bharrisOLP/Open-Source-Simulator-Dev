@@ -155,6 +155,25 @@ def test_a_device_solve_that_fails_is_not_used(monkeypatch):
         continuity.Solver(m).operator(ref.psi.ravel(), "n", ref.p.ravel()[m.sflat], np.ones(m.n_semi))
     g = dd.solve(dev, 1.0, 0.0, method="gummel", linear="device")
     assert g.converged and g.linear_fallbacks == 2 * g.iterations and g.krylov_iterations == 0
+    assert g.linear_errors == {"SpanError": 2 * g.iterations}
+    assert np.max(np.abs(g.psi - ref.psi)) < 1e-12
+
+
+def test_a_device_error_falls_back_to_superlu(monkeypatch):
+    """A device continuity solve that raises (a RuntimeError, as jax's XlaRuntimeError at a device out of memory):
+    that step uses SuperLU, the error is counted by type in linear_errors and given as a RuntimeWarning; the
+    solution is the Newton solution. (Before, the error went to the caller; sweep() then halved its step.)"""
+    dev, _ = junction(n=200)
+    ref = dd.solve(dev, 1.0, 0.0)
+
+    def fail(*args, **kw):
+        raise RuntimeError("RESOURCE_EXHAUSTED: out of memory (test)")
+
+    monkeypatch.setattr(continuity.Solver, "solve", fail)
+    with pytest.warns(RuntimeWarning, match="device linear solve failed.*out of memory"):
+        g = dd.solve(dev, 1.0, 0.0, method="gummel", linear="device")
+    assert g.converged and g.linear_fallbacks == 2 * g.iterations and g.krylov_iterations == 0
+    assert g.linear_errors == {"RuntimeError": 2 * g.iterations}
     assert np.max(np.abs(g.psi - ref.psi)) < 1e-12
 
 

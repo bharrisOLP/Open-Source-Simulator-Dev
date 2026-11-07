@@ -3,6 +3,8 @@ linear="device"): the ELL product and one linear solve against SuperLU; the whol
 method with SuperLU (the reference) on the long-base diode (and against Shockley), the 1-D junction in reverse
 bias, the PIN phase shifter rib up to high injection and in reverse bias, and the depletion-modulator rib in reverse
 bias; the fallback to SuperLU. The measured values are printed (pytest -s)."""
+import warnings
+
 import jax
 import numpy as np
 import pytest
@@ -52,14 +54,22 @@ def _continuation(dev, biases, step=0.05, **kw):
     return out, steps
 
 
+# the continuation tests: every device solve reaches the FGMRES target RTOL (1e-10; measured at most 9.97e-11), so
+# they are checked to 1e-9 (RTOL with a margin), not only to ACCEPT (1e-6): a weaker preconditioner whose solves
+# stop at 1e-7 would still give converged Newton solutions (inexact Newton steps), and would pass ACCEPT.
+CONTINUATION_RESIDUAL = 1e-9
+
+
 def _check_device_steps(steps):
-    """Every Newton step of every bias was solved on the device (no fallback), to a relative residual of at most
-    ACCEPT. Returns the FGMRES steps, the Newton steps and the largest relative residual."""
+    """Every Newton step of every bias was solved on the device (no fallback, no error), to a relative residual of
+    at most CONTINUATION_RESIDUAL. Returns the FGMRES steps, the Newton steps and the largest relative residual, and
+    prints the FGMRES steps per Newton step."""
     for s in steps:
-        assert s.linear == "device" and s.linear_fallbacks == 0, (s.bias, s.linear_fallbacks)
-        assert 0.0 <= s.linear_error <= coupled.ACCEPT
-    return (sum(s.krylov_iterations for s in steps), sum(s.iterations for s in steps),
-            max(s.linear_error for s in steps))
+        assert s.linear == "device" and s.linear_fallbacks == 0 and not s.linear_errors, (s.bias, s.linear_errors)
+        assert 0.0 < s.linear_error <= CONTINUATION_RESIDUAL, (s.bias, s.linear_error)
+    krylov, newton = sum(s.krylov_iterations for s in steps), sum(s.iterations for s in steps)
+    print(f"\n  FGMRES steps per Newton step: {krylov / newton:.1f}", end="")
+    return krylov, newton, max(s.linear_error for s in steps)
 
 
 @pytest.fixture(scope="module")
@@ -210,10 +220,12 @@ def test_far_starts_without_continuation():
         r = dd.solve(d, v_n, v_p)
         diff = _diff(s, r)
         print(f"\nfar start {v_p - v_n} V ({d.n_net.shape}): Newton steps {s.iterations} (SuperLU {r.iterations}), "
-              f"FGMRES {s.krylov_iterations}, psi {diff[0]:.1e} V, n {diff[1]:.1e}, p {diff[2]:.1e}, "
-              f"I {diff[3]:.1e}, max residual {s.linear_error:.2e}, linear solves {s.timings['linear_s']:.3f} s "
+              f"FGMRES {s.krylov_iterations} ({s.krylov_iterations / s.iterations:.1f} per Newton step), "
+              f"psi {diff[0]:.1e} V, n {diff[1]:.1e}, p {diff[2]:.1e}, I {diff[3]:.1e}, "
+              f"max residual {s.linear_error:.2e}, linear solves {s.timings['linear_s']:.3f} s "
               f"(SuperLU {r.timings['linear_s']:.3f} s)")
-        assert s.converged and s.linear_fallbacks == 0 and s.iterations <= r.iterations + 2
+        assert s.converged and s.linear_fallbacks == 0 and not s.linear_errors
+        assert s.iterations <= r.iterations + 2 and s.linear_error <= coupled.ACCEPT
         assert diff[0] < 1e-12 and diff[1] < 1e-9 and diff[2] < 1e-9, diff
 
 
@@ -232,13 +244,50 @@ def test_a_device_solve_that_fails_is_not_used(monkeypatch):
 
     monkeypatch.setattr(coupled.Solver, "solve", bad)
     g = dd.solve(dev, 0.0, 0.6, linear="device")
-    assert g.converged and g.linear_fallbacks == g.iterations and g.linear_error == 0.0
+    assert g.converged and g.linear_fallbacks == g.iterations and g.linear_error is None and not g.linear_errors
     assert np.max(np.abs(g.psi - ref.psi)) < 1e-12
     monkeypatch.setattr(coupled.Solver, "solve", real)
     monkeypatch.setattr(continuity, "SPAN_MAX", 10.0)
-    g = dd.solve(dev, 0.0, 0.6, linear="device")
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        g = dd.solve(dev, 0.0, 0.6, linear="device")
     assert g.converged and g.linear_fallbacks == g.iterations and g.krylov_iterations == 0
+    assert g.linear_errors == {"SpanError": g.iterations} and g.linear_error is None
+    assert not [w for w in caught if "device linear solve failed" in str(w.message)]     # expected: no warning
     assert np.max(np.abs(g.psi - ref.psi)) < 1e-12
+
+
+@pytest.mark.parametrize("where", ["solve", "setup"])
+def test_a_device_error_falls_back_to_superlu(monkeypatch, where):
+    """A device solve that raises (here a RuntimeError, as jax's XlaRuntimeError at a device out of memory), in the
+    solve or in the setup of the solver: that Newton step uses SuperLU, the error is counted by type in
+    linear_errors and given as a RuntimeWarning, and the solution is the SuperLU solution. sweep() reaches the bias
+    with no step halving (before this change the error went to sweep, which halved the step down to min_step and
+    then reported "did not converge")."""
+    dev, _ = junction(n=200)
+    ref = dd.solve(dev, 0.0, 0.6)
+
+    def fail(*args, **kw):
+        raise RuntimeError("RESOURCE_EXHAUSTED: out of memory (test)")
+
+    monkeypatch.setattr(coupled.Solver, "solve" if where == "solve" else "__init__", fail)
+    with pytest.warns(RuntimeWarning, match="device linear solve failed.*RuntimeError.*out of memory"):
+        g = dd.solve(dev, 0.0, 0.6, linear="device")
+    assert g.converged and g.linear_fallbacks == g.iterations and g.linear_errors == {"RuntimeError": g.iterations}
+    assert g.krylov_iterations == 0 and g.linear_error is None
+    assert np.max(np.abs(g.psi - ref.psi)) < 1e-12
+    calls = []
+    real_solve = dd.solve
+
+    def counted(*args, **kw):
+        calls.append(args[2])
+        return real_solve(*args, **kw)
+
+    monkeypatch.setattr(dd, "solve", counted)
+    with pytest.warns(RuntimeWarning, match="device linear solve failed"):
+        s = dd.sweep(dev, [0.1], step=0.05, linear="device")[0]
+    assert s.converged and s.bias == pytest.approx(0.1) and calls == [0.0, 0.05, 0.1]
+    assert s.linear_errors == {"RuntimeError": s.iterations}
 
 
 def test_solution_info():

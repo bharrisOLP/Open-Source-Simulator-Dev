@@ -36,16 +36,17 @@ Solvers:
   equilibrated. Damping: the step of psi is limited to 10 V_T, a decrease of a carrier density is applied as
   n exp(dn/n) (it stays positive). The linear solver is the option ``linear``: "superlu" (the sparse direct LU of
   SuperLU on the CPU, the reference) or "device" (coupled.py: FGMRES with a block Gauss-Seidel preconditioner in
-  quasi-Fermi variables, one multigrid V-cycle per block, on the JAX device; a device solve that is not converged is
-  replaced by SuperLU for that Newton step and counted in DDSolution.linear_fallbacks).
+  quasi-Fermi variables, one multigrid V-cycle per block, on the JAX device; a device solve that is not converged or
+  that raises an error is replaced by SuperLU for that Newton step and counted in DDSolution.linear_fallbacks).
 - "gummel": the decoupled Gummel iteration. The Poisson step is the nonlinear Poisson equation of poisson.py with
   the quasi-Fermi levels of the last carriers per cell: symmetric positive definite, solved on the device (JAX) with
   multigrid-preconditioned CG. The continuity steps (nonsymmetric) are linear systems for n and then for p, with the
   recombination linearized at the last carriers. Their linear solver is the option ``linear``: "superlu" (sparse
   direct LU on the CPU, the reference) or "device" (continuity.py: the Slotboom form of the SG matrix, BiCGSTAB with
   a multigrid preconditioner as one jitted loop on the JAX device, and a convergence flag from the componentwise
-  backward error of the true residual; a device solve that is not converged is replaced by SuperLU for that step
-  and counted in DDSolution.linear_fallbacks). Robust at low bias; linear convergence (more iterations than Newton).
+  backward error of the true residual; a device solve that is not converged or that raises an error is replaced by
+  SuperLU for that step and counted in DDSolution.linear_fallbacks). Robust at low bias; linear convergence (more
+  iterations than Newton).
 - sweep(): bias continuation from 0 V in steps of at most ``step``, with a halved step after a failed solve.
 
 SI units throughout (doping and carriers in m^-3, currents in A per m of device length along z).
@@ -55,6 +56,7 @@ from __future__ import annotations
 
 import dataclasses
 import time
+import warnings
 from dataclasses import dataclass, field
 
 import jax
@@ -313,38 +315,60 @@ def _scaled_system(m: _Mesh, psi, n, p, tau_n, tau_p):
     return sp.diags(rs) @ js, -rs * f, rs
 
 
+# the errors of a device linear solve that make that step use SuperLU: RuntimeError (also jax's XlaRuntimeError, for
+# example a device out of memory), ValueError (also continuity.SpanError and np.linalg.LinAlgError), ArithmeticError
+# and MemoryError. Other errors (TypeError, ...) are programming errors and propagate.
+DEVICE_ERRORS = (RuntimeError, ValueError, ArithmeticError, MemoryError)
+
+
+def _device_failed(stats, exc):
+    """Count a device linear solve that raised (the caller solves that step with SuperLU), by exception type in
+    stats["errors"]. continuity.SpanError (the span limit of the Slotboom scaling) is an expected case; every other
+    error also gives a RuntimeWarning with its text, so that a device failure is not hidden (sweep() halves its
+    step only for a solve that fails or does not converge, and the fallback makes the solve succeed)."""
+    from charge_gpu.continuity import SpanError
+
+    name = type(exc).__name__
+    stats["errors"][name] = stats["errors"].get(name, 0) + 1
+    if not isinstance(exc, SpanError):
+        warnings.warn(f"device linear solve failed, SuperLU used for this step: {name}: {exc}", RuntimeWarning,
+                      stacklevel=3)
+
+
 def _newton(m: _Mesh, psi, n, p, tau_n, tau_p, tol, max_iter, dpsi_max, linear="superlu"):
     """The coupled Newton method. linear: "superlu" (sparse direct LU on the CPU, the reference) or "device"
     (coupled.Solver: FGMRES with the block multigrid preconditioner on the JAX device). A device solve that is not
-    converged (relative residual above coupled.ACCEPT) or that cannot run (continuity.SpanError) is not used: that
-    step is solved with SuperLU and counted in stats["fallbacks"]. Returns psi, n, p, the iterations, the convergence
-    flag, the last metric and a dict of the linear-solve statistics."""
+    converged (relative residual above coupled.ACCEPT) or that raises one of DEVICE_ERRORS (for example
+    continuity.SpanError, or a device out of memory) is not used: that step is solved with SuperLU and counted in
+    stats["fallbacks"] (and the error in stats["errors"]). Returns psi, n, p, the iterations, the convergence flag,
+    the last metric and a dict of the linear-solve statistics."""
     nc, ns = m.n_cells, m.n_semi
     err = np.inf
-    stats = {"krylov": 0, "fallbacks": 0, "residual": None, "t_assembly": 0.0, "t_linear": 0.0}
+    stats = {"krylov": 0, "fallbacks": 0, "residual": None, "errors": {}, "t_assembly": 0.0, "t_linear": 0.0}
     dev_solver = None
     if linear == "device":
-        from charge_gpu.continuity import SpanError
         from charge_gpu.coupled import Solver
 
-        dev_solver = Solver(m)
-        stats.update(residual=0.0, t_setup=0.0, t_krylov=0.0)
+        stats.update(t_setup=0.0, t_krylov=0.0)
     for it in range(1, max_iter + 1):
         t0 = time.perf_counter()
         js, b, rs = _scaled_system(m, psi, n, p, tau_n, tau_p)
         t1 = time.perf_counter()
         y = None
-        if dev_solver is not None:
+        if linear == "device":
             try:
+                if dev_solver is None:
+                    dev_solver = Solver(m)
                 res = dev_solver.solve(js, b, rs, psi, n, p, tau_n, tau_p)
                 stats["krylov"] += res.iterations
                 stats["t_setup"] += res.setup_s
                 stats["t_krylov"] += res.krylov_s
                 if res.converged:
                     y = res.y
-                    stats["residual"] = max(stats["residual"], res.residual)
-            except SpanError:
-                pass
+                    last = stats["residual"]
+                    stats["residual"] = res.residual if last is None else max(last, res.residual)
+            except DEVICE_ERRORS as exc:
+                _device_failed(stats, exc)
             if y is None:
                 stats["fallbacks"] += 1
         if y is None:
@@ -412,22 +436,20 @@ def _poisson_qf(dev: Device, m: _Mesh, psi, phi_n, phi_p, tol, cg_tol, max_newto
 def _gummel(dev, m: _Mesh, psi, n, p, tau_n, tau_p, tol, max_iter, linear="superlu"):
     """The Gummel iteration. linear: "superlu" (the continuity steps with the sparse direct LU on the CPU, the
     reference) or "device" (continuity.Solver: BiCGSTAB with the Slotboom multigrid on the JAX device). A device solve
-    that is not converged (backward error above continuity.CHECK) or that cannot run (continuity.SpanError) is not
-    used: that step is solved with SuperLU and counted in stats["fallbacks"]. Returns psi, n, p, the iterations, the
-    convergence flag, the last metric and a dict of the linear-solve statistics (the backward error of the last
-    continuity steps, for both linear solvers)."""
+    that is not converged (backward error above continuity.CHECK) or that raises one of DEVICE_ERRORS (for example
+    continuity.SpanError) is not used: that step is solved with SuperLU and counted in stats["fallbacks"] (and the
+    error in stats["errors"]). Returns psi, n, p, the iterations, the convergence flag, the last metric and a dict of
+    the linear-solve statistics (the backward error of the last continuity steps, for both linear solvers)."""
     from charge_gpu.continuity import CHECK
 
     ns, vt, ni = m.n_semi, m.vt, m.n_i
     phi_n, phi_p = np.zeros(m.n_cells), np.zeros(m.n_cells)
     err = np.inf
-    stats = {"cg": 0, "krylov": 0, "backward_error": 0.0, "linear_converged": True, "fallbacks": 0,
+    stats = {"cg": 0, "krylov": 0, "backward_error": 0.0, "linear_converged": True, "fallbacks": 0, "errors": {},
              "t_poisson": 0.0, "t_continuity": 0.0}
     dev_solver = None
     if linear == "device":
-        from charge_gpu.continuity import Solver, SpanError
-
-        dev_solver = Solver(m)
+        from charge_gpu.continuity import Solver
     tiny = 1e-300
 
     def superlu(carrier, other, den):
@@ -438,17 +460,21 @@ def _gummel(dev, m: _Mesh, psi, n, p, tau_n, tau_p, tol, max_iter, linear="super
         return c, omega
 
     def step(carrier, other, den, c_old):
+        nonlocal dev_solver
         res = None
-        if dev_solver is not None:
+        if linear == "device":
             try:
+                if dev_solver is None:
+                    dev_solver = Solver(m)
                 res = dev_solver.solve(psi_new, carrier, other, den, c_old)
                 stats["krylov"] += res.iterations
-            except SpanError:
+            except DEVICE_ERRORS as exc:
+                _device_failed(stats, exc)
                 res = None
         if res is not None and res.converged:
             c, omega = res.c, res.backward_error
         else:
-            if dev_solver is not None:
+            if linear == "device":
                 stats["fallbacks"] += 1
             c, omega = superlu(carrier, other, den)
         stats["backward_error"] = max(stats["backward_error"], omega)
@@ -501,10 +527,12 @@ class DDSolution:
     linear_error: float | None = None  # gummel: the largest componentwise backward error of the last continuity
     #                                    steps (both linear solvers); newton with linear="device": the largest relative
     #                                    residual ||b - J_s y|| / ||b|| of the Newton steps solved on the device
-    #                                    (0.0 when all fell back); newton with SuperLU: None
+    #                                    (None when no device solve was used); newton with SuperLU: None
     linear_converged: bool = True  # gummel: the last continuity steps have a backward error of at most 1e-11
     linear_fallbacks: int = 0      # linear="device": continuity steps (gummel) or Newton steps (newton) solved with
-    #                                SuperLU because the device solve was not converged or could not run
+    #                                SuperLU because the device solve was not converged or raised an error
+    linear_errors: dict = field(default_factory=dict)  # linear="device": the device solves that raised (and were
+    #                                replaced by SuperLU), counted by exception type, for example {"SpanError": 3}
     timings: dict = field(default_factory=dict)   # wall times (s). gummel: the Poisson and continuity steps; newton:
     #                                assembly (the Jacobian on the host) and linear (the solves); linear="device" also
     #                                setup (hierarchies, transfers) and krylov (the FGMRES loops)
@@ -595,6 +623,7 @@ def solve(dev: Device, v_n: float, v_p: float, guess=None, method: str = "newton
                       method=method, device=where, tau_n=tau_n, tau_p=tau_p, mesh=m, linear=linear,
                       krylov_iterations=stats["krylov"], linear_error=stats["backward_error"],
                       linear_converged=stats["linear_converged"], linear_fallbacks=stats["fallbacks"],
+                      linear_errors=stats["errors"],
                       timings={k[2:] + "_s": v for k, v in stats.items() if k.startswith("t_")})
 
 
@@ -603,8 +632,9 @@ def sweep(dev: Device, biases, step: float = 0.05, min_step: float = 1e-3, metho
     """Solutions at the forward biases V = v_p - v_n (v_n = 0; a negative V is a reverse bias), in the given order.
     Continuation from 0 V (started from poisson.solve): steps of at most ``step``, each solve started from the last
     converged solution. A failed solve (not converged, or a RuntimeError or LinAlgError of the linear solver, for
-    example a singular LU factor) halves the step, down to min_step, then RuntimeError. kw goes to solve() (not
-    ``guess``: sweep sets it)."""
+    example a singular LU factor of SuperLU) halves the step, down to min_step, then RuntimeError. An error of a
+    device linear solve (linear="device") does not come here: solve() solves that step with SuperLU, counts it in
+    DDSolution.linear_errors and gives a RuntimeWarning. kw goes to solve() (not ``guess``: sweep sets it)."""
     if "guess" in kw:
         raise ValueError("sweep starts from poisson.solve at 0 V and sets guess itself: do not give guess")
     cur = solve(dev, 0.0, 0.0, method=method, **kw)

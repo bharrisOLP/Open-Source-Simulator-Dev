@@ -13,7 +13,7 @@ row-equilibrated system: each row has the max entry 1, so all rows (minority and
 the same weight. J_s is on the device in ELL form (fixed number of entries per row; a gather and a row sum, no
 atomic adds). One jitted call does one Arnoldi step (the
 preconditioner, the product and the orthogonalization); the host keeps the small Hessenberg matrix and the Givens
-rotations (one transfer of RESTART + 1 numbers per step).
+rotations (two device-to-host transfers per step: the column h, RESTART + 1 numbers, and its norm).
 
 Preconditioner: one block Gauss-Seidel step in quasi-Fermi variables, with one multigrid V-cycle per block.
 - Change of variables (Gummel's decoupling, in linear form): x = dpsi / V_T, a = -dphi_n / V_T, b = dphi_p / V_T.
@@ -27,8 +27,10 @@ Preconditioner: one block Gauss-Seidel step in quasi-Fermi variables, with one m
     M of continuity.py with dR/dn in place of the linearized R, so J_nn = -S_n E_n^-1 (Slotboom form, S_n
     symmetric positive definite) and G_11 a = -S_n (u a), u = n / E_n. One V-cycle on S_n. Holes: G_22 = S_p (v b),
     v = p / F_p.
-  - G_10 and G_20 (the change of the currents with psi at fixed quasi-Fermi levels) are proportional to the
-    current; G_01 = q V n and G_02 = -q V p couple the quasi-Fermi levels into the Poisson rows.
+  - G_10 and G_20 hold the change of the currents with psi at fixed quasi-Fermi levels (proportional to the
+    current) and the change of the recombination, V (dR/dn n - dR/dp p) x (with a minus sign in the electron
+    rows; zero only at equilibrium, n p = n_i^2); G_01 = q V n and G_02 = -q V p couple the quasi-Fermi levels into
+    the Poisson rows.
 - The step: x from the Poisson block; then a from the electron rows with the term of x moved to the right side;
   then b from the hole rows with the terms of x and a. The products with G_10, G_20 and G_21 are products with the
   rows of J_s at T (x, 0, 0) and T (x, a, 0), so no block of G is assembled. The neglected couplings (upper
@@ -42,10 +44,11 @@ true residual (stagnation), or after MAX_ITER steps. A solve is converged (used)
 most ACCEPT = 1e-6 and all values are finite. This is an inexact Newton step (Dembo, Eisenstat and Steihaug, SIAM J.
 Numer. Anal. 19, 400 (1982)): with ||F + J s|| <= eta ||F|| (here in the row-scaled norm, eta <= 1e-6) the Newton
 iteration still converges, at least linearly with a rate of about eta, and the residual F of every Newton step is
-computed exactly on the host. Why not RTOL as the limit: in some Newton steps far from the solution (a reverse-biased
-junction started from poisson.solve) the true residual stagnates at 1e-9 to 1e-8 of ||b|| (probably a round-off
-floor: the preconditioned vectors span many decades). drift_diffusion._newton does not use a solve that is not
-converged: it solves that Newton step with SuperLU and counts it (DDSolution.linear_fallbacks).
+computed exactly on the host. Why not RTOL as the limit: in some Newton steps far from the solution the true
+residual stagnates above RTOL (the 1-D junction at 3 V reverse, started from poisson.solve, in
+tests/test_newton_device.py: a solve at 8.5e-9; probably a round-off floor, as the preconditioned vectors span many
+decades); with RTOL as the limit such a step would use SuperLU. drift_diffusion._newton does not use a solve that is
+not converged: it solves that Newton step with SuperLU and counts it (DDSolution.linear_fallbacks).
 
 Cost: the Jacobian is assembled on the host (as for SuperLU) and copied to the device per Newton step; the three
 hierarchies are built on the host (the coarsening of thermal_gpu.multigrid and a 256-cell LU inverse).
@@ -175,8 +178,8 @@ def fgmres(o: _Ops, b, rtol: float = RTOL, restart: int = RESTART, max_iter: int
     """FGMRES for J_s y = b from y = 0 (o: the device operators). Returns y (device), the steps and the relative
     true residual. A cycle ends when the Givens estimate of the residual reaches rtol, after ``restart`` steps or at
     max_iter; then the true residual is computed. The solve stops when it is at most rtol, or when a cycle did not
-    halve it (stagnation: the round-off floor of the true residual, measured at 1e-9 to 1e-8 of ||b|| in some
-    far-from-solution Newton steps of a reverse-biased junction)."""
+    halve it (stagnation of the true residual, for example at 8.5e-9 of ||b|| in a Newton step of the 3 V far-start
+    test, module docstring)."""
     size = b.shape[0]
     y = jnp.zeros_like(b)
     bnorm = float(jnp.linalg.norm(b))
