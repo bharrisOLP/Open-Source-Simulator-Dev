@@ -348,3 +348,100 @@ def test_bad_inputs():
         zernike_fit(wf, 36, "standard")
     with pytest.raises(ValueError):
         zernike_fit(wf, 400)
+    with pytest.raises(ValueError):
+        fft_mtf(wf, fft_psf(wf, 30))           # 30 < 2 N - 1 = 31: below the full autocorrelation of the pupil
+    assert fft_mtf(wf, fft_psf(wf, 31)).tangential.shape == (15,)
+    with pytest.raises(ValueError):
+        huygens_psf(singlet_at_infinity(), WL, np.zeros(1), np.zeros(1), device="cpu")
+
+
+def test_opd_uses_the_index_of_image_space_at_the_traced_wavelength():
+    """An image surface in a dispersive medium (AbbeMaterial n_d 1.4, V_d 20 between the singlet and the image),
+    traced at 0.4861 um with the primary wavelength 0.5876 um: the OPD against its definition, with Optiland's NumPy
+    trace and the optical path to Optiland's reference sphere (SphericalReference.path_length) at the index of
+    that medium at 0.4861 um. The same definition with the index at 0.5876 um differs (the dispersion matters
+    here), and so does Optiland's Wavefront (it uses the index after the image surface, air here, at the primary
+    wavelength)."""
+    from optiland.materials import AbbeMaterial, IdealMaterial
+    from optiland.optic import Optic
+    from optiland.physical_apertures import RadialAperture
+    from optiland.wavefront import Wavefront
+    from optiland.wavefront.reference_geometry import SphericalReference
+
+    o = Optic()
+    o.add_surface(index=0, thickness=40.0)
+    o.add_surface(index=1, radius=10.0, thickness=3.0, material=IdealMaterial(n=1.5), is_stop=True,
+                  aperture=RadialAperture(r_max=3.0))
+    o.add_surface(index=2, radius=np.inf, thickness=1.0, material=AbbeMaterial(n=1.4, abbe=20.0))
+    o.add_surface(index=3)
+    o.set_aperture(aperture_type="EPD", value=6.0)
+    o.set_field_type(field_type="object_height")
+    o.add_field(y=0.0)
+    o.add_wavelength(value=0.5876, is_primary=True)
+    o.add_wavelength(value=0.4861)
+    o.image_solve()
+    wl, N = 0.4861, 64
+    wf = pupil_wavefront(o, wavelength=wl, n_pupil=N, device="cpu")
+    data = Wavefront(o, fields=[(0.0, 0.0)], wavelengths=[wl], num_rays=N, distribution="uniform").get_data(
+        (0.0, 0.0), wl)
+    p = np.linspace(-1, 1, N)
+    X, Y = np.meshgrid(p, p)
+    ins = X**2 + Y**2 <= 1
+    n_wl = float(np.ravel(o.image_surface.material_pre.n(wl))[0])
+    n_p = float(np.ravel(o.image_surface.material_pre.n(0.5876))[0])
+    sphere = SphericalReference(tuple(float(v) for v in data.reference_center), float(data.radius))
+    chief = o.ray_tracer.trace_generic(0.0, 0.0, np.zeros(1), np.zeros(1), wl, record=False)
+    rays = o.ray_tracer.trace_generic(0.0, 0.0, X[ins].copy(), Y[ins].copy(), wl, record=False)
+
+    def definition(n):
+        p_c = float(chief.opd[0] - sphere.path_length(chief, n)[0])
+        return (p_c - (rays.opd - sphere.path_length(rays, n))) / (wl * 1e-3)
+
+    ok = np.asarray(rays.i) > 0
+    ours = np_(wf.opd).T[ins][ok]
+    d_def = float(np.max(np.abs(ours - definition(n_wl)[ok])))
+    d_primary = float(np.max(np.abs(ours - definition(n_p)[ok])))
+    d_opt = float(np.max(np.abs(ours - np.asarray(data.opd)[ok])))
+    report("dispersive image space", n_wl=n_wl, n_primary=n_p, d_definition=d_def, d_index_at_primary=d_primary,
+           d_optiland=d_opt, w_pv=float(ours.max() - ours.min()))
+    assert n_wl - n_p > 5e-3
+    assert d_def < 1e-9
+    assert d_primary > 1e-3 and d_opt > 1e-3
+
+
+def test_singlet_huygens_peak_depends_on_the_pupil_weights():
+    """Why the peaks of the singlet PSFs differ (review 2026-11-08-1f9108bcd8e3, finding 1). A Debye sum over the
+    pupil grid (pupil 256) with the traced OPD W and the image-side direction cosines (L', M') of each ray, on the
+    80 x 80 points of 1 um of the Huygens test, with two amplitude weights: the same for each entrance-pupil sample
+    (the convention of the FFT PSF and of Optiland's HuygensPSF), and sqrt(J), J = |d(L', M') / d(Px, Py)| (the
+    energy-conserving weight of the image sum, up to the object-side factor of a flat angular spectrum). Each sum
+    is normalized by (sum of the weights)^2, the peak for all samples in phase."""
+    o = aberrated_singlet()
+    N = 256
+    dev = "cuda" if torch.cuda.is_available() else "cpu"
+    wf = pupil_wavefront(o, n_pupil=N, device=dev)
+    PX, PY = np.meshgrid(wf.p, wf.p, indexing="ij")
+    rays = o.ray_tracer.trace_generic(0.0, 0.0, PX.ravel().copy(), PY.ravel().copy(), WL, record=False)
+    Lp, Mp = (np.asarray(v).reshape(N, N) for v in (rays.L, rays.M))
+    J = np.abs(np.gradient(Lp, wf.p, axis=0) * np.gradient(Mp, wf.p, axis=1)
+               - np.gradient(Lp, wf.p, axis=1) * np.gradient(Mp, wf.p, axis=0))
+    use = np_(wf.inside & (wf.intensity > 0))
+    xs = np.linspace(-40.0, 40.0, 80)
+    t = lambda v: torch.as_tensor(np.asarray(v), dtype=torch.float64, device=dev)  # noqa: E731
+    k = 2 * np.pi / WL
+    ex = torch.exp(1j * k * t(xs)[:, None] * t(Lp[use])[None, :])
+    ey = torch.exp(1j * k * t(xs)[:, None] * t(Mp[use])[None, :])
+    w_use = wf.opd[torch.as_tensor(use, device=wf.device)]
+    phase = torch.polar(torch.ones_like(w_use), -2 * np.pi * w_use)
+    peaks = {}
+    for name, w in (("uniform", np.ones(int(use.sum()))), ("sqrt_J", np.sqrt(J[use]))):
+        E = (ex * (t(w) * phase)[None, :]) @ ey.T
+        peaks[name] = float(((E.abs() ** 2).max() / float(w.sum()) ** 2).item())
+    image_sum = float(huygens_psf(o, WL, xs, xs, device=dev).max().item())
+    j_ratio = float(J[use].max() / J[use].min())
+    report("pupil weights", j_ratio=j_ratio, peak_uniform=peaks["uniform"], peak_sqrt_j=peaks["sqrt_J"],
+           peak_image_sum=image_sum, shift=1 - peaks["sqrt_J"] / peaks["uniform"])
+    assert 1.4 < j_ratio < 1.8
+    assert 0.12 < 1 - peaks["sqrt_J"] / peaks["uniform"] < 0.25        # the weights move the peak
+    assert abs(image_sum - peaks["sqrt_J"]) < abs(image_sum - peaks["uniform"])
+    assert abs(image_sum / peaks["sqrt_J"] - 1) < 0.08

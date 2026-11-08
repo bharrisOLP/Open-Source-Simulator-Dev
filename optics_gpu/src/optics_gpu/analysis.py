@@ -1,3 +1,11 @@
+# SPDX-License-Identifier: MIT
+# Parts of this file follow Optiland 0.6.3 (MIT; Copyright (c) 2024 Kramer Harrison): pupil_wavefront follows
+# ChiefRayStrategy.compute_wavefront_data step by step (the reference sphere, the optical path to it, the
+# restored launch-plane phase of an object at infinity, the mask of valid rays), get_working_FNO (the working
+# F-number) and ScalarFFTMTF._get_mtf_frequency_steps (the MTF frequency step); _path_to_sphere follows
+# SphericalReference.path_length; fft_psf follows the padding and the normalization of ScalarFFTPSF. The index of
+# image space differs from Optiland (item 2 of the module docstring). See THIRD_PARTY_NOTICES.md and
+# LICENSES/Optiland-MIT.txt.
 """Image-quality analyses of a lens system on the GPU: the wavefront (OPD) map in the exit pupil, its Zernike fit,
 the FFT PSF, the MTF, and the Huygens PSF of the image sum of optics_gpu.pop as the second PSF method.
 
@@ -14,7 +22,13 @@ Definitions (lengths of Optiland in mm, wavelengths in um, the OPD in waves):
    R is the distance from that point to the paraxial exit-pupil point (Optiland: paraxial.exit_pupil_point_gcs).
    Each ray goes back from its point on the image surface along its direction to the sphere (the root t > 0 of
    |X - t D - C|^2 = R^2 nearest to the image, else the other root); its optical path to the sphere is
-   OPL - n t (n: the index of image space).
+   OPL - n t. n is the index of image space (the medium before the image surface) at the traced wavelength; the
+   same n is in the working F-number (item 5) and the MTF frequency step (item 6). Optiland 0.6.3 uses the medium
+   after the image surface (air by default): at the primary wavelength for the OPD, at the traced wavelength for
+   the working F-number and the MTF frequency step. The results are the same when the two media are the same and,
+   for the OPD, that medium is not dispersive or the traced wavelength is the primary one. For an image in a
+   medium (an immersed image) with air after the image surface they differ: the OPD, and F, the PSF step dx and
+   the MTF axis by the factor n.
 3. OPD: W = (P_chief - P_ray) / lambda, with P the optical path from the object to the reference sphere. W > 0
    where the ray has a shorter optical path than the chief ray. For an object at infinity and an angle field, the
    phase of the incident plane wave across the launch plane is added (n_obj D0 . (X0 - X0_chief)). The pupil
@@ -33,17 +47,24 @@ Definitions (lengths of Optiland in mm, wavelengths in um, the OPD in waves):
    (a: the angle between a marginal ray and the chief ray; mean over the rays that are not clipped).
 6. MTF: |fftshift(fft2(PSF))| normalized at zero frequency; tangential along y (pupil Py), sagittal along x, M // 2
    values each. One pupil sample of lag is the frequency n |D(+1) - D(-1)| / ((N - 1) lambda) (D: the direction of
-   the marginal ray at pupil coordinate +1 or -1; for a flat image surface normal to z). With M >= 2 N the
-   autocorrelation of the pupil does not wrap.
+   the marginal ray at pupil coordinate +1 or -1; for a flat image surface normal to z). The full autocorrelation
+   of the pupil has 2 N - 1 lags: fft_mtf needs M >= 2 N - 1 (a ValueError below), so that the whole
+   autocorrelation is free of wrap. The returned values (up to the cutoff) stay exact down to M = 2 N - 3 (a check
+   in the review reviews/2026-11-08-0e8cf1910c4b.md); the bound keeps a margin.
 
 Items 2 to 6 use the conventions of Optiland 0.6.3 (MIT; its Wavefront "chief_ray" strategy, ZernikeFit,
-ScalarFFTPSF and ScalarFFTMTF), so that the results compare one to one (tests/test_analysis.py). The code is
-written from the equations above.
+ScalarFFTPSF and ScalarFFTMTF), so that the results compare one to one (tests/test_analysis.py, systems with
+air before and after the image surface). The parts named in the notice at the top of this file follow Optiland's
+code. Differences: the index n of item 2 (the conditions of agreement are there), and the PSF peak 1 for a perfect
+pupil (Optiland: 100).
 
 The Huygens PSF (huygens_psf) is the image sum of optics_gpu.pop for a point source (one source sample, a flat
 angular spectrum): E(x, y) = sum_r a_r exp(i k (L'_r x + M'_r y + N'_r dz)), normalized by (sum_r |a_r|)^2, the
 peak for all rays in phase. It is a Debye-type sum over the image-side directions, independent of the pupil grid
-of the FFT method; it needs an object at a finite distance on the axis.
+of the FFT method, with the energy-conserving weights a_r ~ sqrt(J_r) (J: the area ratio of the image-side to
+the object-side direction cosines). The FFT PSF (and Optiland) give each entrance-pupil sample the same amplitude;
+for an aberrated system the two weights give different peaks (tests/test_analysis.py). It needs an object at a
+finite distance on the axis (else a ValueError).
 """
 
 from __future__ import annotations
@@ -160,8 +181,9 @@ def pupil_wavefront(optic, field: tuple[float, float] = (0.0, 0.0), wavelength: 
     hx, hy = float(field[0]), float(field[1])
     # host values of the original optic: the exit-pupil point, the indices of image and object space
     xpp = [_float(v) for v in optic.paraxial.exit_pupil_point_gcs()]
-    n_img = _float(optic.surfaces.n(optic.primary_wavelength)[-1])      # as Optiland's wavefront strategy
-    n_img_wl = abs(_float(optic.image_surface.material_post.n(wl)))     # as Optiland's MTF frequency steps
+    # the index of image space (the medium before the image surface) at the traced wavelength, for the OPD, F and
+    # the MTF step; Optiland 0.6.3 uses the medium after the image surface (see item 2 of the module docstring)
+    n_img = abs(_float(optic.image_surface.material_pre.n(wl)))
     launch = optic.object_surface.is_infinite and isinstance(optic.fields.field_definition, AngleField)
     n_obj = _float(optic.object_surface.material_post.n(wl)) if launch else 1.0
     p = np.linspace(-1.0, 1.0, n_pupil)
@@ -185,13 +207,13 @@ def pupil_wavefront(optic, field: tuple[float, float] = (0.0, 0.0), wavelength: 
         # the working F-number (Optiland's get_working_FNO) and the MTF frequency steps (flat image normal to z)
         D = torch.stack([five.L, five.M, five.N], dim=1)
         cosang = torch.clamp(D[1:] @ D[0], -1.0, 1.0)
-        na2 = (n_img_wl * torch.sin(torch.arccos(cosang))) ** 2
+        na2 = (n_img * torch.sin(torch.arccos(cosang))) ** 2
         ok = five.i[1:] > 0
         mean_na2 = float((na2[ok].mean() if bool(ok.any()) else na2.mean()).item())
         fno = math.inf if mean_na2 <= 0 else 1.0 / (2.0 * math.sqrt(mean_na2))
         fno = min(fno, MAX_FNUM)
         band = torch.stack([D[1, :2] - D[2, :2], D[3, :2] - D[4, :2]]).norm(dim=1)
-        steps = n_img_wl * band / ((n_pupil - 1) * wl * 1e-3)
+        steps = n_img * band / ((n_pupil - 1) * wl * 1e-3)
         freq_step = (float(steps[0].item()), float(steps[1].item()))
         # all rays inside the unit circle, in blocks
         Px = torch.as_tensor(PX[inside_np], **f64)
@@ -350,8 +372,13 @@ class MTF:
 
 
 def fft_mtf(wf: PupilWavefront, psf: FFTPSF) -> MTF:
-    """The MTF of item 6 of the module docstring from the FFT PSF of wf."""
+    """The MTF of item 6 of the module docstring from the FFT PSF of wf. The grid of the PSF must have at least
+    2 N - 1 points (N: the pupil sampling; else a ValueError): the full autocorrelation of the pupil needs them.
+    The returned values stay exact down to 2 N - 3 points (the check in the module docstring)."""
     M = psf.psf.shape[0]
+    if M < 2 * wf.n - 1:
+        raise ValueError(f"grid_size {M} is below 2 N - 1 = {2 * wf.n - 1}: the full autocorrelation of the "
+                         f"pupil needs 2 N - 1 points (use fft_psf(wf) with the default grid 2 N)")
     otf = torch.fft.fftshift(torch.fft.fft2(psf.psf)).abs()
     c = M // 2
     dc = otf[c, c]
@@ -382,16 +409,21 @@ def airy(r_um, na: float, wavelength: float) -> np.ndarray:
 
 
 def huygens_psf(optic, wavelength: float, x_img, y_img, dz: float = 0.0, n_src: int = 64, dx_src: float = 1.0,
-                n_pad: int = 16, na_cut: float = 0.5, device: str = "cuda",
-                trace_chunk: int | None = None) -> torch.Tensor:
+                n_pad: int = 16, na_cut: float = 0.5, device: str = "cuda", trace_chunk: int | None = None,
+                return_bundle: bool = False):
     """The PSF of the on-axis object point by the image sum of optics_gpu.pop (trace_bundle and image_sum):
     |E|^2 / (sum_r |a_r|)^2 on the grid (x_img, y_img) in um, dz um after the image surface. The point source is
     one sample of an n_src x n_src source of pitch dx_src um, padded n_pad times: the direction step is
     lambda / (n_src n_pad dx_src) and the image field repeats with the period n_src n_pad dx_src um (keep the image
-    grid inside it). Directions up to na_cut are traced; the stop of the optic must be a physical aperture."""
+    grid inside it). Directions up to na_cut are traced; the stop of the optic must be a physical aperture. An
+    object at infinity gives a ValueError. return_bundle: also return the RayBundle (its n_rays: the kept rays)."""
+    if optic.object_surface.is_infinite:
+        raise ValueError("huygens_psf needs an object at a finite distance (the image sum traces from an object "
+                         "point); for an object at infinity use fft_psf")
     src = np.zeros((n_src, n_src), complex)
     src[n_src // 2, n_src // 2] = 1.0
     bundle = trace_bundle(optic, src, dx_src, wavelength, na_cut, 0.0, n_pad, device, trace_chunk)
     E = image_sum(bundle, x_img, y_img, dz=dz)
     peak = sum(b[3].abs().sum() for b in bundle.blocks) ** 2
-    return (E.real**2 + E.imag**2) / peak
+    psf = (E.real**2 + E.imag**2) / peak
+    return (psf, bundle) if return_bundle else psf

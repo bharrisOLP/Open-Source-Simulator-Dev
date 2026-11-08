@@ -11,7 +11,9 @@ JSON line with the best of --repeat runs (after one untimed run) of:
 pupil_wavefront + fft_psf + fft_mtf. Each row gives the largest differences from Optiland (OPD in waves, Zernike
 coefficients in waves, PSF in Strehl units, MTF). With --huygens, one more line per N <= 256: Optiland's HuygensPSF
 (pupil N, 80 x 80 points of 1 um) against huygens_psf (the image sum of a point source on the same points),
-after all other rows.
+after all other rows (with the kept rays of the image sum and the rays of HuygensPSF). Each row also logs the clock
+time, the versions of Optiland and PyTorch, and the thread counts of PyTorch and numba with the numba threading
+layer (the rows of benchmarks/2026-11-08/optics-analysis.jsonl do not have these fields).
 
     bash tools/gpu_run.sh optics_gpu python bench/bench_analysis.py --pupil 64 128 256 512 1024
 """
@@ -62,6 +64,22 @@ def np_(t):
     return t.detach().cpu().numpy()
 
 
+def provenance() -> dict:
+    """The clock time, the versions, and the thread counts of PyTorch and numba (numba's threading layer is known
+    only after a parallel numba kernel has run, for example Optiland's HuygensPSF)."""
+    from importlib.metadata import version
+
+    import numba
+
+    try:
+        layer = numba.threading_layer()
+    except ValueError:
+        layer = "not initialized"
+    return {"time": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "optiland": version("optiland"),
+            "torch": torch.__version__, "threads": torch.get_num_threads(), "numba_threads": numba.get_num_threads(),
+            "numba_threading_layer": layer}
+
+
 for N in a.pupil:
     from optiland.mtf import ScalarFFTMTF
     from optiland.psf.fft import ScalarFFTPSF
@@ -102,7 +120,7 @@ for N in a.pupil:
            "ours_fft_mtf_s": t_mtf, "ours_total_s": t_all, "speedup_psf": t_opsf / (t_wf + t_psf),
            "speedup_mtf": t_omtf / (t_wf + t_psf + t_mtf), "d_opd_waves": d_opd, "d_zernike_waves": d_zk,
            "d_psf": d_psf, "d_mtf": d_mtf, "strehl": float(np_(psf.psf).max()),
-           "threads": torch.get_num_threads(), "torch": torch.__version__}
+           **provenance()}
     print(json.dumps(row), flush=True)
 
 # the Huygens rows after all FFT rows: Optiland's HuygensPSF runs numba kernels in parallel, and in a development run
@@ -112,10 +130,12 @@ for N in (n for n in a.pupil if a.huygens and n <= 256):
 
     t_oh, oh = best(lambda: HuygensPSF(optic, FIELD, WL, num_rays=N, image_size=80, pixel_pitch=1e-3))
     xs = np.linspace(float(oh.cx) - 0.04, float(oh.cx) + 0.04, 80) * 1e3
-    t_h, h = best(lambda: huygens_psf(optic, WL, xs, xs, device=a.device))
+    t_h, (h, bundle) = best(lambda: huygens_psf(optic, WL, xs, xs, device=a.device, return_bundle=True))
     I, R = np_(h), np.asarray(oh.psf).T / 100
     corr = float((I * R).sum() / np.sqrt((I**2).sum() * (R**2).sum()))
     print(json.dumps({"system": a.system, "device": a.device, "huygens_pupil": N, "image": 80,
                       "optiland_huygens_s": t_oh, "ours_huygens_s": t_h, "speedup": t_oh / t_h,
                       "correlation": corr, "peak_ours": float(I.max()), "peak_optiland": float(R.max()),
-                      "threads": torch.get_num_threads()}), flush=True)
+                      "image_sum_rays": bundle.n_rays,
+                      "optiland_huygens_rays": int(np.size(oh.get_data(FIELD, WL).opd)),
+                      **provenance()}), flush=True)

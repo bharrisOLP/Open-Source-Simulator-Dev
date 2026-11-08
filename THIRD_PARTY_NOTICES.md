@@ -30,6 +30,16 @@ Version 2.0 (`LICENSES/Apache-2.0.txt`).
 |---|---|---|---|
 | `meow_gpu/src/meow_gpu/meow_backend.py` | `post_process_modes` | `meow.fde.post_process` (`post_process_modes`, `orthonormalize_modes`) | each mode keeps its own neff in the Gram-Schmidt step (meow 0.15 averages them; `docs/upstream-issues.md`) |
 
+## Optiland (MIT)
+
+Source: Optiland 0.6.3 (Kramer Harrison), licensed under the MIT License (`LICENSES/Optiland-MIT.txt`): "Copyright
+(c) 2024 Kramer Harrison". This repository also uses Optiland as an installed library (the ray trace of
+`optics_gpu/`).
+
+| File | Functions | Source |
+|---|---|---|
+| `optics_gpu/src/optics_gpu/analysis.py` | `pupil_wavefront` (the steps of the wavefront data with the chief-ray reference), `_path_to_sphere` (the path to the reference sphere), the working F-number, the MTF frequency step, the restored launch-plane phase of an object at infinity, the padding and normalization of the FFT PSF | Optiland's `ChiefRayStrategy.compute_wavefront_data`, `SphericalReference.path_length`, `get_working_FNO`, `_get_mtf_frequency_steps`, `_restore_launch_phase` and its scalar FFT PSF; this code uses the image-space medium (`material_pre`) where Optiland uses the medium after the image surface (`optics_gpu/README.md`) |
+
 ## Not in this repository
 
 The GPU add-on of the add-on route of FDTD (GPL-2.0-or-later) and the FDTD solver that it extends (GPL-2.0-or-later)
