@@ -272,7 +272,8 @@ class GPUModeSolver:
         of the polish after a warm start, and COLD_SWITCH_TOL after a cold start with the "refine" polish.
 
         Reason (2026-11-07, tests/test_refine.py::test_example_grid_gives_the_modes_of_the_earlier_polish, the SiN
-        tip of examples/chip_to_fiber_coupling.py, cold start): from a cold start the complex64 Davidson stopped at
+        tip of tests/structures.sin_tip, the structure of examples/chip_to_fiber_coupling.py before 2026-11-07, cold
+        start): from a cold start the complex64 Davidson stopped at
         1e-3 before a near-degenerate pair of window modes nearer the target (neff 1.4418809, 1.4418766) was in its
         block. Then the refinement either stalled (the fallback gave the right modes) or converged to the next pair
         (1.4412281, 1.4411957), and the BLAS thread count decided which: with OPENBLAS_NUM_THREADS=1 at the start of

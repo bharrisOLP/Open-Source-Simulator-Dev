@@ -12,7 +12,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 import scipy.sparse.linalg as sla
-from structures import coupler, sin_tip, strip
+from structures import N_SIN, coupler, sin_tip, strip
 
 import meow_gpu.fde.eigensolver as eigensolver
 from meow_gpu.device import put
@@ -273,6 +273,26 @@ def test_complex128_precisions_need_x64(strip_case):
         jax.config.update("jax_enable_x64", True)
 
 
+@pytest.mark.parametrize("dx,edge,centre", [(0.05, (-0.10, 0.15), (-0.125, 0.125)),
+                                            (0.1, (-0.1, 0.1), (-0.05, 0.15))])
+def test_sin_tip_core_is_the_documented_one(dx, edge, centre):
+    """The core of ``structures.sin_tip`` (the docstring): the range of its edge and centre samples on each axis,
+    one sample off the mirror symmetry (the rounding of np.arange). Host arrays only, no solve."""
+    exx, eyy, ezz, g, _ = sin_tip(dx=dx)
+    xc, xe = 0.5 * (g[1:] + g[:-1]), g[:-1]
+
+    def span(e, axis, coords):
+        inside = np.any(np.abs(e - N_SIN**2) < 1e-9, axis=1 - axis)
+        return coords[inside].min(), coords[inside].max(), int(inside.sum())
+
+    n = round((edge[1] - edge[0]) / dx) + 1
+    m = round((centre[1] - centre[0]) / dx) + 1
+    for e, axis, coords, want, count in ((exx, 0, xc, centre, m), (exx, 1, xe, edge, n), (eyy, 0, xe, edge, n),
+                                         (eyy, 1, xc, centre, m), (ezz, 0, xe, edge, n), (ezz, 1, xe, edge, n)):
+        lo, hi, k = span(e, axis, coords)
+        assert np.allclose([lo, hi], want, atol=1e-9) and k == count
+
+
 def test_weakly_guided_mode_converges():
     """Regression (2026-10-30, examples/chip_to_fiber_coupling.py): a weakly guided SiN tip mode just above a dense
     band of window modes. The refinement alone stalls at a residual of about 3e-10 (the halving rule stops it; before
@@ -308,8 +328,9 @@ def test_weakly_guided_mode_converges():
 
 @pytest.fixture(scope="module")
 def example_tip():
-    """The grid of examples/chip_to_fiber_coupling.py (the SiN tip on 50 nm, 280 x 280 cells, 4 modes, extra 8) and
-    the references: the earlier polish and the double solve."""
+    """The grid of examples/chip_to_fiber_coupling.py (the SiN tip on 50 nm, 280 x 280 cells, 4 modes, extra 8; the
+    structure of that example before 2026-11-07, with the core of ``structures.sin_tip``) and the references: the
+    earlier polish and the double solve."""
     p = make_problem(*sin_tip(dx=0.05), 1.55)
     old = GPUModeSolver(precision="mixed", polish="davidson", extra=8, warm_start=False)
     ref_old = old.solve(p, K)
@@ -345,6 +366,29 @@ def test_example_grid_gives_the_modes_of_the_earlier_polish(example_tip, monkeyp
         assert np.all(_cos(e[:2], ref[:2]) > 1 - 1e-6)
         qa, qb = np.linalg.qr(_unit(e[2:4]).T)[0], np.linalg.qr(_unit(ref[2:4]).T)[0]
         assert np.linalg.svd(qa.conj().T @ qb, compute_uv=False).min() > 1 - 1e-6
+
+
+@pytest.mark.parametrize("admission", [True, False])
+def test_warm_start_on_the_example_grid(example_tip, monkeypatch, admission):
+    """A warm start on the near-degenerate tip of ``example_tip``: from the modes of a tip of side 0.28 um on the same
+    grid. After a warm start the complex64 stage stops at REFINE_SWITCH_TOL (1e-3), where the refinement alone can
+    converge to the wrong pair (see the cold-start test above). The review of 2026-11-07 found the right modes in 14
+    warm starts (1 BLAS thread, admission on and off), each one through the fallback; this test keeps the warm path
+    under test, with and without the admission rule: the 4 neff of the earlier polish and of the double solve."""
+    import meow_gpu.meow_backend as backend
+    p, (n_old, _, _), (n_dbl, _, _) = example_tip
+    if not admission:
+        track = eigensolver._track
+        monkeypatch.setattr(eigensolver, "_track", lambda vals, prev, rn_vals=None, target=0.0: track(vals, prev))
+    seen = []
+    solve = backend.davidson
+    monkeypatch.setattr(backend, "davidson", lambda *a, **kw: seen.append(kw["switch_tol"]) or solve(*a, **kw))
+    s = GPUModeSolver(precision="mixed", extra=8)
+    s.solve(make_problem(*sin_tip(dx=0.05, side=0.28), 1.55), K)     # cold: the warm-start memory of s
+    n, _, _ = s.solve(p, K)
+    assert seen == [COLD_SWITCH_TOL, REFINE_SWITCH_TOL]
+    assert s.last_info.warm and s.last_info.converged
+    assert np.max(np.abs(n - n_old)) < 1e-9 and np.max(np.abs(n - n_dbl)) < 1e-9
 
 
 def test_cold_start_uses_the_switch_of_the_earlier_polish(strip_case, monkeypatch):

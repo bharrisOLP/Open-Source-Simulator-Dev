@@ -278,25 +278,64 @@ def test_host_pool_keeps_one_blas_thread():
         assert blas_threads() == before
 
 
-def test_host_pool_without_a_blas_limit(monkeypatch):
+@pytest.fixture
+def small_pool(monkeypatch):
+    """The module ``meow_gpu.fde.eigensolver`` with HOST_THREADS = 4 and a new pool for one test; after the test the
+    new pool stops, and the pool and HOST_THREADS of the module come back."""
+    import meow_gpu.fde.eigensolver as E
+    monkeypatch.setattr(E, "HOST_THREADS", 4)
+    monkeypatch.setattr(E, "_POOL", None)
+    yield E
+    if E._POOL is not None:
+        E._POOL.shutdown(wait=True)
+
+
+def _thread_name():
+    import threading
+    return threading.current_thread().name
+
+
+def test_host_pool_without_a_blas_limit(small_pool, monkeypatch):
     """Without threadpoolctl and without OMP_NUM_THREADS=1, the host steps run in the main thread, with a warning;
     with OMP_NUM_THREADS=1 they run in the pool."""
     import threading
-
-    import meow_gpu.fde.eigensolver as E
+    E = small_pool
     monkeypatch.setattr(E, "ThreadpoolController", None)
-    monkeypatch.setattr(E, "HOST_THREADS", 4)
     monkeypatch.setattr(E, "_WARNED", [False])
     monkeypatch.delenv("OPENBLAS_NUM_THREADS", raising=False)
     monkeypatch.setenv("OMP_NUM_THREADS", "4")
-
-    def name():
-        return threading.current_thread().name
-
     with pytest.warns(UserWarning, match="run in one thread"):
-        assert E._host_map(name, [()] * 3) == [threading.main_thread().name] * 3
+        assert E._host_map(_thread_name, [()] * 3) == [threading.main_thread().name] * 3
     monkeypatch.setenv("OMP_NUM_THREADS", "1")
-    assert all(n.startswith("meow-gpu-host") for n in E._host_map(name, [()] * 3))
+    assert all(n.startswith("meow-gpu-host") for n in E._host_map(_thread_name, [()] * 3))
+
+
+@pytest.mark.parametrize("layer,per_worker", [("pthreads", False), ("openmp", True)])
+def test_host_pool_blas_limit_by_threading_layer(small_pool, monkeypatch, layer, per_worker):
+    """The scope of the BLAS limit (threadpoolctl): a BLAS with pthreads has one process-wide thread count, so the
+    calling thread sets the limit once (with the lock); an OpenMP BLAS has a count for each thread, so each pool
+    worker sets its own limit. A controller stand-in records the thread that enters each limit."""
+    import contextlib
+    import threading
+    E = small_pool
+    entered = []
+
+    class Controller:
+        def info(self):
+            return [{"user_api": "blas", "internal_api": "openblas", "num_threads": 8, "threading_layer": layer}]
+
+        def limit(self, limits, user_api):
+            entered.append((threading.current_thread().name, limits, user_api, E._HOST_LOCK.locked()))
+            return contextlib.nullcontext()
+
+    monkeypatch.setattr(E, "ThreadpoolController", Controller)
+    monkeypatch.setattr(E, "_BLAS", Controller())
+    names = E._host_map(_thread_name, [()] * 3)
+    assert all(n.startswith("meow-gpu-host") for n in names)
+    if per_worker:
+        assert len(entered) == 3 and all(e[0].startswith("meow-gpu-host") and e[1:3] == (1, "blas") for e in entered)
+    else:
+        assert entered == [(threading.main_thread().name, 1, "blas", True)]
 
 
 def test_compute_modes_gpu_batch_with_two_grid_shapes_and_a_fallback_cell(monkeypatch):

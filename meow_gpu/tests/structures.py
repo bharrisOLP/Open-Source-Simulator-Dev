@@ -43,9 +43,24 @@ def coupler(core=11, height=0.22, gap=40, margin=25, n_core=N_SI, n_clad=N_SIO2,
 
 
 def sin_tip(half=7.0, dx=0.1, side=0.3, n_core=N_SIN, n_clad=N_SIO2):
-    """A small square SiN core (side x side um) in SiO2, in a square window of +-half um: a weakly guided mode
-    (neff about 1.448 at 1.55 um, cladding 1.444) just above a dense band of window modes. The structure of
-    examples/chip_to_fiber_coupling.py on a coarser grid (that example: dx = 0.05)."""
+    """A small SiN core (about side x side um) in SiO2, in a square window of +-half um: a weakly guided mode (neff
+    about 1.448 at 1.55 um, cladding 1.444) just above a dense band of window modes. The structure of
+    examples/chip_to_fiber_coupling.py before 2026-11-07, when that example also used this construction (since then
+    it uses integer cell indices and a symmetric core with partial cells).
+
+    The real core is not symmetric. A sample is in the core when its coordinate c (a cell centre or a cell edge, by
+    the eps component) satisfies |c| < side / 2 in floating point, and the coordinates of np.arange are not exact:
+    the sample at +side/2 is in the core and the one at -side/2 is not. With the defaults (side 0.3 um):
+
+    - dx = 0.05 (280 x 280 cells): the edge samples of the core run from -0.10 to +0.15 um (6 samples: x of eps_yy
+      and eps_zz, y of eps_xx and eps_zz); the centre samples from -0.125 to +0.125 um (6 samples).
+    - dx = 0.1 (140 x 140 cells): the centre samples run from -0.05 to +0.15 um (3 samples: x of eps_xx, y of
+      eps_yy); the edge samples from -0.1 to +0.1 um (3 samples).
+
+    So the core has no mirror symmetry, and its centre is not at the origin. It is a valid synthetic structure (each
+    test compares solvers on the same eps arrays), and the tests of the refinement need it: its near-degenerate
+    pairs of window modes gave the regressions of 2026-10-30 and 2026-11-07. ``tests/test_refine.py`` checks this
+    description (``test_sin_tip_core_is_the_documented_one``)."""
     g = np.arange(-half, half + 1e-9, dx)
     xc, xe = 0.5 * (g[1:] + g[:-1]), g[:-1]
 

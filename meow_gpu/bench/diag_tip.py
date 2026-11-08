@@ -1,8 +1,15 @@
 """Diagnosis of tests/test_refine.py::test_example_grid_gives_the_modes_of_the_earlier_polish (development tool): the
-SiN tip of examples/chip_to_fiber_coupling.py on its 50 nm grid, "mixed" with and without the admission rule of
-``_track``, against the earlier polish and the double solve, at several BLAS thread counts (threadpoolctl).
+SiN tip of ``tests/structures.sin_tip`` (the structure of examples/chip_to_fiber_coupling.py before 2026-11-07) on
+the 50 nm grid, "mixed" with and without the admission rule of ``_track``, against the earlier polish and the
+double solve, at the BLAS thread counts of --threads (threadpoolctl, changed while the process runs).
 
-    python bench/diag_tip.py --threads 4,1 --repeat 2
+    OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=1 python bench/diag_tip.py --threads 1 --repeat 1 --switch-tols 1e-3
+    OPENBLAS_NUM_THREADS=4 OMP_NUM_THREADS=4 python bench/diag_tip.py --threads 4,1 --repeat 2
+
+A reproduction of the defect of 2026-11-07 needs the thread count in the environment when the process starts:
+OPENBLAS_NUM_THREADS=1 gave the wrong pair with the admission rule (with --switch-tols 1e-3, the stop before the
+cold-start rule), 4 threads only without it. A thread count changed while the process runs (--threads) gave the
+results of the count at the start (RX 7900 XT computer).
 
 One JSON line for each solve: the BLAS threads, the case, the polish that was used, convergence, the residual,
 the iterations, the neff and the differences against the references of the same thread count.

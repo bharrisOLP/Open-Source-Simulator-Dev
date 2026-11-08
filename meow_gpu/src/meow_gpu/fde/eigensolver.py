@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import contextlib
 import os
+import threading
 import warnings
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
@@ -590,6 +591,12 @@ def davidson(op: DeviceOperator | tuple[DeviceOperator, DeviceOperator], pc: Pre
     polish ("mixed" only): "refine" (the mixed-precision refinement, ``refine``) or "davidson" (a complex128
         Davidson with a subspace of 3 blocks). switch_tol: the residual at which the complex64 Davidson stops
         (default: REFINE_SWITCH_TOL or DAVIDSON_SWITCH_TOL). inner: the GMRES steps of each correction solve.
+
+    The default stop of "refine" (REFINE_SWITCH_TOL, 1e-3) is for a warm block (the modes of a similar problem).
+    For a random block, give ``switch_tol=DAVIDSON_SWITCH_TOL``, as ``GPUModeSolver`` does after a cold start
+    (``meow_backend.COLD_SWITCH_TOL``): from a random block the complex64 stage can stop at 1e-3 before a
+    near-degenerate pair nearer the target is in the block, and the refinement can then converge to the next pair
+    (2026-11-07, tests/test_refine.py::test_example_grid_gives_the_modes_of_the_earlier_polish).
     """
     b = x0.shape[0]
     if b < k:
@@ -679,26 +686,38 @@ HOST_THREADS = max(1, min(8, os.cpu_count() or 1))
 _POOL: ThreadPoolExecutor | None = None
 _BLAS = None              # the threadpoolctl controller (made at the first call of the pool)
 _WARNED = [False]
+_HOST_LOCK = threading.Lock()   # one caller of the pool at a time while a process-wide BLAS limit holds
+_SERIAL_LAYERS = ("pthreads", "disabled", "sequential")   # threadpoolctl threading layers with a process-wide count
 
 
 def _blas_limit():
-    """A context that keeps the BLAS of numpy at one thread while the host thread pool runs, or None when that is
-    not possible (no threadpoolctl, and neither OPENBLAS_NUM_THREADS nor OMP_NUM_THREADS is 1).
+    """How the host thread pool keeps the BLAS of numpy at one thread: (a function that gives the limit context,
+    per_worker), or None when that is not possible (no threadpoolctl, and neither OPENBLAS_NUM_THREADS nor
+    OMP_NUM_THREADS is 1; this branch reads the variables when it runs, so it cannot see a variable that was set
+    after numpy loaded).
 
     Reason (bench/kernel_reduce.py, 8 eigenproblems of 72 x 72 on the CPU of the RX 7900 XT computer): with the
     default OpenBLAS threads, a pool of 8 threads took 102 ms against 48 ms in one thread (the logged run), and 45 ms
     against 50 ms (the run of the review); with one BLAS thread, set before numpy loads, the pool took 5.4 ms.
-    threadpoolctl changes the thread count of the BLAS for the whole process, so the limit holds only while the main
-    thread waits for the pool."""
+
+    Scope of the limit (threadpoolctl 3.8, "Known limitations"): for a BLAS with pthreads (the PyPI wheels of numpy
+    and scipy: OpenBLAS with pthreads) the thread count is a setting of the whole process. Then the calling thread
+    sets the limit while it waits for the pool (per_worker False), and ``_HOST_LOCK`` lets one caller at a time do
+    this (two solvers in two threads could otherwise keep the limited count as the count to restore). For an OpenMP
+    BLAS (OpenBLAS-OpenMP, MKL) the count is a setting of each thread: then each pool worker sets its own limit
+    (per_worker True). While a process-wide limit holds, other threads of the process (for example the
+    post-processing thread of ``compute_modes_gpu_batch``) also run their BLAS with one thread."""
     global _BLAS
     if ThreadpoolController is not None:
         if _BLAS is None:
             _BLAS = ThreadpoolController()
-        if all(i["num_threads"] == 1 for i in _BLAS.info() if i["user_api"] == "blas"):
-            return contextlib.nullcontext()
-        return _BLAS.limit(limits=1, user_api="blas")
+        blas = [i for i in _BLAS.info() if i["user_api"] == "blas"]
+        if all(i["num_threads"] == 1 for i in blas):
+            return contextlib.nullcontext, False
+        per_worker = any(i.get("threading_layer") not in _SERIAL_LAYERS for i in blas)
+        return (lambda: _BLAS.limit(limits=1, user_api="blas")), per_worker
     env = os.environ.get("OPENBLAS_NUM_THREADS", os.environ.get("OMP_NUM_THREADS"))
-    return contextlib.nullcontext() if env == "1" else None
+    return (contextlib.nullcontext, False) if env == "1" else None
 
 
 def _host_map(f, args: list[tuple]) -> list:
@@ -707,17 +726,23 @@ def _host_map(f, args: list[tuple]) -> list:
     global _POOL
     if len(args) < 2 or HOST_THREADS < 2:
         return [f(*a) for a in args]
-    limit = _blas_limit()
-    if limit is None:
+    how = _blas_limit()
+    if how is None:
         if not _WARNED[0]:
             _WARNED[0] = True
             warnings.warn("meow_gpu: the host steps of the batched solve run in one thread. For the thread pool, "
                           "install threadpoolctl, or set OMP_NUM_THREADS=1 before numpy is imported (a pool with a "
                           "multi-threaded BLAS was up to 2x slower than one thread).", stacklevel=2)
         return [f(*a) for a in args]
+    limit, per_worker = how
     if _POOL is None:
         _POOL = ThreadPoolExecutor(HOST_THREADS, thread_name_prefix="meow-gpu-host")
-    with limit:
+    if per_worker:
+        def run(a):
+            with limit():
+                return f(*a)
+        return list(_POOL.map(run, args))
+    with _HOST_LOCK, limit():
         return list(_POOL.map(lambda a: f(*a), args))
 
 
@@ -927,7 +952,7 @@ def _davidson_batch_fixed(op: DeviceOperator, pc: Preconditioner, k: int, target
 
 def davidson_batch(op: DeviceOperator | tuple[DeviceOperator, DeviceOperator], pc: Preconditioner, k: int,
                    target, x0: jax.Array, tol=1e-10, max_iter=300, max_subspace: int | None = None,
-                   precision: str = "mixed", switch_tol: float | None = None, verbose: bool = False,
+                   precision: str = "mixed", switch_tol: float | np.ndarray | None = None, verbose: bool = False,
                    polish: str = "refine", inner: int = REFINE_INNER) -> BatchEigResult:
     """The k eigenpairs nearest the target of each of B problems with the same grid shape, solved at the same time.
 
@@ -936,7 +961,9 @@ def davidson_batch(op: DeviceOperator | tuple[DeviceOperator, DeviceOperator], p
     pc: a batched preconditioner (``stack`` of B preconditioners).
     target, tol, max_iter: one value for all members, or an array of B values.
     x0: (B, b, 2, Nx, Ny), b >= k: the initial block of each member.
-    polish, switch_tol, inner: as for ``davidson``.
+    polish, inner: as for ``davidson``. switch_tol: as for ``davidson``, one value for all members or an array of B
+        values (``GPUModeSolver.solve_batch`` gives COLD_SWITCH_TOL to the members with a cold start); the default
+        stop of "refine" is for warm blocks (see ``davidson``).
 
     Each member does the steps of ``davidson`` on its own problem (the same precision modes and stall rule); the
     device kernels run on all members together. Exception: the "refine" polish runs member after member (``refine``

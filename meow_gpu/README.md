@@ -95,7 +95,11 @@ tolerance is capped at 1e-3 with a warning.
 case with the mode-solve time, |S21|, max |dneff| against the per-cell run and the iterations). On the RX 7900 XT,
 with the changes of "Profile of the batched path" below (`--precision single --batches 4,8,16 --repeat 2` and the
 same with `--precision mixed`; the second run, after compilation; `OMP_NUM_THREADS=1`; the mixed columns use the
-refinement, the default polish; rows in `benchmarks/2026-10-30/eme-batch-profiled.jsonl`):
+refinement, the default polish; rows in `benchmarks/2026-10-30/eme-batch-profiled.jsonl`). These rows are from the
+code of commit 88d5158, before the cold-start stop of 2026-11-07 ("Cold starts" below): the single columns do not
+depend on it; in the mixed columns the cold first cell and the cold first batch now go to 2e-5 (B = 8 with
+`OMP_NUM_THREADS=4`: first batch 72 instead of 46 iterations, 7.17 s against 7.11 s; per cell 8.04 s against
+8.13 s; `benchmarks/2026-11-07/meow-cold-switch.jsonl`). B = 4 and 16 were not measured again.
 
 | Case | single: mode solves | single: max \|dneff\| | mixed: mode solves | mixed: max \|dneff\| | Batch iterations |
 |---|---|---|---|---|---|
@@ -111,8 +115,8 @@ the complex64 tolerance (the bound of `tests/test_batch.py` is 2e-5); the mixed-
 complex128 tolerance. Against the earlier rows below, the mode solves of the taper take 2.40 s instead of 5.53 s in
 single precision (B = 4 against the earlier per-cell run), and 6.60 s instead of 11.72 s in mixed precision (B = 4
 against the per-cell refinement row of "Mixed-precision refinement"). B = 16 is slower than B = 8: the cold first
-batch (52 iterations in single, 49 in mixed precision) is a larger part of 2 batches, and 15 members of a cold
-batch do the work of 15 cold cells.
+batch (52 iterations in single, 49 in mixed precision with the code of 88d5158) is a larger part of 2 batches, and
+15 members of a cold batch do the work of 15 cold cells.
 
 Earlier rows (the code of commit 0fabc92, OpenBLAS with its default threads, rows in
 `benchmarks/2026-10-30/eme-batch.jsonl`):
@@ -256,7 +260,8 @@ Why the batched path gains less in mixed precision, and what was not changed:
 
 ## Mixed-precision refinement (the default polish of `mixed`, 2026-10-30)
 
-`fde.eigensolver.refine`. The complex64 Davidson stops at a residual of 1e-3 (`REFINE_SWITCH_TOL`). Then each step:
+`fde.eigensolver.refine`. After a warm start the complex64 Davidson stops at a residual of 1e-3
+(`REFINE_SWITCH_TOL`); after a cold start at `COLD_SWITCH_TOL` (2e-5; see "Cold starts" below). Then each step:
 
 1. complex128 Rayleigh-Ritz on the subspace [Q, T] (two blocks: an orthonormal basis Q of the last Ritz vectors, and
    the last corrections T) and the complex128 residuals. The stop test is that of the complex128 Davidson (the
@@ -311,20 +316,22 @@ refine_inner=...)` changes the two parameters.
 
 **Cold starts (2026-11-07).** After a cold start (no warm-start vectors), the complex64 stage of `refine` stops at
 `COLD_SWITCH_TOL` (2e-5, the stop of the earlier polish) instead of 1e-3 (`GPUModeSolver._switch_tol`; also for each
-cold member of a batch; a given `switch_tol` is kept). Reason: the protection above was not stable. On the 50 nm
-grid of the example (cold start), the complex64 stage stopped at 1e-3 before the near-degenerate pair at neff
-1.4418809 / 1.4418766 was in its block. Then the refinement either stalled (the fallback gave the right modes) or
-converged to the next pair (1.4412281, 1.4411957), and the BLAS decided which: with `OPENBLAS_NUM_THREADS=1` at
-the start of the process it converged to the wrong pair also with the admission rule; with 4 threads only without
-the admission rule; the code of commit f8c16ec gave the same results (`bench/diag_tip.py` and the test, RX 7900 XT
-computer). The BLAS thread count changed while the process ran (threadpoolctl, 1 to 4 threads) gave the same
-results as the count at the start. With the stop at 2e-5, the test passes with 1 and with 4 BLAS threads. A warm
-start (the next cell of a taper) keeps the stop at 1e-3: on the 30-cell taper the change costs nothing measurable
-(`bench_refine.py --cases double,mixed-refine --repeat 2`, with `OMP_NUM_THREADS=4`: 8.04 s, 497 iterations,
-1724 complex128 applies, against 8.13 s, 489 iterations, 1736 applies, with `--switch-tol 1e-3`; max |dneff|
-against double 2.1e-12 and 1.7e-12; `bench_eme_batch.py --precision mixed --batches 8 --repeat 2`: 7.17 s against
-7.11 s, 126 against 104 batch iterations, the extra iterations in the cold first batch; rows in
-`benchmarks/2026-11-07/meow-cold-switch.jsonl`, the same commands without and with `--switch-tol 1e-3`).
+cold member of a batch; a given `switch_tol` is kept). Reason: the protection above was not stable. On the SiN tip
+of the tests (`tests/structures.sin_tip` on the 50 nm grid: the structure of the example before 2026-11-07, with a
+core one sample off its mirror symmetry; see the docstring), from a cold start, the complex64 stage stopped at 1e-3
+before the near-degenerate pair at neff 1.4418809 / 1.4418766 was in its block. Then the refinement either stalled
+(the fallback gave the right modes) or converged to the next pair (1.4412281, 1.4411957), and the BLAS decided
+which: with `OPENBLAS_NUM_THREADS=1` at the start of the process it converged to the wrong pair also with the
+admission rule; with 4 threads only without the admission rule; the code of commit f8c16ec gave the same results
+(`bench/diag_tip.py` and the test, RX 7900 XT computer). The BLAS thread count changed while the process ran
+(threadpoolctl, 1 to 4 threads) gave the same results as the count at the start. With the stop at 2e-5, the test
+passes with 1 and with 4 BLAS threads. A warm start (the next cell of a taper) keeps the stop at 1e-3: on the
+30-cell taper the change costs nothing measurable (`bench_refine.py --cases double,mixed-refine --repeat 2`, with
+`OMP_NUM_THREADS=4`: 8.04 s, 497 iterations, 1724 complex128 applies, against 8.13 s, 489 iterations, 1736 applies,
+with `--switch-tol 1e-3`; max |dneff| against double 2.1e-12 and 1.7e-12; `bench_eme_batch.py --precision mixed
+--batches 8 --repeat 2`: 7.17 s against 7.11 s, 126 against 104 batch iterations, the extra iterations in the cold
+first batch; rows in `benchmarks/2026-11-07/meow-cold-switch.jsonl`, the same commands without and with
+`--switch-tol 1e-3`).
 
 **Checks** (`tests/test_refine.py`; the numbers below are from the same cases on the RX 7900 XT, run through
 `tools/gpu_run.sh`). 4 modes and 4 extra block vectors. The agreement columns are those of the refinement; the last
@@ -507,9 +514,12 @@ cells instead of 0.952 / 0.955, and the 3-D FDTD of the same taper gives 0.9961 
   GMRES time), and faster inner products (the Gram matrices with a long contraction run far below the peak rate of
   the card).
 - The host thread pool of the batched solve needs one BLAS thread. With threadpoolctl, the library sets it while
-  the pool runs. Without threadpoolctl, set `OMP_NUM_THREADS=1` before the import of numpy; else the host steps
-  run in one thread (with a warning). With the default OpenBLAS threads, the pool gained nothing in one run and was
-  up to 2x slower than one thread in another run.
+  the pool runs: for a BLAS with pthreads (the PyPI wheels) the calling thread sets the process-wide count, one
+  caller at a time (a lock), and other threads of the process also run their BLAS with one thread meanwhile; for an
+  OpenMP BLAS (a count for each thread) each pool worker sets its own limit (`_blas_limit`; the OpenMP path is
+  tested with a stand-in controller only). Without threadpoolctl, set `OMP_NUM_THREADS=1` before the import of
+  numpy; else the host steps run in one thread (with a warning). With the default OpenBLAS threads, the pool gained
+  nothing in one run and was up to 2x slower than one thread in another run.
 - Limits of the batched solve: a batch costs the iterations of its slowest member (a member that stopped still
   goes through the kernels, as zero rows). The first batch starts cold in all members (no warm start). The host
   eigenproblems grow with B (one for each member, in a thread pool of up to 8 threads). All members need the same
@@ -559,20 +569,22 @@ precision, the warm start, the meow backend (neff and field overlap against `com
 placement. `tests/test_batch.py` checks that the batched solve gives the per-cell results (neff, E and H, in each
 precision; a batch of 1; the warm start between batches; `compute_modes_gpu_batch` with batch 1, 2 and 8 on a
 5-cell taper, with a short last run; two grid shapes and a cell that falls back to tidy3d in one list; the
-post-processing in a second thread, and its errors), ragged convergence (members that stop at very different
+post-processing in a second thread, and its errors; the BLAS limit of the host thread pool, by threading layer,
+and without threadpoolctl), ragged convergence (members that stop at very different
 iterations give the results of `davidson` from the same initial block), the stop by the stall rule and the iteration
 limit of each member, and the tidy3d direction rule for modes below cutoff. On the CPU the iterations and the
 matvecs must be the same as those of the per-cell solve (all three precisions); on a GPU the iteration check has a
 slack and is not done in single precision.
 `tests/test_refine.py` checks the mixed-precision refinement (above): the stop of the complex64 stage after a cold
-and a warm start (`COLD_SWITCH_TOL`, per cell and batched), the strip against the double solve and the
-SciPy residuals, the two-core cluster against ARPACK, a mode count that cuts a near-degenerate pair (1 and 3 modes
-of the two cores, 3 start blocks, against ARPACK and the double solve by neff and field overlap), the complex128
-applies against the earlier polish, the tracking and the selection of the pairs, the weakly guided SiN tip (the
-fallback; against the earlier polish, the double solve, ARPACK and the SciPy residuals; on the 50 nm grid of the
-example all 4 modes, with and without the admission rule; the batched fallback), the stop with `converged=False`
-(tolerance out of reach: the stall rule of the fallback and the better result; step limit; solver warning), the
-error without `jax_enable_x64`, and the earlier polish (per cell and batched).
-`tests/test_bend.py` checks the bend modes (see "Bend modes"), and a batch of bends and a straight cell. Run all tests
-on the GPU computer (`bash tools/remote.sh push`, then `bash tools/gpu_run.sh meow_gpu python -m pytest -q` there;
+and a warm start (`COLD_SWITCH_TOL`, per cell and batched), a warm start on the SiN tip of the example grid (with
+and without the admission rule), the documented core of `structures.sin_tip`, the strip against the double solve and
+the SciPy residuals, the two-core cluster against ARPACK, a mode count that cuts a near-degenerate pair (1 and 3
+modes of the two cores, 3 start blocks, against ARPACK and the double solve by neff and field overlap), the
+complex128 applies against the earlier polish, the tracking and the selection of the pairs, the weakly guided SiN
+tip (the fallback; against the earlier polish, the double solve, ARPACK and the SciPy residuals; on the 50 nm grid
+of the example all 4 modes, with and without the admission rule; the batched fallback), the stop with
+`converged=False` (tolerance out of reach: the stall rule of the fallback and the better result; step limit; solver
+warning), the error without `jax_enable_x64`, and the earlier polish (per cell and batched). `tests/test_bend.py`
+checks the bend modes (see "Bend modes"), and a batch of bends and a straight cell. Run all tests on the GPU
+computer (`bash tools/remote.sh push`, then `bash tools/gpu_run.sh meow_gpu python -m pytest -q` there;
 `tools/gpu_run.sh` uses `.venv-rocm` and the GPU lock; first `bash tools/remote.sh setup-env`).
