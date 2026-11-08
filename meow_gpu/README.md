@@ -505,7 +505,300 @@ cells instead of 0.952 / 0.955, and the 3-D FDTD of the same taper gives 0.9961 
 (`benchmarks/2026-10-30/fdtd-v3.jsonl`, row 4: T00 = 0.99614; `suite/README.md`).
 `bench_eme_taper.py --post-process meow` gives the old numbers.
 
+## A power-conserving interface (`meow_gpu.interface`, 2026-11-08)
+
+```python
+from meow_gpu.interface import compute_interface_s_matrices, post_process_eigenmodes
+
+modes = [compute_modes_gpu(cs, num_modes=40, solver=solver, post_process=post_process_eigenmodes) for cs in css]
+S, port_map = mw.compute_s_matrix(modes, cells=cells, interfaces_fn=compute_interface_s_matrices)
+```
+
+In photonsuite: `photonsuite.eme.transmission(..., interface="conserving")` (the default stays `"meow"`).
+
+**Why meow's interface does not conserve power.** Without a correction, the kept modes of the 0.5 to 2.0 um taper of
+`suite/bench/eme_fdtd_taper.py` carry 1.008 to 1.012 of the input power (`suite/README.md`). Two causes
+(`bench/bench_interface.py --diag` puts both into one row, and the tests below check both):
+
+- The formula. Mode matching at a step has two equations: E_t and H_t are continuous. meow (0.15,
+  `compute_interface_s_matrix`) tests both equations with the modes of the left guide: (O_LR + O_RL^T) T = 2 I, with
+  O_LR[i, j] = <e^L_i, h^R_j>. This is exact for the complete set of modes. For a truncated set the S-matrix is not
+  unitary, and O_LR + O_RL^T is almost singular when a kept mode of one side has no partner in the kept modes of the
+  other side. Thus meow truncates the solve (TSVD, rcond 1e-3) and then changes the singular values of S (the
+  passivity rules "invert" and "clip"). Without the truncation the solve is unstable.
+- The product. meow's inner product integrates the field samples with the trapezoidal rule on the nodes. The
+  eigenmodes of the discrete operator are not orthogonal in it. meow's Gram-Schmidt step then mixes the modes, and
+  each mixed mode propagates with the neff of one eigenmode.
+
+**The interface.** It is written from the field equations (module docstring of `meow_gpu/interface.py`):
+
+- The product is the unconjugated reciprocity product of the Yee grid, <m1, m2> = 1/2 sum (E1x H2y dA_x -
+  E1y H2x dA_y), with the area of each Yee sample (the weights of the Poynting flux of the tidy3d solver). Two
+  eigenmodes of the discrete operator with different propagation constants are orthogonal in it (discrete
+  reciprocity), so the Gram matrices are diagonal to the solver tolerance.
+- The E_t equation is tested with the H fields of the right modes, and the H_t equation with the E fields of the
+  left modes (the testing of the conservation-of-complex-power technique, Safavi-Naini and MacPhie, IEEE Trans.
+  Microw. Theory Tech. 29, 337 (1981)). With P[i, j] = <e^L_i, h^R_j> and the Gram matrices G_L, G_R, each
+  excitation gives one square system K [R; T] = rhs, K = [[P^T, -G_R^T], [G_L, P]]. For orthonormal modes with real
+  fields (lossless guides, modes above cutoff), the singular basis of P (P = U diag(s) V^T) divides the step into
+  independent channels with r = (1 - s^2) / (1 + s^2) and t = 2 s / (1 + s^2). Thus r^2 + t^2 = 1 for every s: S is
+  orthogonal (power is conserved) and symmetric (reciprocal) for every truncation of a set of modes above cutoff,
+  with no TSVD and no passivity rule. For the complete set the projections are exact. With modes below cutoff in a
+  truncated set, P is complex and this proof does not hold.
+- The modes (`post_process_eigenmodes`): no Gram-Schmidt (the modes stay eigenmodes, and the interface uses their
+  Gram matrices). Each mode goes on the branch that decays in +z (below cutoff: Im(neff) > 0) or that carries power
+  in +z (above cutoff, the rule of tidy3d): a mode on the other branch is flipped (neff, E_z, H_x and H_y change
+  sign), not removed. Thus both members of a complex pair (neff, -conj(neff)) of the lossless guide stay in the set;
+  the member with Re(neff) < 0 also decays in +z and is a forward mode. All modes below cutoff stay in the set (meow
+  removes the modes with |Im neff| > 1; `max_imag_neff=1.0` gives that rule). meow's phase rule and the normalization
+  <m, m> = 1 in the Yee product. A degenerate cluster of modes above cutoff gets a real basis that is orthonormal in
+  the Yee product (the eigensolver gives any basis of the cluster, often with complex coefficients, and then |S|^2 is
+  not the power); a degenerate cluster below cutoff is not changed. Removed: modes with fields that are not finite or
+  with a self-product of almost zero, and copies of a kept mode (the same neff and parallel E_t fields; a copy makes
+  the interface system singular, and a singular system raises `ValueError`).
+
+**Checks** (`tests/test_interface.py`, 15 tests, mixed precision):
+
+- A lossless step (Si strip 0.5 to 1.0 um, 8 modes, all above cutoff): S^H S = I and S = S^T within 1e-7. On the
+  same eigenmodes, meow's interface without a passivity rule has a singular value above 1.001, and meow's product
+  gives Gram entries off the diagonal above 1e-4; the Yee product gives the identity within 1e-7.
+- meow's SAX cascade of narrow, wide and narrow cells (with propagation): the power of each input mode goes into the
+  kept modes within 1e-7; S = S^T within 1e-7.
+- The star-product cascade (`compute_s_matrix`, narrow, wide and narrow cells) gives the S-matrix and the port map
+  of meow's SAX cascade within 1e-10, with the conserving interface and with meow's interface.
+- Equal guides: S = [[0, I], [I, 0]] within 1e-12.
+- Uniform media (the window filled with n = 1.444, then with n = 2.0): the two first modes of this grid are a
+  degenerate pair with neff = n (uniform Ex and uniform Ey). R = r I and T^H T = (1 - r^2) I on the pair within
+  1e-8, with the Fresnel value r = (n1 - n2) / (n1 + n2); no coupling into the other modes (1e-7); the fields of
+  the pair are real.
+- The complete set (a 0.2 and a 0.4 um strip on an 8 x 6 grid; all 96 modes from a dense eigensolve, most of them
+  below cutoff): for the incidence of modes 0, 1 and 5, E_t and H_t are continuous at every sample within 1e-8 of
+  the field maximum (the exact discrete solution); meow's formula with the same product, no TSVD and no passivity
+  rule gives the same column of S within 1e-8; S = S^T within 1e-8.
+- The post-processing removes a copy of a mode, a backward copy (flipped back, then a copy), a mode with a NaN
+  field and a zero mode; a mode set with a mode twice raises `ValueError`.
+- The documented path on the complete set: `post_process_eigenmodes` on all 96 modes of the 8 x 6 grid keeps all
+  96 (two strips: with complex pairs and modes on the growing branch; two uniform windows: with degenerate clusters
+  below cutoff), all decay in +z, and E_t and H_t are continuous within 1e-8 (review finding: the first version
+  removed the members with Re(neff) < 0 of complex pairs and the modes with Im(neff) < 0, 24 and 30 of the 96 modes,
+  and the continuity errors were 6.6 % and 17 %).
+- `max_imag_neff`; a cluster without a real basis stays as it is; a step with 8 modes on the left and 5 on the right
+  (S unitary and symmetric within 1e-7); the star cascade with a non-symmetric S (meow's interface without its
+  symmetrization).
+- The solver at 60 modes on the first cell of the taper (0.02 um grid): each mode is an eigenpair of the assembled
+  operator (relative residual below 1e-9, an ARPACK eigenvalue), no copies, and each complex mode has its conjugate
+  eigenvalue in the ARPACK spectrum (a complex pair); `post_process_eigenmodes` keeps all 60.
+- Errors: two different grids, a PML window (on either side).
+
+`suite/tests/test_eme.py` (`test_conserving_interface_keeps_the_power`): a 0.5 to 1.2 um step in photonsuite sends
+the input power into the kept modes within 1e-6 (meow's interface without a passivity rule: more than 1 + 1e-4); a
+straight guide transmits 1 within 1e-9.
+
+**Results** (the files of `benchmarks/2026-11-08/`: `meow-interface.jsonl`, 55 rows, and `meow-interface-2.jsonl`,
+12 rows, with meow's SAX cascade; `meow-interface-3.jsonl`, 4 rows, and `meow-interface-4.jsonl`, 25 rows, with the
+star cascade, see "Memory of the cascade"; `meow-solver-arpack.jsonl`, 8 rows; `suite-eme-fdtd-taper.jsonl` and
+`suite-eme-fdtd-double-step.jsonl` for the FDTD; RX 7900 XT, precision "mixed", 0.02 um grid unless stated, one EME
+cell per segment; the commands are at the end of this part). The meow rows give the eighth-wave rows of
+photonsuite.eme again (`suite-eme-fdtd-taper.jsonl`), for example T00 = 0.8761 ("invert") and 0.8980 ("none") at
+1.55 um and 10 modes. The power columns give the sum of |S|^2 from the input TE0 mode into the left and the right
+ports of the modes above cutoff. The conserving rows above 40 modes come from `meow-interface-4.jsonl` (the
+post-processing after the review of 2026-11-08: modes on the wrong branch are flipped, not removed). The conserving
+rows above 40 modes of `meow-interface.jsonl` and `meow-interface-2.jsonl` came from the first version of
+`post_process_eigenmodes`, which removed valid modes (the members with Re(neff) < 0 of complex pairs and the modes
+on the growing branch); they are not used. With 40 modes or fewer no mode is below cutoff, and nothing was removed.
+
+**Scope: the mode sets lack modes.** All EME rows here, of both interfaces and at all mode counts, use the mode sets
+of the meow_gpu solver. In this window the solver misses about 10 of the 40 eigenvalues nearest the target, all
+above cutoff ("The modes that the solver misses", below; the first item of "Known limits and next steps"). So each
+"40 modes" set is not the set of the 40 modes nearest the target, and each EME result here is the result for such a
+set. It is not known how much the missed modes change T00.
+
+The causes (the 4 `--diag` rows; the taper, 1.55 um, 10 / 20 / 30 / 40 modes):
+
+- meow's interface without the passivity rule: the largest singular value of an interface S-matrix of the taper is
+  1.094, 1.165, 1.564, 2.101, and the right-going kept modes carry 1.0115, 1.0107, 1.0103, 1.0089 of the input
+  power.
+- meow's formula without the TSVD (rcond 1e-12) is unstable with both products (largest singular values 3e5 to
+  5e11; T00 up to 4e4).
+- The conserving formula with meow's Gram-Schmidt modes and meow's product gives T00 = 0.88708, 0.89439, 0.90394,
+  0.91224, within 7.2e-5 of the conserving interface (0.88701, 0.89435, 0.90390, 0.91221), with a largest singular
+  value of 1.001 to 1.015. Thus the formula sets T00; the product adds a smaller power error.
+- The largest Gram entry off the diagonal: meow's product on the eigenmodes 0.0095, 0.0136, 0.0216, 0.0333; the Yee
+  product 1.3e-9 to 5.6e-9.
+
+The taper of the eighth wave (T00 at 1.50, 1.525, 1.55, 1.575 and 1.60 um):
+
+| interface | modes | T00 | power |
+|---|---|---|---|
+| meow, "invert" (the default) | 40 | 0.8813, 0.8836, 0.8857, 0.8876, 0.8891 | 0.9750 to 0.9784 |
+| meow, "none" | 40 | 0.9132, 0.9163, 0.9189, 0.9214, 0.9235 | 1.0085 to 1.0096 |
+| conserving | 10 | 0.8813, 0.8842, 0.8870, 0.8900, 0.8926 | 1 within 1e-12 |
+| conserving | 20 | 0.8878, 0.8912, 0.8943, 0.8934, 0.8951 | 1 within 1e-12 |
+| conserving | 30 | 0.8998, 0.9021, 0.9039, 0.9060, 0.9079 | 1 within 1e-12 |
+| conserving | 40 | 0.9061, 0.9094, 0.9122, 0.9148, 0.9173 | 1 within 1e-12 |
+| conserving (b) | 60 | 0.9098, 0.9139, 0.9170, 0.9196, 0.9214 | 0.999998 to 1.000000 |
+| conserving (b) | 80 | 0.9071, 0.9102, 0.9129, 0.9156, 0.9189 | 0.999952 to 1.000212 |
+| 3-D FDTD, 60 cells per um (a) | | 0.9008, 0.9058, 0.9103, 0.9143, 0.9178 | T_flux 0.9996 to 1.0002 |
+
+(a) `benchmarks/2026-11-08/suite-eme-fdtd-taper.jsonl`, the eighth wave. (b) `meow-interface-4.jsonl`; all
+requested modes kept; modes below cutoff in all cells (251 to 387 of the stack at 60 modes, 691 to 827 at 80).
+
+- The conserving T00 rises by 0.0025 to 0.0127 for each 10 more modes up to 40 modes, by 0.0036 to 0.0048 from 40 to
+  60 modes, and falls by 0.0025 to 0.0041 from 60 to 80 modes. From 40 to 80 modes it stays between 0.9061 and
+  0.9214; it has no converged value.
+- The conserving interface differs from the FDTD (60 cells per um) by +0.0053, +0.0035, +0.0019, +0.0005, -0.0005
+  with 40 modes, +0.0090, +0.0080, +0.0066, +0.0053, +0.0036 with 60 modes and +0.0063, +0.0044, +0.0025, +0.0013,
+  +0.0011 with 80 modes (the FDTD limit is known to 2e-3 to 4e-3, `suite/README.md`); meow with "invert" is 0.0196
+  to 0.0287 below the FDTD, with "none" 0.0058 to 0.0124 above (40 modes). Over the band, the conserving T00 rises
+  by 0.0111, 0.0116 and 0.0118 (40, 60 and 80 modes), the FDTD T00 by 0.0169.
+- With modes below cutoff the power on the ports of the modes above cutoff stays within 2.2e-4 of 1 (80 modes).
+
+The double step (0.5 um, then 1.25 um for 0.1 um, then 2.0 um; `--length 0.1 --segments 1`; the FDTD is
+photonsuite.fdtd_avg on the same segments):
+
+| method | modes | T00 | power |
+|---|---|---|---|
+| conserving | 10 | 0.5987, 0.5943, 0.6055, 0.6171, 0.6293 | 1 within 1e-12 |
+| conserving | 20 | 0.5839, 0.5946, 0.6058, 0.6174, 0.6294 | 1 within 1e-12 |
+| conserving | 40 | 0.5532, 0.5603, 0.5676, 0.5744, 0.5810 | 1 within 1e-12 |
+| conserving (e) | 60 | 0.5554, 0.5622, 0.5690, 0.5762, 0.5846 | 1 within 1e-7 |
+| conserving (e) | 80 | 0.5561, 0.5605, 0.5645, 0.5713, 0.5807 | 1 within 1e-7 |
+| conserving (e) | 120 | 0.5575, 0.5637, 0.5690, 0.5739, 0.5828 | 1 within 1e-7 |
+| conserving, 0.01 um grid (b) | 40 | 1.55 um: 0.5677 | 1.00000 |
+| conserving, window x -3 to 3, y -1.8 to 2.02 um (c) | 40 | 1.55 um: 0.6101 | 1 (no mode below cutoff) |
+| conserving, the same window (c) | 80 | 1.55 um: 0.5825 | 1 (no mode below cutoff) |
+| meow, "none" | 40 | 0.5575, 0.5656, 0.5741, 0.5835, 0.5938 | 1.0339 to 1.0355 |
+| meow, "invert" | 40 | 0.5312, 0.5366, 0.5424, 0.5487, 0.5550 | 0.9695 to 0.9724 |
+| 3-D FDTD, 30 cells per um (d) | | 0.5517, 0.5559, 0.5616, 0.5688, 0.5776 | T_flux 0.9954 to 0.9978 |
+| 3-D FDTD, 40 (d) | | 0.5480, 0.5522, 0.5578, 0.5650, 0.5738 | T_flux 0.9954 to 0.9977 |
+| 3-D FDTD, 50 (d) | | 0.5501, 0.5543, 0.5599, 0.5670, 0.5758 | T_flux 0.9955 to 0.9976 |
+| 3-D FDTD, 60 (d) | | 0.5492, 0.5535, 0.5591, 0.5663, 0.5751 | T_flux 0.9954 to 0.9975 |
+
+(b) `meow-interface-2.jsonl`. A 0.005 um grid did not run: the refinement of the mode solver asked for 4.37 GiB of
+GPU memory (its GMRES basis, 168 b n bytes for b = 48 block vectors and n = 582,400 unknowns), above the GPU memory
+limit of the shared computer (`XLA_PYTHON_CLIENT_MEM_FRACTION=0.4`). (c) `meow-interface-3.jsonl` (star cascade; no
+mode below cutoff, so nothing was removed): the walls 1 um farther away than in the FDTD window; 120 modes did not
+run (an error row: a 2.29 GiB allocation of the same GMRES basis, b = 128 and n = 114,600, under the same limit).
+(d) `suite-eme-fdtd-double-step.jsonl`. (e) `meow-interface-4.jsonl`; all requested modes kept; 36 to 230 modes
+of the stack below cutoff.
+
+The EME and the FDTD do not agree on the double step, and the cause is not known:
+
+- With 40 modes (all above cutoff, power conserved) the EME is above the FDTD (60 cells per um) by +0.0040,
+  +0.0068, +0.0085, +0.0082, +0.0058. The FDTD changes by up to 0.0038 between 30 and 60 cells per um, and not
+  monotonically (0.5616, 0.5578, 0.5599, 0.5591 at 1.55 um).
+- The EME is not converged in the mode count: from 20 to 40 modes T00 falls by 0.031 to 0.048; from 40 to 120
+  modes it moves by 0.0034 to 0.0049 at each wavelength and not monotonically (1.55 um: 0.5676, 0.5690, 0.5645 and
+  0.5690 at 40, 60, 80 and 120 modes). Over 40 to 120 modes the EME is above the FDTD by 0.0040 to 0.0103.
+- Where the power goes at 1.55 um: the EME (40 modes) puts 0.5676 into TE0, 0.4255 into the other transmitted modes
+  and 0.0070 into the reflected modes. The FDTD (60 cells per um) puts 0.5591 into TE0 and 0.4377 into the rest of
+  the transmitted flux (T_flux 0.9968); its input plane gives a mode power of 1.0037 of the net flux, which is about
+  1 + R for a pure TE0 source (R about 0.4 %). Thus the EME puts 0.0122 less power into the other transmitted modes,
+  0.0085 more into TE0, and reflects about 0.0032 more. T_flux + 0.0037 = 1.0005: the FDTD loses almost no power
+  through the sides of the window.
+- The EME grid is not the cause: the 0.01 um grid gives 0.56771 at 1.55 um and 40 modes, 0.00016 above the 0.02 um
+  grid (0.56756), against a gap of 0.0085. (The edges of the 1.25 um section, x = +-0.625 um, are not on a grid line
+  of the 0.02 um grid; the FDTD averages the permittivity.)
+- The walls: the EME window has PEC walls at x = +-2 um and y = -0.8 and 1.02 um (0.8 um from the core), the FDTD a
+  0.4 um PML outside the same window, so a field that reaches the walls is reflected in the EME and absorbed in the
+  FDTD. In the larger window the EME gives 0.6101 at 40 modes and 0.5825 at 80 modes (1.55 um), against 0.5676 at 40
+  modes in the default window. The larger window has more modes above cutoff, so at 40 and 80 modes it is farther
+  from convergence in the mode count (the default window gave 0.6055 and 0.6058 at 10 and 20 modes). These rows
+  cannot show the effect of the walls; it is not known.
+- Not tested: the walls, the modes that the solver misses (below), the mode truncation and the FDTD error. The gap
+  of 0.0040 to 0.0085 at 40 modes (0.0040 to 0.0103 over 40 to 120 modes) is not explained.
+
+**The modes that the solver misses** (`meow-solver-arpack.jsonl`, `bench/solver_vs_arpack.py`: the first and the
+last cell of the taper, 0.5 and 2.0 um strips, 1.55 um, the 0.02 um grid; ARPACK shift-invert on the assembled
+operator at the target of the solver):
+
+- Each mode of the solver is an eigenpair: relative residual 2.4e-11 or less, eigenvalue within 9.2e-13 (relative)
+  of an ARPACK eigenvalue; no copies. After `post_process_eigenmodes` each complex mode has the other member of its
+  pair in the set, except one mode in the 60-mode and one in the 120-mode set of the 0.5 um cell (the other member is
+  outside the set).
+- The solver does not give the k eigenvalues nearest the target. Of the nearest 40, 60, 80 and 120 it misses 10, 13,
+  15 and 18 (0.5 um cell) and 9, 12, 14 and 18 (2.0 um cell).
+- The missed modes above cutoff are the same in both cells: neff = 1.444 (twice), 1.43094, 1.39104, 1.37979,
+  1.32187, 1.21849, 1.16624, 1.07105, 0.85716, 0.67428 and 0.49757 (all twelve from 60 modes on; the first ten and
+  nine at 40 modes); the others are below cutoff. These values are, within 1.9e-3, the modes of the window without
+  the core that have one transverse wavenumber of zero: sqrt(1.444^2 - (m lambda / 2a)^2) with a = 4 um, m = 1 to 7,
+  and sqrt(1.444^2 - (n lambda / 2b)^2) with b = 1.82 um, n = 1 to 3, and the two uniform-field modes at 1.444 (an
+  interpretation of the logged values; why the solver misses them is open).
+
+**Memory of the cascade.** The rows of `meow-interface.jsonl` and `meow-interface-2.jsonl` used meow's SAX cascade
+(`meow.compute_s_matrix`, klu backend). Its analysis step (`sax.backends.klu.analyze_circuit_klu`) builds a boolean
+matrix of (all S-matrix entries of the interfaces and the propagations) x (the connected port pairs, in both
+directions), and index arrays of the same shape: about 16 n^2 k^3 entries for n interfaces with k modes each. All
+memory values here are in GiB (the bench and the probe divide by 2^30). `bench/mem_cascade.py` (synthetic stacks of
+22 cells with random interface S-matrices; CPU; `benchmarks/2026-11-08/meow-cascade-memory.jsonl`) gives a peak RSS
+increase of 0.56, 0.99 and 2.14 GiB for 10, 20 and 30 modes (7.4e6, 5.8e7 and 1.9e8 entries; 5.5 to 6.3 s): about
+0.5 GiB + 8.5 bytes per entry. For the 22 cells of the taper this is about 12 GiB at 57 kept modes and 24 GiB at 73
+kept modes; the process peaks of `meow-interface-2.jsonl` were 16.3 GiB (60 modes) and 28.3 GiB (80 modes), on a
+computer with 29 GiB. The star product (`meow_gpu.interface.compute_s_matrix`: cell after cell, (I - R R)^-1 of k x
+k blocks) increased the peak RSS in `bench/mem_cascade.py` by 0.001 GiB at most (0.01 s) and gave the same T00
+within 2e-15; `tests/test_interface.py` checks it against meow's cascade on real modes (1e-10, both interfaces, also
+a non-symmetric S). On the taper at 80 modes and 1.55 um the bench with the star cascade (`meow-interface-3.jsonl`)
+gives T00 = 0.91223, the value of the SAX row of `meow-interface-2.jsonl` (both with the first version of the
+post-processing, so the two cascades had the same modes), with a process peak of 5.45 GiB against 28.3 GiB. The
+bench (default `--cascade star`) and `photonsuite.eme` with `interface="conserving"` use the star product. The bench
+refuses a row whose estimate (the mode fields: 1.67 MiB per mode on the 200 x 91 grid, 2.86 GiB for each list of 22
+cells x 80 modes; or the SAX cascade) is above `--max-gb` (GiB, default 8).
+
+Commands (from the repository folder on the GPU computer). The rows of `meow-interface.jsonl` and
+`meow-interface-2.jsonl` came from the bench before `--cascade` existed, that is with the SAX cascade, and from the
+first version of `post_process_eigenmodes`. With the bench of today, `--cascade sax` repeats the cascade; the rows
+of 60 and 80 modes then also need `--max-gb` above their estimates (about 12 and 24 GiB), which do not fit on the
+shared computer. The rows of `meow-interface-3.jsonl` and `meow-interface-4.jsonl` used the star cascade (peak RSS
+of the `-4` rows 6.34 GiB):
+
+```bash
+B="python bench/bench_interface.py"; W="--wavelengths 1.50,1.525,1.55,1.575,1.60"
+bash tools/gpu_run.sh meow_gpu $B --modes 10,20,30,40 $W                    # meow-interface.jsonl: 20 rows
+bash tools/gpu_run.sh meow_gpu $B --modes 10,20,30,40 --diag                # 4 rows, 1.55 um
+bash tools/gpu_run.sh meow_gpu $B --length 0.1 --segments 1 --modes 10,20,40,60,80,120 $W   # 30 rows
+GPU_RUN_TIMEOUT=3600 bash tools/gpu_run.sh meow_gpu $B --modes 60,80 --interfaces conserving $W   # -2.jsonl: 10
+bash tools/gpu_run.sh meow_gpu $B --length 0.1 --segments 1 --modes 40 --step 0.01 --interfaces conserving
+bash tools/gpu_run.sh meow_gpu $B --length 0.1 --segments 1 --modes 40,80,120 --window=-3,3,-1.8,2.02 \
+  --interfaces conserving                                                   # -3.jsonl: 3 rows (1 error row)
+bash tools/gpu_run.sh meow_gpu $B --modes 80 --interfaces conserving --wavelengths 1.55   # -3.jsonl: 1 row
+GPU_RUN_TIMEOUT=3600 bash tools/gpu_run.sh meow_gpu $B --modes 60,80 --interfaces conserving $W   # -4.jsonl: 10
+bash tools/gpu_run.sh meow_gpu $B --length 0.1 --segments 1 --modes 60,80,120 --interfaces conserving $W   # -4: 15
+bash tools/gpu_run.sh meow_gpu python bench/solver_vs_arpack.py --widths 0.5,2.0 --modes 40,60,80,120   # 8 rows
+for r in 30 40 50 60; do                                                    # suite-eme-fdtd-double-step.jsonl
+  bash tools/gpu_run.sh suite python bench/eme_fdtd_taper.py fdtd --resolution $r --length 0.1 --segments 1
+done
+cd meow_gpu; for k in 10 20 30; do for m in star sax; do                    # meow-cascade-memory.jsonl (CPU)
+  JAX_PLATFORMS=cpu ../.venv-rocm/bin/python bench/mem_cascade.py --method $m --cells 22 --modes $k; done; done
+```
+
+Limits:
+
+- Straight guides in a closed window only (no PML, no bend, no angled propagation: `ValueError`). The product of a
+  PML window or a bend needs the coordinate stretch of the solver.
+- Modes below cutoff carry no power. For them S holds the amplitudes of the unconjugated normalization. With such
+  modes in a truncated set, P is complex and power conservation is not proven: check the power sums
+  (`P_right_prop`, `P_left_prop`; the rows of `meow-interface-4.jsonl` stay within 2.2e-4 of 1). A degenerate
+  cluster below cutoff is not changed. In the window of the bench, the sets of 40 modes are all above cutoff.
+- The interface is exact for the complete set and conserves power for every truncation of a set above cutoff, but
+  T00 still changes with the mode count: the box modes of the closed window stand for the radiation.
+- With modes below cutoff in the set, |S|^2 summed over all ports is not the power: the bench gives the sums over
+  the ports of the modes above cutoff (`P_right_prop`, `P_left_prop`).
+- The eigensolver can miss modes nearer the target than the kept ones ("Known limits"); a missed mode is a
+  truncation, not an error of the interface. In the window of the taper the solver misses about 10 modes above
+  cutoff ("The modes that the solver misses"; `test_solver_modes_near_cutoff_are_eigenpairs` checks that its modes
+  are true eigenpairs without copies).
+
 ## Known limits and next steps
+
+- **Open, first: the solver misses modes above cutoff.** In the window of the taper and the double step (x -2 to 2
+  um, y -0.8 to 1.02 um, 0.02 um grid) the Davidson solver of meow_gpu gives correct eigenpairs, but not the set
+  nearest the target: it misses 10 and 9 of the 40 nearest eigenvalues of the 0.5 and the 2.0 um cell, and 12 modes
+  above cutoff from 60 modes on (`meow-solver-arpack.jsonl`; "The modes that the solver misses"). The results that
+  use such sets: every EME row of "A power-conserving interface" (meow's interface and the conserving interface, all
+  mode counts; the larger window of the double step probably also, not checked), the 10 um taper of "Correction of
+  meow's post-processing", and the EME rows of photonsuite in `suite/README.md`. The effect on T00 is not known.
+  Next: find why the solver misses these modes (its start block, its preconditioner or its selection; not checked),
+  fix it, and repeat these rows.
 
 - At small cross-sections (about 36k unknowns) the GPU is about 3x faster than one core. The batched solve gains
   less in mixed precision than in single precision (see "Profile of the batched path"): the device kernels of a
@@ -585,6 +878,7 @@ tip (the fallback; against the earlier polish, the double solve, ARPACK and the 
 of the example all 4 modes, with and without the admission rule; the batched fallback), the stop with
 `converged=False` (tolerance out of reach: the stall rule of the fallback and the better result; step limit; solver
 warning), the error without `jax_enable_x64`, and the earlier polish (per cell and batched). `tests/test_bend.py`
-checks the bend modes (see "Bend modes"), and a batch of bends and a straight cell. Run all tests on the GPU
+checks the bend modes (see "Bend modes"), and a batch of bends and a straight cell. `tests/test_interface.py`
+checks the power-conserving interface (see "A power-conserving interface"). Run all tests on the GPU
 computer (`bash tools/remote.sh push`, then `bash tools/gpu_run.sh meow_gpu python -m pytest -q` there;
 `tools/gpu_run.sh` uses `.venv-rocm` and the GPU lock; first `bash tools/remote.sh setup-env`).

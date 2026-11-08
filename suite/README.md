@@ -139,6 +139,8 @@ segment must be at least 1 um and the last at least 0.5 um long (the source and 
   meow-gpu mode solver. `Rect` and `Polygon` shapes (a polygon becomes a prism along z; meow 0.15 drops such
   prisms, and the adapter corrects that: `docs/upstream-issues.md`). Each shape gets its own meow mesh order, so a
   later shape replaces an earlier one, as in `CrossSection`. `cell_length=None`: one cell per segment.
+  `interface="conserving"` uses the power-conserving interface of meow-gpu (`meow_gpu/README.md`, "A
+  power-conserving interface") in place of meow's (the default, `interface="meow"`).
 - `fdtd_avg.mode_transmission(segments, x_range, y_range, wavelengths, resolution)`: fdtd_gpu with subpixel
   averaging, a band of wavelengths in one run (the last section).
 
@@ -203,6 +205,10 @@ The case (`bench/eme_fdtd_taper.py`; textbook indices, constant over the band: S
 (each with the width at its center), 1 um straight at 2.0 um; window x -2 to 2 um, y -0.8 to 1.02 um; TE; five
 wavelengths from 1.50 to 1.60 um. The taper is short, so about 9 % of the power goes into higher modes (T00 near 0.91):
 the comparison tests the mode coupling, not only a transmission near 1.
+
+The EME rows of this section use the mode sets of the meow-gpu solver, which lack some modes above cutoff
+(about 10 of the 40 nearest eigenvalues; `meow_gpu/README.md`, the first open item); how much this changes T00
+is not known.
 
 Results: the rows of `benchmarks/2026-11-08/suite-eme-fdtd-taper.jsonl` (the commands below; RX 7900 XT, shared
 computer). T00 at 1.50, 1.525, 1.55, 1.575 and 1.60 um.

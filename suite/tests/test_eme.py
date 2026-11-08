@@ -38,6 +38,31 @@ def test_a_polygon_segment_continues_the_guide():
     assert abs(r.transmission - 1.0) < 1e-4          # without the prism fix: the second half is oxide, T << 1
 
 
+def test_conserving_interface_keeps_the_power():
+    """interface="conserving" (meow_gpu.interface): a width step 0.5 -> 1.2 um sends all the input power into the
+    kept modes on the two sides (meow's interface without a passivity rule gives more than 1 here); a straight guide
+    transmits 1; interface_kwargs belong to meow's interface only."""
+    import pytest
+
+    narrow = CrossSection(SIO2, (Rect(-0.25, 0.25, 0.0, 0.22, SI),))
+    wide = CrossSection(SIO2, (Rect(-0.6, 0.6, 0.0, 0.22, SI),))
+    args = ((-1.5, 1.5), (-0.8, 1.02), 1.55)
+    segs = [Segment(0.0, 1.0, narrow), Segment(1.0, 2.0, wide)]
+    r = transmission(segs, *args, step=0.04, cell_length=None, num_modes=8, interface="conserving")
+    assert abs(r.total_right + r.total_left - 1.0) < 1e-6 and 0.5 < r.transmission < 1.0
+    m = transmission(segs, *args, step=0.04, cell_length=None, num_modes=8,
+                     interface_kwargs={"passivity_method": "none"})
+    assert m.total_right + m.total_left > 1.0 + 1e-4
+    s = transmission([Segment(0.0, 1.0, narrow), Segment(1.0, 2.0, narrow)], *args, step=0.04, cell_length=None,
+                     num_modes=6, interface="conserving")
+    assert abs(s.transmission - 1.0) < 1e-9 and s.total_left < 1e-12
+    with pytest.raises(ValueError, match="interface_kwargs"):
+        transmission(segs, *args, step=0.04, cell_length=None, num_modes=4, interface="conserving",
+                     interface_kwargs={"passivity_method": "none"})
+    with pytest.raises(ValueError, match="interface must be"):
+        transmission(segs, *args, step=0.04, cell_length=None, num_modes=4, interface="other")
+
+
 def test_structures_keep_the_fill_order():
     """A later shape replaces an earlier one, also between materials (review finding: one mesh_order for all
     shapes lost the SiN core inside an SiO2 trench of an SiN slab)."""

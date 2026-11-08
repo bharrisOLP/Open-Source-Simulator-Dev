@@ -6,10 +6,14 @@ meow Box over the z range of its segment, and each Polygon a prism along z; meow
 so the EME samples the piecewise-constant device exactly (no error from the cell length). meow 0.15 never projects
 a Prism with axis "z" inside its z range (``_project_axis_z`` tests ``z < h_max`` where it means ``z > h_max``), so
 the adapter uses a subclass with the corrected test. The S-matrix comes from meow (overlaps, interfaces, SAX
-cascade) with its default interface settings; ``interface_kwargs`` passes other settings to
-meow.compute_interface_s_matrices. On a short taper these settings change T00 by 0.02 to 0.03: the default passivity
-correction ("invert") turns the power gain of the truncated interface solve into a loss (README, "EME against 3-D
-FDTD with subpixel averaging").
+cascade). ``interface="meow"`` (the default): meow's interface with its default settings; ``interface_kwargs``
+passes other settings to meow.compute_interface_s_matrices. On a short taper these settings change T00 by 0.02 to
+0.03: the default passivity correction ("invert") turns the power gain of the truncated interface solve into a loss
+(README, "EME against 3-D FDTD with subpixel averaging"). ``interface="conserving"``: the interface of
+meow_gpu.interface (the modes without Gram-Schmidt, the Yee product, a testing that conserves power for every
+count of modes above cutoff; meow_gpu/README.md, "A power-conserving interface"), cascaded with the star product of
+meow_gpu.interface.compute_s_matrix (the same S-matrix as meow's SAX cascade, with memory of the order of the square
+of the mode count; the SAX cascade needs about 12 GiB for 22 cells with 57 modes).
 """
 
 from __future__ import annotations
@@ -73,12 +77,18 @@ def structures(segments, x_range, y_range):
 
 def transmission(segments, x_range, y_range, wavelength: float, step: float = 0.02,
                  cell_length: float | None = 0.25, num_modes: int = 10, precision: str = "mixed",
-                 interface_kwargs: dict | None = None) -> EMEResult:
-    """Fundamental-mode transmission |S21|^2 at one wavelength (um). cell_length=None: one EME cell per segment."""
+                 interface_kwargs: dict | None = None, interface: str = "meow") -> EMEResult:
+    """Fundamental-mode transmission |S21|^2 at one wavelength (um). cell_length=None: one EME cell per segment.
+    interface: "meow" or "conserving" (module docstring); interface_kwargs only with "meow"."""
     import jax
     import meow as mw
 
     from meow_gpu.meow_backend import GPUModeSolver, compute_modes_gpu
+
+    if interface not in ("meow", "conserving"):
+        raise ValueError(f"interface must be 'meow' or 'conserving', not {interface!r}")
+    if interface == "conserving" and interface_kwargs:
+        raise ValueError("interface_kwargs are settings of meow's interface; interface='conserving' has none")
 
     z_lo, z_hi = segments[0].z0, segments[-1].z1
     structures_ = structures(segments, x_range, y_range)
@@ -93,12 +103,21 @@ def transmission(segments, x_range, y_range, wavelength: float, step: float = 0.
     cells = mw.create_cells(structures_, mesh, lengths, z_min=z_lo)
     env = mw.Environment(wl=wavelength, T=25.0)
     solver = GPUModeSolver(precision=precision)
-    modes = [compute_modes_gpu(mw.CrossSection.from_cell(cell=c, env=env), num_modes=num_modes, solver=solver)
-             for c in cells]
-    interfaces = (functools.partial(mw.compute_interface_s_matrices, **interface_kwargs) if interface_kwargs
-                  else mw.compute_interface_s_matrices)
-    with jax.default_device(jax.devices("cpu")[0]):          # SAX with klujax runs on the CPU
-        S, pm = mw.compute_s_matrix(modes, cells=cells, interfaces_fn=interfaces)
+    post_process = None
+    if interface == "conserving":
+        from meow_gpu.interface import compute_interface_s_matrices, post_process_eigenmodes
+        post_process, interfaces = post_process_eigenmodes, compute_interface_s_matrices
+    else:
+        interfaces = (functools.partial(mw.compute_interface_s_matrices, **interface_kwargs) if interface_kwargs
+                      else mw.compute_interface_s_matrices)
+    modes = [compute_modes_gpu(mw.CrossSection.from_cell(cell=c, env=env), num_modes=num_modes, solver=solver,
+                               post_process=post_process) for c in cells]
+    if interface == "conserving":     # the star product: meow's SAX cascade needs O(cells^2 modes^3) memory
+        from meow_gpu.interface import compute_s_matrix
+        S, pm = compute_s_matrix(modes, [c.length for c in cells], interfaces_fn=interfaces)
+    else:
+        with jax.default_device(jax.devices("cpu")[0]):      # SAX with klujax runs on the CPU
+            S, pm = mw.compute_s_matrix(modes, cells=cells, interfaces_fn=interfaces)
     S = np.asarray(S)
     t = float(abs(S[pm["left@0"], pm["right@0"]]) ** 2)
     total = float(sum(abs(S[pm["left@0"], pm[k]]) ** 2 for k in pm if k.startswith("right")))

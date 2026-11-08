@@ -1,0 +1,6 @@
+{"method": "star", "cells": 22, "modes": 10, "klu_bool_entries": 7425600, "peak_gb_before": 0.383, "peak_gb_after": 0.383, "seconds": 0.0, "T00": [0.020556531233923234, -0.0015659061307148883], "sum_abs2_row0": 1.0}
+{"method": "sax", "cells": 22, "modes": 10, "klu_bool_entries": 7425600, "peak_gb_before": 0.384, "peak_gb_after": 0.945, "seconds": 5.48, "T00": [0.02055653123392173, -0.0015659061307176734], "sum_abs2_row0": 0.9999999999999973}
+{"method": "star", "cells": 22, "modes": 20, "klu_bool_entries": 57926400, "peak_gb_before": 0.384, "peak_gb_after": 0.384, "seconds": 0.0, "T00": [-0.033043144268862304, 0.0030589641177783903], "sum_abs2_row0": 1.0000000000000002}
+{"method": "sax", "cells": 22, "modes": 20, "klu_bool_entries": 57926400, "peak_gb_before": 0.383, "peak_gb_after": 1.374, "seconds": 5.81, "T00": [-0.033043144268860944, 0.0030589641177816637], "sum_abs2_row0": 0.9999999999999977}
+{"method": "star", "cells": 22, "modes": 30, "klu_bool_entries": 193838400, "peak_gb_before": 0.385, "peak_gb_after": 0.386, "seconds": 0.01, "T00": [-0.0002185643277195275, -0.002962728248227248], "sum_abs2_row0": 0.999999999999999}
+{"method": "sax", "cells": 22, "modes": 30, "klu_bool_entries": 193838400, "peak_gb_before": 0.384, "peak_gb_after": 2.522, "seconds": 6.3, "T00": [-0.0002185643277185054, -0.0029627282482266445], "sum_abs2_row0": 0.9999999999999895}
