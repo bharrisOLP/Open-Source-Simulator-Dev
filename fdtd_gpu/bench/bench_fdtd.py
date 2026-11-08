@@ -1,19 +1,27 @@
 """Validation cases of fdtd_gpu on the GPU, one JSON line per case (results, references and run time).
 
-    python bench/bench_fdtd.py --case bragg --resolution 200
+    python bench/bench_fdtd.py --case bragg --resolution 200 [--lam0 1.03] [--no-avg]
     python bench/bench_fdtd.py --case waveguide --resolution 20 [--three-d]
-    python bench/bench_fdtd.py --case ring --resolution 40
+    python bench/bench_fdtd.py --case ring --resolution 40 [--no-avg]
+    python bench/bench_fdtd.py --case disk --resolution 40 [--tm] [--no-avg]
+    python bench/bench_fdtd.py --case slab --resolution 20 [--e-normal] [--no-avg]
     python bench/bench_fdtd.py --case dipole --resolution 20 --index 1.5 [--half 0.5]
     python bench/bench_fdtd.py --case waveguide --three-d --src-freq 0.5701613   # mode source solved at a band edge
     python bench/bench_fdtd.py --case sheet --resolution 40 [--index 1.5]
-    python bench/bench_fdtd.py --case all          # all five at the default resolutions
-Each row has the resolution and the cells.
-The cases are in tests/cases.py; the references (transfer matrices, Bessel-function ring resonances, the analytic
-dipole power, the flux of a current sheet) are in tests/references.py and tests/cases.py. "seconds" is the time
-of the FDTD loops (compile included).
+    python bench/bench_fdtd.py --case setup --resolution 50     # time of the subpixel average only, 3-D strip
+    python bench/bench_fdtd.py --case all          # bragg, waveguide, ring, dipole, sheet at the default resolutions
+    python bench/bench_fdtd.py --case ring --resolution 40,60,80 --both    # a list of resolutions; averaged and not
+Each row has the resolution and the cells. --no-avg: the staircase (eps_averaging=False); default: averaged.
+The cases are in tests/cases.py; the references (transfer matrices, Bessel-function ring and disk resonances, the
+exact slab mode with the Yee dispersion along x and in time, the analytic dipole power, the flux of a current
+sheet) are in tests/references.py and tests/cases.py. "seconds" is the time of the FDTD loops (compile included);
+"setup_seconds" the time of the rasterization and the subpixel average. NaN values (T outside the source band of
+the waveguide case) are written as null.
 """
 import argparse
+import itertools
 import json
+import math
 import os
 import sys
 
@@ -32,23 +40,56 @@ def _clean(v):
     if isinstance(v, complex):
         return [v.real, v.imag]
     if isinstance(v, (float, np.floating)):
-        return float(f"{float(v):.7g}")
+        return None if math.isnan(float(v)) else float(f"{float(v):.7g}")
     if isinstance(v, np.integer):
         return int(v)
     return v
 
 
+def setup(resolution: int = 50):
+    """Time of the subpixel average of a 3-D Si strip (0.4 x 0.22 um, n 3.45 in 1.45) in a 8 x 4 x 4 um cell, and
+    the number of sampled voxels (no FDTD run)."""
+    import time
+
+    import fdtd_gpu as fg
+    core = fg.Block(size=fg.Vector3(fg.inf, 0.4, 0.22), material=fg.Medium(index=3.45))
+    ring = [fg.Cylinder(radius=1.2, height=0.22, material=fg.Medium(index=3.45), center=fg.Vector3(1.5, 0)),
+            fg.Cylinder(radius=0.8, height=0.22, material=fg.Medium(index=1.45), center=fg.Vector3(1.5, 0))]
+    sim = fg.Simulation(cell_size=fg.Vector3(8, 4, 4), resolution=resolution, geometry=[core] + ring,
+                        default_material=fg.Medium(index=1.45))
+    t0 = time.perf_counter()
+    eps = sim.get_epsilon()
+    return dict(setup_seconds=sim.setup_seconds, total_seconds=time.perf_counter() - t0,
+                n_averaged=sim.n_averaged, cells=int(np.prod(sim.shape)), eps_mean=float(eps.mean()))
+
+
 ap = argparse.ArgumentParser()
-ap.add_argument("--case", choices=["bragg", "waveguide", "ring", "dipole", "sheet", "all"], default="all")
-ap.add_argument("--resolution", type=int, default=None)
+ap.add_argument("--case", choices=["bragg", "waveguide", "ring", "disk", "slab", "dipole", "sheet", "setup", "all"],
+                default="all")
+ap.add_argument("--resolution", type=str, default=None, help="one value, or a list: 20,40,80")
 ap.add_argument("--index", type=float, default=1.0, help="medium of the dipole and sheet cases")
 ap.add_argument("--half", type=float, default=1.0, help="half width of the flux box of the dipole case (um)")
 ap.add_argument("--three-d", action="store_true", help="3-D strip for the waveguide case")
 ap.add_argument("--src-freq", type=float, default=None, help="source center frequency of the waveguide case")
+ap.add_argument("--lam0", type=float, default=1.0, help="design wavelength of the Bragg stack (um)")
+ap.add_argument("--tm", action="store_true", help="disk case: Ez (default: Hz, in-plane E)")
+ap.add_argument("--e-normal", action="store_true", help="slab case: E normal to the faces (Hz polarization)")
+ap.add_argument("--no-avg", action="store_true", help="staircase geometry (eps_averaging=False)")
+ap.add_argument("--both", action="store_true", help="each case averaged and with the staircase")
 a = ap.parse_args()
 todo = ["bragg", "waveguide", "ring", "dipole", "sheet"] if a.case == "all" else [a.case]
-for case in todo:
-    kw = {} if a.resolution is None else {"resolution": a.resolution}
+resolutions = [None] if a.resolution is None else [int(r) for r in a.resolution.split(",")]
+averaging = [True, False] if a.both else [not a.no_avg]
+for case, resolution, avg in itertools.product(todo, resolutions, averaging):
+    kw = {} if resolution is None else {"resolution": resolution}
+    if case in ("bragg", "waveguide", "ring", "disk", "slab"):
+        kw["eps_averaging"] = avg
+    if case == "bragg":
+        kw["lam0"] = a.lam0
+    if case == "disk":
+        kw["te"] = not a.tm
+    if case == "slab":
+        kw["e_normal"] = a.e_normal
     if case == "dipole":
         kw["n"] = a.index
         kw["half"] = a.half
@@ -57,6 +98,6 @@ for case in todo:
     if case == "waveguide":
         kw["three_d"] = a.three_d
         kw["src_freq"] = a.src_freq
-    res = getattr(cases, case)(**kw)
+    res = setup(**kw) if case == "setup" else getattr(cases, case)(**kw)
     row = {"case": case, **{k: v for k, v in kw.items()}, **res}
     print(json.dumps(_clean(row)), flush=True)

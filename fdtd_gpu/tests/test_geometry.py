@@ -56,8 +56,6 @@ def test_harminv_two_modes():
 
 def test_unsupported_options_raise():
     with pytest.raises(NotImplementedError):
-        fg.Simulation(cell_size=fg.Vector3(1, 1, 0), resolution=10, eps_averaging=True)
-    with pytest.raises(NotImplementedError):
         fg.Block(size=fg.Vector3(1, 1, 1), e1=fg.Vector3(1, 1, 0))
     with pytest.raises(NotImplementedError):
         fg.Simulation(cell_size=fg.Vector3(1, 1, 0), resolution=10, k_point=fg.Vector3(0.1, 0, 0))

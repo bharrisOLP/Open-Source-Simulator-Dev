@@ -1,7 +1,9 @@
 """Geometry in the style of the MIT FDTD package: Vector3, Medium, Block, Cylinder, Sphere, Prism.
 
-Units: um. The cell is centered at the origin. Objects later in the geometry list replace earlier ones. Each cell
-takes the material of its center (a staircase; no subpixel averaging).
+Units: um. The cell is centered at the origin. Objects later in the geometry list replace earlier ones.
+`rasterize` gives each cell the material of its center (a staircase); `Simulation(eps_averaging=True)` then
+averages the permittivity at each Yee E component (`fdtd_gpu._averaging`). The `contains` methods take NumPy or
+JAX arrays.
 """
 
 from __future__ import annotations
@@ -122,7 +124,7 @@ class Block(GeometricObject):
 
     def contains(self, x, y, z):
         c, s = self.center, self.size
-        return ((np.abs(x - c.x) <= s.x / 2) & (np.abs(y - c.y) <= s.y / 2) & (np.abs(z - c.z) <= s.z / 2))
+        return (abs(x - c.x) <= s.x / 2) & (abs(y - c.y) <= s.y / 2) & (abs(z - c.z) <= s.z / 2)
 
     def bounds(self):
         c, s = self.center, self.size
@@ -141,7 +143,7 @@ class Cylinder(GeometricObject):
         p = (x - self.center.x, y - self.center.y, z - self.center.z)
         a = self.axis
         u, v = (p[i] for i in range(3) if i != a)
-        return (u**2 + v**2 <= self.radius**2) & (np.abs(p[a]) <= self.height / 2)
+        return (u**2 + v**2 <= self.radius**2) & (abs(p[a]) <= self.height / 2)
 
     def bounds(self):
         half = [self.radius] * 3
@@ -164,16 +166,17 @@ class Sphere(GeometricObject):
 
 
 def _in_polygon(u, v, pu, pv):
-    """Even-odd rule: True where (u, v) is inside the polygon with vertices (pu, pv)."""
-    inside = np.zeros(np.broadcast(u, v).shape, bool)
+    """Even-odd rule: True where (u, v) is inside the polygon with vertices (pu, pv). NumPy or JAX arrays (no
+    in-place operations), or floats."""
+    inside = False
     n = len(pu)
     for k in range(n):
-        u1, v1, u2, v2 = pu[k], pv[k], pu[(k + 1) % n], pv[(k + 1) % n]
+        u1, v1, u2, v2 = float(pu[k]), float(pv[k]), float(pu[(k + 1) % n]), float(pv[(k + 1) % n])
         if v1 == v2:
             continue
         crosses = (v1 > v) != (v2 > v)
         u_cross = u1 + (v - v1) * (u2 - u1) / (v2 - v1)
-        inside ^= crosses & (u < u_cross)
+        inside = inside ^ (crosses & (u < u_cross))
     return inside
 
 
@@ -225,7 +228,7 @@ class Prism(GeometricObject):
         p = (x, y, z)
         a = self.axis
         t = [i for i in range(3) if i != a]
-        return _in_polygon(p[t[0]], p[t[1]], self._pu, self._pv) & (np.abs(p[a] - self.center[a]) <= self.height / 2)
+        return _in_polygon(p[t[0]], p[t[1]], self._pu, self._pv) & (abs(p[a] - self.center[a]) <= self.height / 2)
 
     def bounds(self):
         a = self.axis

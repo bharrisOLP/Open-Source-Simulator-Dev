@@ -3,6 +3,8 @@ ring (Bessel functions), and the radiated power of a point dipole. Units: um, fr
 
 from __future__ import annotations
 
+import warnings
+
 import numpy as np
 from scipy import optimize, special
 
@@ -68,3 +70,54 @@ def dipole_flux_3d(f, n: float, current_spectrum):
     eta = 1 / n, k = n omega)."""
     om = 2 * np.pi * np.asarray(f, float)
     return n * om**2 * np.abs(current_spectrum) ** 2 / (6 * np.pi)
+
+
+def slab_tm_neff(f: float, n_core: float, n_clad: float, width: float) -> float:
+    """Effective index of the fundamental even mode with E normal to the faces of a symmetric slab (H parallel to
+    the faces; exact): tan(kx w / 2) = (n_core / n_clad)^2 gamma / kx."""
+    k0 = 2 * np.pi * f
+    r = (n_core / n_clad) ** 2
+
+    def g(ne):
+        kx = k0 * np.sqrt(n_core**2 - ne**2)
+        gam = k0 * np.sqrt(ne**2 - n_clad**2)
+        return np.tan(kx * width / 2) - r * gam / kx
+
+    hi = n_core - 1e-12
+    lo = max(n_clad + 1e-12, np.sqrt(max(n_core**2 - (np.pi / (k0 * width)) ** 2, 0)) + 1e-12)
+    return float(optimize.brentq(g, lo, hi))
+
+
+def slab_bloch_frequency(beta: float, n_core: float, n_clad: float, width: float, dx: float, dt: float,
+                         e_normal: bool = False) -> float:
+    """Frequency (1/um) of the fundamental even slab mode with the propagation constant beta along x on a Yee grid
+    that is exact across the slab: the grid replaces beta by (2 / dx) sin(beta dx / 2) (central difference of
+    exp(i beta x) on the staggered grid, exact for a structure that is uniform along x), and the leapfrog in time
+    maps the frequency w of the space-continuous problem to (2 / dt) arcsin(w dt / 2) (Taflove and Hagness,
+    Computational Electrodynamics, ch. 4). The remaining FDTD error is the discretization across the slab
+    (the geometry and the derivative in y). e_normal: E normal to the faces (slab_tm_neff), else parallel."""
+    neff = slab_tm_neff if e_normal else slab_te_neff
+    b = 2.0 / dx * np.sin(beta * dx / 2)
+
+    def h(f):
+        return 2 * np.pi * f * neff(f, n_core, n_clad, width) - b
+
+    fc = optimize.brentq(h, b / (2 * np.pi * n_core) * (1 + 1e-9), b / (2 * np.pi * n_clad) * (1 - 1e-9), xtol=1e-14)
+    return float(2.0 / dt * np.arcsin(np.pi * fc * dt) / (2 * np.pi))
+
+
+def disk_resonance(m: int, f_guess: complex, n: float, radius: float, te: bool = False, n_out: float = 1.0) -> complex:
+    """Exact complex resonance frequency (1/um) of the whispering-gallery mode of azimuthal order m of a dielectric
+    disk in 2-D. TM: Ez = A J_m(n k r) inside, D H1_m(n_out k r) outside, Ez and dEz/dr continuous. TE (te=True):
+    the same for Hz, with Hz and (1 / eps) dHz/dr continuous. Root of p_in J_m'/J_m - p_out H_m'/H_m with p = n (TM)
+    or 1 / n (TE)."""
+    p_in, p_out = (1 / n, 1 / n_out) if te else (n, n_out)
+
+    def g(f):
+        k = 2 * np.pi * f
+        x1, x2 = n * k * radius, n_out * k * radius
+        return p_in * special.jvp(m, x1) / special.jv(m, x1) - p_out * special.h1vp(m, x2) / special.hankel1(m, x2)
+
+    with warnings.catch_warnings():     # Newton steps near a pole of J_m or H_m: NaN steps, harmless; keep stderr clean
+        warnings.simplefilter("ignore", RuntimeWarning)
+        return complex(optimize.newton(g, complex(f_guess), x1=complex(f_guess) * (1 + 1e-4), tol=1e-13, maxiter=200))

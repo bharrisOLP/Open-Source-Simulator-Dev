@@ -3,11 +3,13 @@
 Units: um; frequency in 1/um (c = 1); time in um/c (1 um/c = 3.336 fs). The cell is centered at the origin. A cell
 size of 0 on an axis makes the simulation 2-D (or 1-D): the fields do not change along that axis.
 
-Mapping to fdtdx (SI units inside): axes x, y, z = fdtdx axes 0, 1, 2. The geometry becomes one voxel object (the
-material of each cell center; a staircase). Boundaries: PML layers inside the cell (as in the MIT package); other
-faces are perfect electric conductors, or periodic with k_point=Vector3(); trivial axes are periodic. Fields run in
-float32. The DFT monitors use the convention of the MIT package, sum f(t) exp(i 2 pi f t) dt / sqrt(2 pi), so
-fluxes and mode coefficients have the same normalization for a given source current.
+Mapping to fdtdx (SI units inside): axes x, y, z = fdtdx axes 0, 1, 2. The geometry becomes one voxel object:
+with eps_averaging=True (the default) one diagonal permittivity per Yee E component, from the subpixel average of
+Kottke et al. (`fdtd_gpu._averaging`); with eps_averaging=False the material of each cell center (a staircase).
+Boundaries: PML layers inside the cell (as in the MIT package); other faces are perfect electric conductors, or
+periodic with k_point=Vector3(); trivial axes are periodic. Fields run in float32. The DFT monitors use the
+convention of the MIT package, sum f(t) exp(i 2 pi f t) dt / sqrt(2 pi), so fluxes and mode coefficients have the
+same normalization for a given source current.
 """
 
 from __future__ import annotations
@@ -119,14 +121,12 @@ def _device():
 class Simulation:
     def __init__(self, cell_size, resolution: float, geometry=(), sources=(), boundary_layers=(),
                  default_material: Medium = Medium(), k_point=None, dimensions: int | None = None,
-                 symmetries=(), eps_averaging: bool = False, Courant: float | None = None,
+                 symmetries=(), eps_averaging: bool = True, Courant: float | None = None,
                  force_complex_fields: bool = False, geometry_center=None, **unsupported):
         if unsupported:
             raise NotImplementedError(f"Simulation: unsupported arguments {sorted(unsupported)}")
         if symmetries:
             raise NotImplementedError("symmetries are not supported")
-        if eps_averaging:
-            raise NotImplementedError("subpixel averaging is not supported: each cell takes its center material")
         if force_complex_fields:
             raise NotImplementedError("complex fields are not supported (real float32 fields)")
         if geometry_center is not None and tuple(_v3(geometry_center)) != (0, 0, 0):
@@ -144,6 +144,7 @@ class Simulation:
         self.shape = tuple(TRIVIAL_CELLS if t else max(1, int(round(s * self.resolution)))
                            for s, t in zip(self.cell_size, self.trivial))
         self.dims = 3 - sum(self.trivial)
+        self.eps_averaging = bool(eps_averaging)
         self.geometry, self.sources = list(geometry), list(sources)
         self.boundary_layers, self.default_material = list(boundary_layers), default_material
         self.periodic = k_point not in (None, False)
@@ -212,11 +213,28 @@ class Simulation:
     def source_end_time(self) -> float:
         return max((s.src.end_time for s in self.sources), default=0.0)
 
-    def get_epsilon(self) -> np.ndarray:
-        """The relative permittivity of each cell (staircase), with the trivial axes removed."""
+    def _permittivity(self):
+        """(staircase index, materials, eps3): eps3 is the (3, *shape) permittivity of the E components (subpixel
+        averaged), or None for the staircase or a uniform cell. Sets setup_seconds and n_averaged."""
+        t0 = _time.perf_counter()
         idx, mats = rasterize(self.geometry, self.default_material, self.shape, self.dx, self.trivial)
-        eps = np.array([m.epsilon for m in mats])[idx]
-        return np.squeeze(eps, axis=tuple(a for a in range(3) if self.trivial[a]))
+        eps3, self.n_averaged = None, 0
+        if self.eps_averaging and len(mats) > 1:
+            import jax
+
+            from fdtd_gpu._averaging import averaged_permittivity
+            with jax.enable_x64(False), jax.default_device(_device()):
+                eps3, self.n_averaged = averaged_permittivity(self.geometry, mats, idx, self.dx, self.trivial)
+        self.setup_seconds = _time.perf_counter() - t0
+        return idx, mats, eps3
+
+    def get_epsilon(self) -> np.ndarray:
+        """The relative permittivity of each cell, with the trivial axes removed. Staircase: the material of the
+        cell center. With eps_averaging: 3 / (1/eps_xx + 1/eps_yy + 1/eps_zz) of the averaged components of the
+        cell (each component is at its own Yee point: the cell center + dx / 2 along its axis)."""
+        idx, mats, eps3 = self._permittivity()
+        eps = np.array([m.epsilon for m in mats])[idx] if eps3 is None else 3.0 / (1.0 / eps3).sum(axis=0)
+        return eps[tuple(0 if t else slice(None) for t in self.trivial)]      # a trivial axis has TRIVIAL_CELLS
 
     # ---------- monitors ----------
     def add_flux(self, *args):
@@ -404,9 +422,12 @@ class Simulation:
             objects.append(obj)
             constraints.append(obj.set_grid_coordinates(axes=(0, 1, 2), sides=("-", "-", "-"), coordinates=tuple(lo)))
 
-        idx, mats = rasterize(self.geometry, self.default_material, self.shape, self.dx, self.trivial)
+        idx, mats, eps3 = self._permittivity()
         self.eps = np.array([m.epsilon for m in mats])[idx]
-        if len(mats) > 1:
+        self.eps3 = eps3
+        if eps3 is not None:
+            place(VoxelMaterial.from_permittivity(eps3, self.default_material.epsilon), (0, 0, 0))
+        elif len(mats) > 1:
             fmats = {f"m{k}": fdtdx.Material(permittivity=m.epsilon) for k, m in enumerate(mats)}
             place(VoxelMaterial.from_index(idx, fmats), (0, 0, 0))
 
