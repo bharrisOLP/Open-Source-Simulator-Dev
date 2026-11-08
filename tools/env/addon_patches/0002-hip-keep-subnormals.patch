@@ -1,0 +1,101 @@
+diff --git a/meep_gpu/subnormal_policy.py b/meep_gpu/subnormal_policy.py
+index 227baec..17ce9e5 100644
+--- a/meep_gpu/subnormal_policy.py
++++ b/meep_gpu/subnormal_policy.py
+@@ -384,8 +384,28 @@ CUPY_CACHE_KEY_ENTRY_POINT = "_compile_with_cache_cuda"
+ #: entry a compile reads and writes and nothing about the binary it builds.
+ CUPY_KEEP_CACHE_KEY_TOKEN = "meep_gpu subnormal policy: keep (-ftz=true stripped)"
+ 
+-#: The option CuPy appends unconditionally, in both spellings.
+-_CUPY_FTZ_OPTIONS = ("-ftz=true", "--ftz=true")
++#: The option CuPy appends unconditionally, in both spellings, and in the two
++#: clang spellings a ROCm build of CuPy uses instead: ``_compile_with_cache_hip``
++#: appends ``-fcuda-flush-denormals-to-zero`` to every hipRTC and hipcc compile
++#: ("HIP's equivalent of -ftz=true"). Measured on one AMD Radeon RX 7900 XT
++#: (gfx1100, CuPy 14.2.0 for ROCm 7): without the clang spellings here, every
++#: CuPy executor (ufunc, ElementwiseKernel, RawKernel, reductions) flushed under
++#: a requested "keep" (gate_subnormal_policy.py, 23 of 23 governed cells).
++_CUPY_FTZ_OPTIONS = ("-ftz=true", "--ftz=true",
++                     "-fcuda-flush-denormals-to-zero", "-fgpu-flush-denormals-to-zero")
++
++#: Where a ROCm build of CuPy computes the key of its kernel cache: the same
++#: role as :data:`CUPY_CACHE_KEY_ENTRY_POINT`, with ``extra_source`` as its fourth
++#: positional parameter (``source, options, arch, extra_source, backend, ...``).
++#: On a ROCm build ``_compile_with_cache_cuda`` exists and is never called.
++CUPY_HIP_CACHE_KEY_ENTRY_POINT = "_compile_with_cache_hip"
++
++
++def _cupy_is_hip(cupy: Any) -> bool:  # Is this CuPy a ROCm build? Never raises.
++    try:
++        return bool(cupy.cuda.runtime.is_hip)
++    except Exception:  # noqa: BLE001 - a CuPy that cannot answer is not a ROCm build here
++        return False
+ 
+ #: The LLVM per-function attribute that makes f32 arithmetic lower to ``.ftz``
+ #: PTX. Triton 3.1.0's ``CUDAOptions`` carries no ftz field, so this is the knob.
+@@ -1225,6 +1245,27 @@ def _wrap_cache_key_entry_point(original: Callable, state: Dict[str, Any]) -> Ca
+     return keyed
+ 
+ 
++def _wrap_hip_cache_key_entry_point(original: Callable, state: Dict[str, Any]) -> Callable:
++    """The ROCm form of :func:`_wrap_cache_key_entry_point` (``_compile_with_cache_hip``).
++
++    The same token, folded into ``extra_source``, which a ROCm CuPy also hashes
++    into its key (``key_src = env, base, source, extra_source``). From ROCm 4.4
++    on, ``_convert_to_hip_source`` returns the source unchanged and reads no
++    ``extra_source``, so the token changes the key and not the binary. Here it is
++    the fourth positional parameter, as there is no ``cache_dir`` parameter.
++    """
++
++    @functools.wraps(original)
++    def keyed(source, options, arch, extra_source=None, *args, **kwargs):
++        state["keyed"] = state.get("keyed", 0) + 1
++        folded = (CUPY_KEEP_CACHE_KEY_TOKEN if extra_source is None
++                  else f"{extra_source}\n{CUPY_KEEP_CACHE_KEY_TOKEN}")
++        return original(source, options, arch, folded, *args, **kwargs)
++
++    setattr(keyed, _POLICY_MARK, KEEP)
++    return keyed
++
++
+ def _cupy_compiler(cupy: Any) -> Any:  # ``cupy.cuda.compiler``, however it is reachable.
+     compiler = getattr(getattr(cupy, "cuda", None), "compiler", None)
+     if compiler is not None:
+@@ -1611,19 +1652,23 @@ def install_cupy_policy(policy: str, cupy: Any = None, *, strict: bool = True) -
+         reasons.append(
+             "this CuPy exposes none of the compiler entry points the strip "
+             f"installs at ({', '.join(_COMPILER_ENTRY_POINTS)}): the seam has moved")
+-    keyer = getattr(compiler, CUPY_CACHE_KEY_ENTRY_POINT, None)
++    # A ROCm CuPy keys its cache in ``_compile_with_cache_hip``; its
++    # ``_compile_with_cache_cuda`` is never called, so a wrap there folds nothing.
++    hip = _cupy_is_hip(cupy)
++    key_entry_point = CUPY_HIP_CACHE_KEY_ENTRY_POINT if hip else CUPY_CACHE_KEY_ENTRY_POINT
++    key_wrapper = _wrap_hip_cache_key_entry_point if hip else _wrap_cache_key_entry_point
++    keyer = getattr(compiler, key_entry_point, None)
+     if keyer is not None:
+         if getattr(keyer, _POLICY_MARK, None) is None:
+             _STATE.setdefault("_cupy_originals", {}).setdefault(
+-                CUPY_CACHE_KEY_ENTRY_POINT, (compiler, keyer))
+-            setattr(compiler, CUPY_CACHE_KEY_ENTRY_POINT,
+-                    _wrap_cache_key_entry_point(keyer, state))
++                key_entry_point, (compiler, keyer))
++            setattr(compiler, key_entry_point, key_wrapper(keyer, state))
+     elif isinstance(compiler, type(sys)) and compiler.__name__ == "cupy.cuda.compiler":
+         # The real module, without the function that computes the key: the token
+         # cannot be folded in, so a native binary already written under a keep
+         # directory would be served to this policy with no NVRTC call to notice.
+         reasons.append(
+-            f"cupy.cuda.compiler has no {CUPY_CACHE_KEY_ENTRY_POINT}, so the keep "
++            f"cupy.cuda.compiler has no {key_entry_point}, so the keep "
+             f"token cannot be folded into CuPy's cache key and a binary compiled "
+             f"before this install with CuPy's own -ftz=true stays reachable on disk")
+     report.update(
+@@ -1636,7 +1681,7 @@ def install_cupy_policy(policy: str, cupy: Any = None, *, strict: bool = True) -
+                   "by '-ftz=false': NVRTC rejects a duplicate -ftz option); "
+                   "policy-suffixed private CUPY_CACHE_DIR because the cache key "
+                   "is computed above the seam"
+-                  + (f"; cupy.cuda.compiler.{CUPY_CACHE_KEY_ENTRY_POINT} wrapped to "
++                  + (f"; cupy.cuda.compiler.{key_entry_point} wrapped to "
+                      f"fold the keep token into that key" if keyer is not None else ""),
+         reasons=reasons,
+     )

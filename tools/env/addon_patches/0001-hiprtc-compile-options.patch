@@ -1,0 +1,96 @@
+diff --git a/meep_gpu/backends.py b/meep_gpu/backends.py
+index 02d1ab3..4fe6472 100644
+--- a/meep_gpu/backends.py
++++ b/meep_gpu/backends.py
+@@ -218,6 +218,72 @@ def _with_subnormals(function):  # One compiler entry point, guarded and marked.
+     return wrapper
+ 
+ 
++# ---------------------------------------------------------------------------
++# A ROCm build of CuPy (AMD GPUs): the NVRTC options the kernel modules pass,
++# in the spelling hipRTC and hipcc (clang) accept
++#
++# On a ROCm build CuPy hands RawKernel source to hipRTC with the caller's
++# options unchanged. hipRTC is clang and refuses the NVRTC spelling
++# ``--fmad=false`` ("unknown argument"), so every hand-written kernel of the CUDA
++# table fails its warm pass on an AMD GPU. The clang option with the same
++# meaning is ``-ffp-contract=off``: no fused multiply-add contraction, which is
++# what ``--fmad=false`` asks NVRTC for.
++#
++# The translation wraps ``_compile_with_cache_hip``, the function a ROCm CuPy
++# enters for every RawKernel and RawModule: it forms the cache key, preprocesses
++# an empty file with the SAME options to read the compiler version, and then
++# calls hipRTC or hipcc. A wrap of the leaf ``compile_using_nvrtc`` alone is too
++# late, because the empty-file preprocess refuses the option first. It runs
++# only when CuPy reports a ROCm build, and it changes only the options in the
++# table below.
++# ---------------------------------------------------------------------------
++
++_HIP_CACHE_ENTRY_POINT = "_compile_with_cache_hip"
++
++_HIP_OPTION_SPELLINGS = {
++    "--fmad=false": "-ffp-contract=off",
++    "-fmad=false": "-ffp-contract=off",
++    "--fmad=true": "-ffp-contract=fast",
++    "-fmad=true": "-ffp-contract=fast",
++}
++
++_HIP_OPTIONS_MARK = "_meep_gpu_hip_options"
++
++
++def hip_options(options: Any) -> tuple:
++    """``options`` with each NVRTC-only spelling replaced by its hipRTC (clang) spelling."""
++    return tuple(_HIP_OPTION_SPELLINGS.get(option, option) for option in tuple(options))
++
++
++def _with_hip_options(function):  # CuPy's ROCm compile path, with the options translated.
++    @functools.wraps(function)
++    def wrapper(source, options=(), *args, **kwargs):
++        return function(source, hip_options(options), *args, **kwargs)
++
++    setattr(wrapper, _HIP_OPTIONS_MARK, True)
++    return wrapper
++
++
++def cupy_is_hip(cupy) -> bool:  # Is this CuPy a ROCm build? Never raises.
++    try:
++        return bool(cupy.cuda.runtime.is_hip)
++    except Exception:  # noqa: BLE001 - a CuPy that cannot answer is not a ROCm build here
++        return False
++
++
++def translate_hip_options(compiler) -> bool:
++    """On a ROCm CuPy, wrap ``_compile_with_cache_hip`` with :func:`hip_options`. Idempotent.
++
++    Returns whether the wrap is in place.
++    """
++    entry = getattr(compiler, _HIP_CACHE_ENTRY_POINT, None)
++    if entry is None:
++        return False
++    if not getattr(entry, _HIP_OPTIONS_MARK, False):
++        setattr(compiler, _HIP_CACHE_ENTRY_POINT, _with_hip_options(entry))
++    return True
++
++
+ def guard_kernel_compilation(cupy) -> bool:
+     """Wrap CuPy's compiler front ends so kernel source parses with subnormals intact.
+ 
+@@ -225,6 +291,9 @@ def guard_kernel_compilation(cupy) -> bool:
+     alone. Returns whether every front end this CuPy ships is now guarded AND this
+     host's default floating-point environment is addressable — i.e. whether a
+     compile started under MEEP's flush-to-zero mode will actually be protected.
++
++    On a ROCm build of CuPy it also translates the NVRTC options of the kernel
++    modules into the spelling hipRTC accepts (:func:`translate_hip_options`).
+     """
+     compiler = getattr(getattr(cupy, "cuda", None), "compiler", None)
+     if compiler is None:
+@@ -232,6 +301,8 @@ def guard_kernel_compilation(cupy) -> bool:
+             compiler = importlib.import_module("cupy.cuda.compiler")
+         except Exception:
+             return False
++    if cupy_is_hip(cupy):
++        translate_hip_options(compiler)
+     found = False
+     for name in _COMPILER_ENTRY_POINTS:
+         original = getattr(compiler, name, None)
