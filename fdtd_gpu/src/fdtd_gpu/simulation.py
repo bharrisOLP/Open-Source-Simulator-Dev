@@ -148,6 +148,12 @@ class Simulation:
         self.geometry, self.sources = list(geometry), list(sources)
         self.boundary_layers, self.default_material = list(boundary_layers), default_material
         self.periodic = k_point not in (None, False)
+        for a in range(3):                   # fdtdx wraps the whole axis when one face of it is periodic
+            sides = [s for s in (High, Low) if any(p.direction in (ALL, a) and p.side in (ALL, s)
+                                                   for p in self.boundary_layers)]
+            if self.periodic and not self.trivial[a] and len(sides) == 1:
+                raise NotImplementedError(f"k_point with a PML on one side of the {'xyz'[a]} axis only is not "
+                                          f"supported (the other face would be periodic): put a PML on both sides")
         self._monitors: list[_Monitor] = []
         self._probes: list = []
         self._done = False
@@ -216,7 +222,9 @@ class Simulation:
         return max((s.src.end_time for s in self.sources), default=0.0)
 
     def _periodic_axes(self) -> tuple[bool, bool, bool]:
-        """True for an axis of size > 0 with periodic faces (k_point given and no PML on that axis; as in _build)."""
+        """True for an axis of size > 0 with periodic faces: k_point given and no PML on the axis (as in _build; a
+        PML on one side only raises in __init__). There the objects repeat. Unlike the MIT package (its default
+        ensure_periodicity), the objects do not repeat along an axis with a PML."""
         return tuple(not self.trivial[a] and self.periodic
                      and not any(p.direction in (ALL, a) for p in self.boundary_layers) for a in range(3))
 

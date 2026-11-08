@@ -274,7 +274,7 @@ def rasterize(geometry, default_material: Medium, shape, dx: float, trivial=(Fal
     centers = [np.zeros(n) if trivial[i] else (np.arange(n) + 0.5) * dx - n * dx / 2 for i, n in enumerate(shape)]
     per = tuple(bool(p) and not t for p, t in zip(periodic, trivial))
     for obj in geometry:
-        mask = np.zeros(shape, bool)
+        parts = []                           # (cell slices, contains) of each copy that holds a cell center
         for s in periodic_shifts(obj, per, shape, dx):
             lo, hi = obj.bounds()
             lo, hi = [lo[i] + s[i] for i in range(3)], [hi[i] + s[i] for i in range(3)]
@@ -291,12 +291,20 @@ def rasterize(geometry, default_material: Medium, shape, dx: float, trivial=(Fal
                 continue
             X, Y, Z = np.meshgrid(centers[0][sl[0]] - s[0], centers[1][sl[1]] - s[1], centers[2][sl[2]] - s[2],
                                   indexing="ij")
-            mask[tuple(sl)] |= np.asarray(obj.contains(X, Y, Z), bool)
+            parts.append((sl, np.asarray(obj.contains(X, Y, Z), bool)))
+        if not parts:
+            continue
+        # the mask covers only the bounding box of the copies (not the whole grid: many objects on a large grid)
+        box = tuple(slice(min(p[0][i].start for p in parts), max(p[0][i].stop for p in parts)) for i in range(3))
+        mask = np.zeros(tuple(b.stop - b.start for b in box), bool)
+        for sl, m in parts:
+            mask[tuple(slice(sl[i].start - box[i].start, sl[i].stop - box[i].start) for i in range(3))] |= m
         if not mask.any():
             continue
         k = next((j for j, m in enumerate(materials) if m is obj.material), None)
         if k is None:
             materials.append(obj.material)
             k = len(materials) - 1
-        idx[mask] = k
+        sub = idx[box]
+        sub[mask] = k
     return idx, materials

@@ -28,7 +28,7 @@ the error with E in the plane of a curved interface is first order. DIAGONAL = "
 forward tensor in its place, eps_aa = n_a^2 / <1/eps> + (1 - n_a^2) <eps> (as the smoothing of fdtdx itself); the
 two are equal when n is along an axis or normal to a.
 Periodic axes: the staircase index wraps, the sample coordinates go back into the cell, and the objects repeat
-across the faces (`geometry.periodic_shifts`), as in the MIT package.
+across the faces (`geometry.periodic_shifts`), as in the MIT package (which also repeats them along PML axes).
 Small problems are sampled with NumPy; larger ones with one jit-compiled JAX function on the default device (the
 GPU), in chunks of about CHUNK_POINTS sample points.
 """

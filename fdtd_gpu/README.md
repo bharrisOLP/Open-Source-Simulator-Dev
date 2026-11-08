@@ -33,7 +33,7 @@ Supported:
   earlier ones. `eps_averaging=True` (the default, as in the MIT package): subpixel averaging of the permittivity at
   each Yee E component (see "Differences"); `eps_averaging=False`: the staircase.
 - **Boundaries:** `PML(thickness, direction, side)` inside the cell. Other faces are metal (PEC), or periodic with
-  `k_point=Vector3()` (the objects repeat across periodic faces).
+  `k_point=Vector3()` (the objects repeat across periodic faces; a PML on both sides or none).
 - **Sources:** `Source(GaussianSource or ContinuousSource, component, center, size, amplitude)`: a point, line or
   plane current. `EigenModeSource(src, center, size, eig_band, eig_parity, eig_kpoint)`.
 - **Monitors:** `add_flux` (`FluxRegion` with weights; `get_flux_data`, `load_minus_flux_data`), `add_mode_monitor`
@@ -77,8 +77,9 @@ sources or mode monitors.
     Check 8, m = 8, 9, 10: -0.052, -0.112, -0.167 % (res 40), +0.022, -0.001, -0.023 % (res 60), +0.037, +0.025,
     +0.012 % (res 80); Q of m = 8 to 10: 7.8e4 to 6.7e5, 2.0e5 to 1.1e6, 2.8e5 to 1.5e6. The fit of check 8 gives
     G = 0.081 to 0.091 um^-1 (inverse diagonal: 0.124 to 0.138): also first order, with a smaller first-order
-    term, but larger errors at res 40. 3-D strip (check 2, res 20): T_mode changes by at most 1.5e-6, neff by
-    +1.7e-4 to +4.0e-4. The default stays the diagonal of the inverse tensor, which follows Kottke et al.;
+    term, but larger errors at res 40 for m = 9 and 10. 3-D strip (check 2, res 20): T_mode changes by at most
+    1.5e-6, neff by +1.7e-4 to +4.0e-4. The default stays the diagonal of the inverse tensor, which follows Kottke
+    et al.;
   - <eps> and <1/eps> come from fixed sample points (a rank-1 lattice of 1024, 1974 and 2042 points per voxel in
     1-D, 2-D and 3-D), not from an adaptive integration with a tolerance (`subpixel_tol` is not accepted). The
     fill fraction of a plane normal to an axis is exact to 1 / (2 n): 4.9e-4 in 1-D and 3-D, 5.07e-4 in 2-D;
@@ -92,17 +93,19 @@ sources or mode monitors.
     the about 2000 points of a voxel, up to 1.3e-3 of eps in 1.3 % of the voxels of the test geometry
     (`test_numpy_and_jax_agree`);
   - fdtdx gets the components through the linear blend of one material over the background (`_voxels.py`): the
-    float32 rounding of the blend is up to 3e-5 of eps for an object below the background
-    (`test_fdtdx_gets_the_components_and_get_epsilon`).
+    float32 rounding of the blend is below 3e-5 of eps for objects below the background (the bound of
+    `test_fdtdx_gets_the_components_and_get_epsilon`; measured 1.1e-5 for its geometry).
   `eps_averaging=False` gives the staircase (each cell takes the material of its center), which converges at
   about first order in the cell size. On a periodic axis (`k_point=Vector3()` and no PML on that axis) the objects
-  repeat across the faces, as in the MIT package, for the staircase and for the average
-  (`test_periodic_faces_repeat_objects`). Setup time (`--case setup`: a 3-D strip and ring in an 8 x 4 x 4 um
-  cell): 3.48 s at res 20 (1.0 M cells, 36,688 sampled voxels; with the start of JAX and the compile), then 2.92 s
-  at res 50 (16 M cells, 247,880 voxels) in the same process. The 2-D checks take 0.02 to 0.7 s. Small problems
-  are sampled with NumPy, larger ones on the GPU. `get_epsilon` returns 3 / (1/eps_xx + 1/eps_yy + 1/eps_zz) of
-  each cell (each component at its own Yee point). `setup_seconds` (NaN before) and `n_averaged` (the number of
-  sampled voxels) are set by `get_epsilon()` and `run()`.
+  repeat across the faces, for the staircase and for the average (`test_periodic_faces_repeat_objects`): each copy
+  that touches the cell. Difference: the MIT package (its default `ensure_periodicity`) also repeats the objects
+  along an axis with a PML when k_point is set; this package does not. `k_point` with a PML on one side of an axis
+  only raises NotImplementedError (fdtdx would make the whole axis periodic). Setup time (`--case setup`: a 3-D
+  strip and ring in an 8 x 4 x 4 um cell): 3.48 s at res 20 (1.0 M cells, 36,688 sampled voxels; with the start of
+  JAX and the compile), then 2.92 s at res 50 (16 M cells, 247,880 voxels) in the same process. The 2-D checks take
+  0.02 to 0.7 s. Small problems are sampled with NumPy, larger ones on the GPU. `get_epsilon` returns
+  3 / (1/eps_xx + 1/eps_yy + 1/eps_zz) of each cell (each component at its own Yee point). `setup_seconds` (NaN
+  before) and `n_averaged` (the number of sampled voxels) are set by `get_epsilon()` and `run()`.
 - **float32 fields**, and the time step of fdtdx: dt = 0.99 dx / (c sqrt 3) in all dimensions (`Courant` is
   ignored).
 - **One-way mode sources.** `EigenModeSource` is the fdtdx TFSF mode source: the mode is solved at the center

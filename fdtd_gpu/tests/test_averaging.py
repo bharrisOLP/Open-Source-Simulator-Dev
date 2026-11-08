@@ -160,6 +160,17 @@ def test_periodic_faces_repeat_objects():
                          boundary_layers=[fg.PML(0.5, direction=fg.Y)])._periodic_axes() == (True, False, False)
     assert fg.Simulation(cell_size=cell, resolution=40, boundary_layers=[fg.PML(0.5)])._periodic_axes() == (
         False, False, False)
+    # a material face between the last and the first cell: the block [0.003, 0.253] crosses x = 0.25 (its copy ends
+    # at x = -0.247). The same block moved by -4 cells has no face there: its arrays, rolled by 4 cells, must agree.
+    # The E_x voxel of the last cell needs the wrapped index of the first cell (this fails with mode="edge").
+    e = run([fg.Block(size=fg.Vector3(0.25, 0.37, fg.inf), center=fg.Vector3(0.128, 0.1), material=si)])
+    f = run([fg.Block(size=fg.Vector3(0.25, 0.37, fg.inf), center=fg.Vector3(0.028, 0.1), material=si)])
+    assert np.array_equal(e[0], np.roll(f[0], 4, axis=0))
+    assert np.allclose(e[1], np.roll(f[1], 4, axis=1), rtol=1e-9, atol=0)
+    assert 2.2 < e[1][0, -1, 44, 0] < 11.8                            # the E_x voxel on the face x = 0.25 is mixed
+    with pytest.raises(NotImplementedError):                          # fdtdx would wrap the whole x axis
+        fg.Simulation(cell_size=fg.Vector3(0.5, 2.0, 0), resolution=40, k_point=fg.Vector3(),
+                      boundary_layers=[fg.PML(0.5, direction=fg.Y), fg.PML(0.2, direction=fg.X, side=fg.High)])
 
 
 def test_numpy_and_jax_agree():
@@ -195,8 +206,8 @@ def test_fdtdx_gets_the_components_and_get_epsilon():
             assert sim.n_averaged > 0 and not np.allclose(sim.eps3[1], sim.eps3[2])
         else:
             assert inv.shape == (1, 20, 40, 3) and np.max(np.abs(inv[0] * sim.eps - 1)) < 1e-6
-    # objects below the background (eps 11.9): the blend of fdtdx has a mask of up to (11.9 - 1) / 2 in size, which
-    # increases its float32 rounding (about 1e-5)
+    # objects below the background (eps 11.9): the blend of fdtdx has a mask down to (1 - 11.9) / 1 = -10.9 for E_x and
+    # E_y (step 1) and -5.45 for E_z (step 2), which increases its float32 rounding (bound below: 3e-5)
     geom = [fg.Block(size=fg.Vector3(fg.inf, 0.37, fg.inf), material=fg.Medium(index=2.0)),
             fg.Cylinder(radius=0.3, center=fg.Vector3(0.1, 0.3), material=fg.Medium(index=1.0))]
     sim = fg.Simulation(cell_size=fg.Vector3(1.0, 2.0, 0), resolution=20, geometry=geom,
