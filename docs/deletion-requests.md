@@ -105,3 +105,9 @@ line, then delete it yourself or reject it.
 | 2026-11-08 | GPU computer | `/tmp/rv_n2f_302c.py` | a scratch script of a reviewer (tests and checks) | not needed: no result depends on it |
 | 2026-11-08 | GPU computer | `/tmp/rvw_chk.py` | a scratch file of a reviewer (tests and checks) | not needed: no result depends on it |
 | 2026-11-08 | GPU computer | `/tmp/rvw_out.txt` | a scratch file of a reviewer (tests and checks) | not needed: no result depends on it |
+| 2026-11-08 | GPU computer | `/tmp/rv8_emul.py`, `/tmp/rv8_gpu.py` | scratch scripts of a reviewer (tests and checks) | not needed: no result depends on them |
+| 2026-11-08 | GPU computer | `/tmp/fdtd-disp/`, but not `rows3.jsonl` and `rows3_tail.jsonl` | the scratch rows and scripts of the fdtd_gpu agent | not needed: `rows4.jsonl` equals the logged rows; `rows2.jsonl`, `drude.jsonl`, the scripts and the `.err` files are cited nowhere. Keep `rows3.jsonl` and `rows3_tail.jsonl` (the first form of the change; a committed review quotes them; the lead's log of the same 15 rows is `benchmarks/2026-11-08/fdtd-gpu-dispersion-v1.jsonl`) |
+| 2026-11-08 | GPU computer | `/tmp/addon-suite-list.txt`, `/tmp/addon-suite/` | the module list and the pytest temporary folders of the add-on suite runs | not needed: the logged rows are in benchmarks/ |
+| 2026-11-08 | GPU computer | `/tmp/rev8_nan_door_check.py`, `/tmp/rev8-chunkdiv-basetemp/`, `/tmp/rev8-chunkdiv-basetemp2/` | a scratch script and pytest folders of a reviewer | not needed: no result depends on them |
+| 2026-11-08 | GPU computer | `/tmp/os_sim_jaxdev_probe.py` | a scratch probe of the lead (the JAX default device after an EME import) | not needed: the test fix does not depend on it |
+| 2026-11-08 | GPU computer | `/tmp/rv_c1663_lock`, `/tmp/rv_c1663_lockA` to `/tmp/rv_c1663_lockE`, `/tmp/rv_c1663_lockG` | empty lock files of a reviewer (tests of the timeout) | not needed: no result depends on them |

@@ -5,18 +5,32 @@ Updated: 2026-11-08.
 ## In work
 
 **Now (2026-11-08; the fourth to eighth waves, one agent per package).** Each change gets one review before its
-commit. In work (eighth wave): the add-on route, more of the add-on's 409 test modules on the AMD GPU (one at a
-time); fdtd_gpu, dispersive materials (Drude and Lorentz); photonsuite, EME against FDTD with subpixel averaging on
-a taper. Done after the seventh wave: the near-to-far follow-ups (63b31de, 1e801bc).
+commit. The eighth wave is done (below); the ninth wave is in planning.
+- Eighth wave (new features), done: fdtd_gpu, Drude and Lorentz dispersion on the ADE of fdtdx 0.6.3 and
+  D_conductivity on its semi-implicit conductivity update (0a4c4b0; fdtdx needed no patch; a fill-fraction face
+  rule, second order for E parallel to a face on the exact Yee grid (the FDTD follows it to res 200, then the
+  float32 ADE coefficients limit it); on a Lorentz film 0.504 um thick the MIT rule and the staircase have 3.8 to
+  8.9 times its error; checks against the
+  transfer matrix and the exact Yee grid; a derived stability bound that a run enforces); photonsuite, EME against
+  3-D FDTD with subpixel averaging on a short SOI taper (f7ecdea; the FDTD T00 converges to about 0.909 at
+  1.55 um; meow's EME gives 0.876 to 0.919 and does not converge in the mode count up to 40 modes; the probable
+  cause: its interface solve does not conserve power, a gain of 0.8 to 1.2 % without correction); the add-on
+  route, all 409 test modules of the add-on on the AMD GPU (698a2a4; 379 clean with four patches, each failure of
+  the other 30 sorted; patch 0004: a subtraction with a NaN subtrahend inverts the sign bit of the NaN on this GPU, now
+  host-ordered in the source deposit). The fdtd_gpu and add-on reviews failed first and were fixed: an off-grid
+  check tested no face inside a cell, and the face rule was worse than the MIT rule there (fdtd_gpu); patch 0004
+  missed the second subtraction of the deposit (add-on). The GPU computer had no problem during the 409-module
+  runs (kernel 7.0.0-42).
 - Seventh wave (new features), done: charge_gpu, temperature dependence from 250 to 500 K (42e1e84; n_i(T) of
   Misiakos and Tsamakis, the Arora mobility(T), tau ~ T^-1/2; bit-identical at 300 K; the long-base diode within
   0.5 % of Shockley(T); at 360 K the depletion modulator has 19.6 to 19.7 % more series resistance and 17.0 to
   20.6 % less intrinsic bandwidth, at 0 to 4 V reverse bias); photonsuite, the switching time of a thermo-optic
-  phase shifter (a24b9c6; the phase from the thermal transient and one mode solve, the exact first-order derivative; 17.94 us with constant kappa, 17.61
-  us (on) and 17.87 us (off) with Si and SiO2 kappa(T)); fdtd_gpu, a near-to-far-field transform with exact
-  Green's functions (c17cb93; second order against the analytic dipole and line-source fields; far-field power
-  equal to the box flux to 0.3 %; fdtdx applies the source current half a time step late, documented). In work:
-  the minor review findings of the near-to-far change.
+  phase shifter (a24b9c6; the phase from the thermal transient and one mode solve, the exact first-order
+  derivative; 17.94 us with constant kappa, 17.61 us (on) and 17.87 us (off) with Si and SiO2 kappa(T)); fdtd_gpu,
+  a near-to-far-field transform with exact Green's functions (c17cb93; second order against the analytic dipole
+  and line-source fields; far-field power equal to the box flux to 0.3 %; fdtdx applies the source current half a
+  time step late, documented). Its review follow-ups are done (63b31de, 1e801bc), except two optional wording notes
+  of review b6be8c2f2946 (the near-to-far text of `fdtd_gpu/README.md`; in the ninth wave).
 - Sixth wave (new features), done: thermal_gpu, transients with kappa(T) and rho c_p(T) (486b1d5; second order
   in dt against solve_ivp; timings a47f265: a second run costs 1.8x to 2.6x the constant-kappa transient with Si
   and SiO2 kappa(T)); optics_gpu, a type-1 non-uniform FFT for the image sum (ab60025; at tol 1e-12, 1.3x to about
@@ -123,12 +137,20 @@ Findings (git-ignored clones in `.local/upstream/`):
   enables the add-on's bulk read for this build (exact: 0 words differ), and the setup is now 1.9 s (2-D) and
   13.0 to 13.2 s (3-D) against 1.25 s and 11.6 s on the CPU solver. Whole runs with the kernel tables, after a
   warm-up run in the same process: 2.19x to 2.34x faster in 2-D and 3.12x to 3.37x in 3-D (the array path: 1.36x
-  and 2.61x; small runs stay slower on the GPU) (`benchmarks/2026-11-07/addon-bench-full-0003.jsonl`). The three
-  patches are installed in the pinned clone. Keep `.local/addon-runs/` (the raw logs, the saved fields and the
-  empty log file whose time stamp dates the crash) and `.local/upstream/addon-work-3` (the state that made
-  `addon-bench-full.jsonl`) on the GPU computer: they are the evidence of committed claims. Nothing is certified on
-  AMD (the kernels run with `MEEP_GPU_HARDWARE=any`). Next: more of the add-on's 409 test modules (its pytest
-  paths), one at a time.
+  and 2.61x; small runs stay slower on the GPU) (`benchmarks/2026-11-07/addon-bench-full-0003.jsonl`). The patches
+  are installed in the pinned clone (0004 in its final form since the run of 2026-11-08, 09:05). Keep
+  `.local/addon-runs/` (the raw logs, the saved fields and the empty log file whose time stamp dates the crash)
+  and `.local/upstream/addon-work-3` (the state that made `addon-bench-full.jsonl`) on the GPU computer: they are
+  the evidence of committed claims. Nothing is certified on AMD (the kernels run with `MEEP_GPU_HARDWARE=any`).
+- **Add-on route: the whole test suite of the add-on (698a2a4, 2026-11-08).** `addon_gpu/suite_runner.py` ran
+  all 409 test modules, one at a time, each with a 300 s limit. With the four patches 379 are clean; the failures
+  of the other 30 are certification records (expected; 40 tests), the environment (230 tests and 97 errors: the
+  solver 1.35.0 refuses `D_conductivity_offdiag`, the `keep` policy needs a CuPy cache folder with `ftz_stripped`
+  in its name, the hardware switch), Triton 3.8 (2) and a test-order defect of the add-on (1). Patch 0004: on this
+  GPU `a - b` with a NaN `b` inverts the sign bit of the NaN (NumPy on the host keeps it); the two device
+  subtractions of the source deposit now take the NaN in the host's order on ROCm builds. Logs:
+  `benchmarks/2026-11-08/addon-*`. Open: the CuPy cache folder of `tools/env/addon_gpu_activate.sh`; `timeout -k`
+  in `tools/gpu_run.sh`; the float32 `D - P` update of `deposit_repair.py` keeps the GPU's NaN sign.
 
 **3. bands-gpu (the method of MPB): version 0.1 works.** Folder: `bands_gpu/` (`bands_gpu/README.md`).
 - Plane-wave operator with FFTs, anisotropic subpixel averaging, block LOBPCG (stabilized), warm start on the k
@@ -233,7 +255,7 @@ The user asked to start with Meep and meow. After those two, the order is by com
 | # | Tool | Open-source base | GPU path on AMD | Complexity | Notes |
 |---|---|---|---|---|---|
 | 1 | meow (EME) | meow (Apache-2) + own FDE solver | JAX on ROCm | medium | v0.1 done; improvements open |
-| 2 | Meep (FDTD) | Meep (GPL-2); GPU forks: Erised add-on (Triton/CUDA), gpmeep (CUDA C++) | CuPy-ROCm + Triton-AMD, HIP, or fdtdx | very high | fdtdx route v0.1 done (`fdtd_gpu/`, subpixel averaging); the add-on route runs on AMD (`addon_gpu/`, three patches; not certified) |
+| 2 | Meep (FDTD) | Meep (GPL-2); GPU forks: Erised add-on (Triton/CUDA), gpmeep (CUDA C++) | CuPy-ROCm + Triton-AMD, HIP, or fdtdx | very high | fdtdx route v0.1 done (`fdtd_gpu/`, subpixel averaging); the add-on route runs on AMD (`addon_gpu/`, four patches; all 409 test modules of the add-on ran; not certified) |
 | 3 | MPB (band and mode solver) | MPB (GPL-2) | plane-wave basis: FFT + block eigensolver in JAX | medium-high | v0.1 done (own code: `bands_gpu/`) |
 | 4 | Thermal | own finite-volume solver (femwell / scikit-fem as references) | CG on GPU (JAX) | medium | v0.1 done (`thermal_gpu/`) |
 | 5 | ZEMAX (ray + physical optics) | Optiland (MIT, PyTorch) + own physical optics | PyTorch on ROCm | medium | v0.1 done (`optics_gpu/`) |
