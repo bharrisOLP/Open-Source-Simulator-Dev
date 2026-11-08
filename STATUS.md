@@ -4,7 +4,8 @@ Updated: 2026-11-07.
 
 ## In work
 
-**Now (fourth wave, 2026-10-30): four agents, one package each.** Each change gets one review before its commit.
+**Now (2026-11-07; the fourth and fifth waves, one agent per package).** Each change gets one review before its
+commit.
 - Done: charge_gpu, the coupled Newton step on the GPU (297baf2; 5.8x to 5.9x faster than SuperLU at 5 nm) and
   a follow-up of its review (f937f57); optics_gpu, all focus planes in one pass (0bbad9f; 3.1x per plane in
   complex128, about 27x in complex64); meow_gpu, the profile of the batched path (88d5158; the taper in mixed
@@ -18,8 +19,14 @@ Updated: 2026-11-07.
   same fix in the top-level example `examples/chip_to_fiber_coupling.py` (the documents commit of 2026-11-07);
   fdtd_gpu, objects repeat across periodic faces (eade281).
 - Done on 2026-11-07, late: the add-on route of item 2 runs on the AMD GPU (a6938b6; time loop 16x to 28x faster
-  than the serial CPU solver on a 2.1-million-cell 3-D case; a longer setup). In work: its minor review findings
-  and the install of the patches into the pinned clone.
+  than the serial CPU solver on a 2.1-million-cell 3-D case; a longer setup); its review follow-up (21bb956: patch
+  0002 by parameter name, CuPy pinned to 14.2.0, whole-run times; the patches are installed into the pinned clone).
+- Fifth wave (2026-11-07, night; the minor findings of the last reviews): fdtd_gpu, an error for k_point with a
+  one-sided PML, a test of the wrap padding and a faster rasterize (0f13a8b); meow_gpu, a warm-start test on the
+  SiN tip and a lock for the BLAS limit (f0bf399); charge_gpu, sweep() raises an error of the device solve at once
+  (9127c9b); the add-on route, patch 0003 (the bulk read of the permittivity for this build; ebfec13): the setup
+  before the first step falls from 21-42 s to 1.9 s (2-D) and 13.0 to 13.2 s (3-D), so whole runs with the kernel
+  tables are now faster on the GPU.
 - 2026-11-07, the GPU computer stopped at about 16:49:53 EST (the kernel time stamps; the last journal entry is
   16:49:44): the kernel (7.0.0-38-generic) stopped with an Oops in the
   amdgpu/TTM memory manager ("list_del corruption" and "list_add corruption", then a NULL pointer dereference in
@@ -90,11 +97,17 @@ Findings (git-ignored clones in `.local/upstream/`):
   flushed them silently, a wrong-arithmetic defect). Both kernel tables equal the add-on's array path word for
   word, and agree with the CPU solver to 8.3e-6 or better (field, relative L2). Time loop on a 2,097,152-cell 3-D case
   (1,280 steps): 37.7 s on the serial CPU solver (float64), 1.34 s with the hand-written table (28x) and 2.35 s
-  with Triton (16x), in float32; but the setup before the first step is longer on the GPU route (39-42 s against
-  11.5 s), so a whole short run gains little in 3-D and is slower in 2-D
-  (`benchmarks/2026-11-07/addon-bench-full.jsonl`).
-  Nothing is certified on AMD (the kernels run with `MEEP_GPU_HARDWARE=any`). Next: install the patches into the
-  pinned clone, the minor review findings, a faster setup, and more of the add-on's 409 test modules (its pytest paths).
+  with Triton (16x), in float32 (`benchmarks/2026-11-07/addon-bench-full.jsonl`). The setup before the first step
+  was longer on the GPU route (39-42 s against 11.5 s), a per-point read of the permittivity; patch 0003 (ebfec13)
+  enables the add-on's bulk read for this build (exact: 0 words differ), and the setup is now 1.9 s (2-D) and
+  13.0 to 13.2 s (3-D) against 1.25 s and 11.6 s on the CPU solver. Whole runs with the kernel tables, after a
+  warm-up run in the same process: 2.19x to 2.34x faster in 2-D and 3.12x to 3.37x in 3-D (the array path: 1.36x
+  and 2.61x; small runs stay slower on the GPU) (`benchmarks/2026-11-07/addon-bench-full-0003.jsonl`). The three
+  patches are installed in the pinned clone. Keep `.local/addon-runs/` (the raw logs, the saved fields and the
+  empty log file whose time stamp dates the crash) and `.local/upstream/addon-work-3` (the state that made
+  `addon-bench-full.jsonl`) on the GPU computer: they are the evidence of committed claims. Nothing is certified on
+  AMD (the kernels run with `MEEP_GPU_HARDWARE=any`). Next: more of the add-on's 409 test modules (its pytest
+  paths), one at a time.
 
 **3. bands-gpu (the method of MPB): version 0.1 works.** Folder: `bands_gpu/` (`bands_gpu/README.md`).
 - Plane-wave operator with FFTs, anisotropic subpixel averaging, block LOBPCG (stabilized), warm start on the k
@@ -199,7 +212,7 @@ The user asked to start with Meep and meow. After those two, the order is by com
 | # | Tool | Open-source base | GPU path on AMD | Complexity | Notes |
 |---|---|---|---|---|---|
 | 1 | meow (EME) | meow (Apache-2) + own FDE solver | JAX on ROCm | medium | v0.1 done; improvements open |
-| 2 | Meep (FDTD) | Meep (GPL-2); GPU forks: Erised add-on (Triton/CUDA), gpmeep (CUDA C++) | CuPy-ROCm + Triton-AMD, HIP, or fdtdx | very high | fdtdx route v0.1 done (`fdtd_gpu/`, subpixel averaging); the add-on route runs on AMD (`addon_gpu/`, two patches; not certified) |
+| 2 | Meep (FDTD) | Meep (GPL-2); GPU forks: Erised add-on (Triton/CUDA), gpmeep (CUDA C++) | CuPy-ROCm + Triton-AMD, HIP, or fdtdx | very high | fdtdx route v0.1 done (`fdtd_gpu/`, subpixel averaging); the add-on route runs on AMD (`addon_gpu/`, three patches; not certified) |
 | 3 | MPB (band and mode solver) | MPB (GPL-2) | plane-wave basis: FFT + block eigensolver in JAX | medium-high | v0.1 done (own code: `bands_gpu/`) |
 | 4 | Thermal | own finite-volume solver (femwell / scikit-fem as references) | CG on GPU (JAX) | medium | v0.1 done (`thermal_gpu/`) |
 | 5 | ZEMAX (ray + physical optics) | Optiland (MIT, PyTorch) + own physical optics | PyTorch on ROCm | medium | v0.1 done (`optics_gpu/`) |

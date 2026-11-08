@@ -69,3 +69,21 @@ line, then delete it yourself or reject it.
 | 2026-11-07 | GPU computer | `/tmp/rev_addon_k3_cuda_2.json` | a scratch file of a reviewer (tests and checks) | not needed: no result depends on it |
 | 2026-11-07 | GPU computer | `/tmp/rev_addon_k3_triton_0.json` | a scratch file of a reviewer (tests and checks) | not needed: no result depends on it |
 | 2026-11-07 | GPU computer | `/tmp/rev_addon_k3_triton_2.json` | a scratch file of a reviewer (tests and checks) | not needed: no result depends on it |
+| 2026-11-07 | GPU computer | `/tmp/rv18fed_raster.py` | a scratch script of a reviewer (tests and checks) | not needed: no result depends on it |
+| 2026-11-07 | GPU computer | `/tmp/rv18fed_checks.py` | a scratch script of a reviewer (tests and checks) | not needed: no result depends on it |
+| 2026-11-07 | GPU computer | `/tmp/rev7047_keyer.py` | a scratch script of a reviewer (tests and checks) | not needed: no result depends on it |
+| 2026-11-07 | GPU computer | `/tmp/rv_meow6_warm.py` | a scratch script of a reviewer (tests and checks) | not needed: no result depends on it |
+| 2026-11-07 | GPU computer | `/tmp/rv_meow6_blas.py` | a scratch script of a reviewer (tests and checks) | not needed: no result depends on it |
+| 2026-11-07 | GPU computer | `/tmp/rv380508_gen.py` | a scratch script of a reviewer (tests and checks) | not needed: no result depends on it |
+| 2026-11-07 | GPU computer | `/tmp/rv380508_mut.py` | a scratch script of a reviewer (tests and checks) | not needed: no result depends on it |
+| 2026-11-07 | GPU computer | `/tmp/rv380508_mut3.py` | a scratch script of a reviewer (tests and checks) | not needed: no result depends on it |
+| 2026-11-07 | GPU computer | `/tmp/rv380508_probe.py` | a scratch script of a reviewer (tests and checks) | not needed: no result depends on it |
+| 2026-11-07 | GPU computer | `/tmp/rv380508_far.py` | a scratch script of a reviewer (tests and checks) | not needed: no result depends on it |
+| 2026-11-07 | GPU computer | `/tmp/rev7a71_fresh/ (a folder: a clone of the add-on)` | scratch files of a reviewer (tests and checks) | not needed: no result depends on them |
+| 2026-11-07 | GPU computer | `/tmp/rev7a71_err/ (a folder: a clone of the add-on)` | scratch files of a reviewer (tests and checks) | not needed: no result depends on them |
+| 2026-11-07 | GPU computer | `/tmp/rev7a71_loop.sh` | scratch files of a reviewer (tests and checks) | not needed: no result depends on them |
+| 2026-11-07 | GPU computer | `/tmp/rev7a71_bulk.py` | scratch files of a reviewer (tests and checks) | not needed: no result depends on them |
+| 2026-11-07 | GPU computer | `/tmp/rev7a71_bulk.log` | scratch files of a reviewer (tests and checks) | not needed: no result depends on them |
+| 2026-11-07 | GPU computer | `os-simulator-dev/.local/upstream/addon-work-1` (a folder in the git-ignored .local/upstream there) | a work copy of the add-on with an early draft of patch 0001 that is in no commit | not needed: no result depends on it |
+| 2026-11-07 | GPU computer | `os-simulator-dev/.local/upstream/addon-work-2` | a work copy of the add-on with patch 0001 only | not needed: tools/env/addon_patches/0001 rebuilds it |
+| 2026-11-07 | GPU computer | `os-simulator-dev/.local/upstream/addon-work-4` | a work copy of the add-on with the three patches | not needed: the pinned clone `erised-fork` holds the same state (tools/env/addon_gpu.sh) |
