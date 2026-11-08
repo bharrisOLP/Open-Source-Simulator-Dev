@@ -164,31 +164,46 @@ def test_a_device_solve_that_fails_is_not_used(monkeypatch):
     assert np.max(np.abs(g.psi - ref.psi)) < 1e-12
 
 
+@pytest.mark.parametrize("kind", [jax.errors.JaxRuntimeError, MemoryError], ids=lambda k: k.__name__)
 @pytest.mark.parametrize("where", ["solve", "setup"])
-def test_a_device_error_falls_back_to_superlu(monkeypatch, where):
-    """A device continuity solve, or the setup of the device continuity solver, that raises
-    jax.errors.JaxRuntimeError (as at a device out of memory): that step uses SuperLU, the error is counted by type
-    in linear_errors and given as a RuntimeWarning; the solution is the Newton solution. (Before, the error went to
-    the caller; sweep() then halved its step.) A TypeError (a programming error) propagates."""
+def test_a_device_error_falls_back_to_superlu(monkeypatch, where, kind):
+    """A device continuity solve, or the setup of the device continuity solver, that raises a device error
+    (jax.errors.JaxRuntimeError, as at a device out of memory, or MemoryError): that step uses SuperLU, the error is
+    counted by type in linear_errors and given as a RuntimeWarning that points to the caller (this file); the
+    solution is the Newton solution. (Before, the error went to the caller; sweep() then halved its step.)"""
     dev, _ = junction(n=200)
     ref = dd.solve(dev, 1.0, 0.0)
 
     def fail(*args, **kw):
-        raise jax.errors.JaxRuntimeError("RESOURCE_EXHAUSTED: out of memory (test)")
+        raise kind("RESOURCE_EXHAUSTED: out of memory (test)")
 
     monkeypatch.setattr(continuity.Solver, "solve" if where == "solve" else "__init__", fail)
-    with pytest.warns(RuntimeWarning, match="device linear solve failed.*JaxRuntimeError.*out of memory"):
+    with pytest.warns(RuntimeWarning, match=f"device linear solve failed.*{kind.__name__}.*out of memory") as rec:
         g = dd.solve(dev, 1.0, 0.0, method="gummel", linear="device")
+    assert all(w.filename == __file__ for w in rec if "device linear solve" in str(w.message))
     assert g.converged and g.linear_fallbacks == 2 * g.iterations and g.krylov_iterations == 0
-    assert g.linear_errors == {"JaxRuntimeError": 2 * g.iterations}
+    assert g.linear_errors == {kind.__name__: 2 * g.iterations}
     assert np.max(np.abs(g.psi - ref.psi)) < 1e-12
 
+
+@pytest.mark.parametrize("kind", [TypeError, ValueError, RuntimeError], ids=lambda k: k.__name__)
+@pytest.mark.parametrize("where", ["solve", "setup"])
+def test_other_errors_of_the_device_continuity_solve_propagate(monkeypatch, where, kind):
+    """Errors of the device continuity solve or its setup that are not device errors (programming errors: a
+    TypeError, a plain ValueError, a plain RuntimeError) leave dd.solve with their type, a note and no warning; no
+    fallback to SuperLU."""
+    dev, _ = junction(n=200)
+
     def bug(*args, **kw):
-        raise TypeError("a programming error (test)")
+        raise kind("a programming error (test)")
 
     monkeypatch.setattr(continuity.Solver, "solve" if where == "solve" else "__init__", bug)
-    with pytest.raises(TypeError, match="programming error"):
-        dd.solve(dev, 1.0, 0.0, method="gummel", linear="device")
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        with pytest.raises(kind, match="programming error") as raised:
+            dd.solve(dev, 1.0, 0.0, method="gummel", linear="device")
+    assert type(raised.value) is kind and raised.value.charge_gpu_device_solve
+    assert not [w for w in caught if "device linear solve failed" in str(w.message)]
 
 
 def test_backward_error_of_both_linear_solvers():

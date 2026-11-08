@@ -1,0 +1,41 @@
+............................................
+one solve at 1.0 V: 21 FGMRES steps, residual 2.16e-11, max |y - y_superlu| / max |y_superlu| = 1.47e-10, setup 0.006 s, krylov 2.820 s
+.
+  FGMRES steps per Newton step: 18.6
+PIN 0 to 1.0 V: 21 solves, 119 Newton, 2215 FGMRES steps, max residual 9.946e-11
+  0.6 V: Newton steps 6 (SuperLU 6), FGMRES 110, psi 1.7e-15 V, n 5.1e-14, p 5.2e-14, I 6.9e-11, index 8.5e-15, I = 0.0107308 A/m
+  0.9 V: Newton steps 6 (SuperLU 6), FGMRES 109, psi 4.6e-15 V, n 2.4e-15, p 2.8e-15, I 5.6e-14, index 2.2e-16, I = 5.49452 A/m
+  1.0 V: Newton steps 5 (SuperLU 5), FGMRES 95, psi 5.0e-15 V, n 1.3e-15, p 1.4e-15, I 1.9e-14, index 0.0e+00, I = 31.1892 A/m
+.
+  FGMRES steps per Newton step: 17.6
+pin reverse: 5 solves, 29 Newton, 511 FGMRES steps, max residual 9.946e-11
+  -2.0 V: psi 1.6e-14 V, n 2.2e-13, p 3.6e-13, I -1.121e-07 and -1.121e-07 A/m
+.
+  FGMRES steps per Newton step: 15.9
+pn reverse: 9 solves, 57 Newton, 904 FGMRES steps, max residual 9.548e-11
+  -1.0 V: psi 9.3e-15 V, n 4.1e-14, p 4.3e-14, I -7.493e-09 and -7.494e-09 A/m
+  -4.0 V: psi 2.3e-14 V, n 1.1e-13, p 1.6e-13, I -2.249e-08 and -2.249e-08 A/m
+.
+  FGMRES steps per Newton step: 18.5
+junction reverse: 51 solves, 304 Newton, 5632 FGMRES steps, max residual 9.976e-11
+  -1.0 V: psi 9.4e-16 V, n 3.8e-14, p 2.8e-14
+  -5.0 V: psi 8.9e-15 V, n 2.2e-13, p 1.7e-13
+  -25.0 V: psi 2.6e-13 V, n 3.3e-12, p 7.1e-12
+.
+  FGMRES steps per Newton step: 22.8
+long-base diode 0 to 0.8 V: 17 solves, 82 Newton, 1872 FGMRES steps, max residual 9.928e-11
+  0.3 V: J / J_Shockley 1.897020 (SuperLU 1.897020), psi 1.6e-15 V, n 6.2e-14, p 6.3e-14, dI 0.0e+00 A/m (0.0e+00)
+  0.6 V: J / J_Shockley 1.004094 (SuperLU 1.004094), psi 1.0e-15 V, n 3.9e-14, p 3.9e-14, dI 0.0e+00 A/m (0.0e+00)
+  0.65 V: J / J_Shockley 1.001546 (SuperLU 1.001546), psi 8.3e-16 V, n 3.2e-14, p 3.2e-14, dI 0.0e+00 A/m (0.0e+00)
+  0.7 V: J / J_Shockley 0.999355 (SuperLU 0.999355), psi 3.3e-16 V, n 1.7e-14, p 1.4e-14, dI 1.6e-15 A/m (3.8e-11)
+  0.75 V: J / J_Shockley 0.990809 (SuperLU 0.990809), psi 3.3e-16 V, n 1.2e-14, p 1.2e-14, dI 0.0e+00 A/m (0.0e+00)
+  0.8 V: J / J_Shockley 0.939446 (SuperLU 0.939446), psi 7.2e-16 V, n 3.2e-14, p 2.9e-14, dI 0.0e+00 A/m (0.0e+00)
+.
+far start 0.6 V ((400, 1)): Newton steps 11 (SuperLU 11), FGMRES 130 (11.8 per Newton step), psi 2.8e-16 V, n 1.0e-14, p 1.3e-14, I 8.0e-08, max residual 9.01e-11, linear solves 0.164 s (SuperLU 0.005 s)
+
+far start -3.0 V ((400, 1)): Newton steps 13 (SuperLU 17), FGMRES 213 (16.4 per Newton step), psi 6.0e-15 V, n 1.6e-13, p 1.2e-13, I 8.3e-02, max residual 9.34e-09, linear solves 0.231 s (SuperLU 0.008 s)
+  3 V: I = -2.71e-10 A/m (SuperLU -2.96e-10 A/m), difference 2.5e-11 A/m; generation current at most 8.0e-11 A/m
+
+far start 0.4 V ((20, 20)): Newton steps 8 (SuperLU 8), FGMRES 73 (9.1 per Newton step), psi 5.6e-17 V, n 1.3e-15, p 2.7e-15, I 4.0e-09, max residual 4.81e-11, linear solves 0.572 s (SuperLU 0.019 s)
+...........................
+77 passed in 112.65s (0:01:52)

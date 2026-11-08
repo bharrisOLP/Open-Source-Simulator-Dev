@@ -343,6 +343,15 @@ def _device_failed(stats, exc):
                       skip_file_prefixes=(os.path.dirname(os.path.abspath(__file__)) + os.sep,))
 
 
+def _mark_device_solve_error(exc):
+    """Mark an error of the device linear solve that is not a device error (a programming error, for example a
+    TypeError, a plain RuntimeError or a LinAlgError): it propagates with its type, a note, and the attribute
+    ``charge_gpu_device_solve``, so that sweep() raises it at once and does not take it for a failed bias step."""
+    exc.charge_gpu_device_solve = True
+    exc.add_note("charge_gpu: raised by the device linear solve (linear='device'); not a device error "
+                 "(continuity.SpanError, jax.errors.JaxRuntimeError, MemoryError), so no fallback to SuperLU")
+
+
 def _newton(m: _Mesh, psi, n, p, tau_n, tau_p, tol, max_iter, dpsi_max, linear="superlu"):
     """The coupled Newton method. linear: "superlu" (sparse direct LU on the CPU, the reference) or "device"
     (coupled.Solver: FGMRES with the block multigrid preconditioner on the JAX device). A device solve that is not
@@ -377,6 +386,9 @@ def _newton(m: _Mesh, psi, n, p, tau_n, tau_p, tol, max_iter, dpsi_max, linear="
                     stats["residual"] = res.residual if last is None else max(last, res.residual)
             except _device_errors() as exc:
                 _device_failed(stats, exc)
+            except Exception as exc:
+                _mark_device_solve_error(exc)
+                raise
             if y is None:
                 stats["fallbacks"] += 1
         if y is None:
@@ -479,6 +491,9 @@ def _gummel(dev, m: _Mesh, psi, n, p, tau_n, tau_p, tol, max_iter, linear="super
             except _device_errors() as exc:
                 _device_failed(stats, exc)
                 res = None
+            except Exception as exc:
+                _mark_device_solve_error(exc)
+                raise
         if res is not None and res.converged:
             c, omega = res.c, res.backward_error
         else:
@@ -643,31 +658,40 @@ def sweep(dev: Device, biases, step: float = 0.05, min_step: float = 1e-3, metho
     """Solutions at the forward biases V = v_p - v_n (v_n = 0; a negative V is a reverse bias), in the given order.
     Continuation from 0 V (started from poisson.solve): steps of at most ``step``, each solve started from the last
     converged solution. A failed solve (not converged, or a RuntimeError or LinAlgError of the linear solver, for
-    example a singular LU factor of SuperLU) halves the step, down to min_step, then RuntimeError. A device error
-    (jax.errors.JaxRuntimeError, MemoryError) of a Newton or continuity linear solve with linear="device" does not
-    come here: solve() solves that step with SuperLU, counts it in DDSolution.linear_errors and gives a
-    RuntimeWarning. A device error of the Gummel Poisson step (on the device for both linear options, not covered
-    by that fallback) is a RuntimeError, so it halves the step here. kw goes to solve() (not ``guess``: sweep sets
-    it)."""
+    example a singular LU factor of SuperLU) halves the step, down to min_step, then RuntimeError; that error names
+    the last exception and has it as its cause (``raise ... from``). Not a failed step, raised at once:
+    NotImplementedError and RecursionError (programming errors), and every error of a device linear solve
+    (linear="device") that is not a device error (marked by solve(): for example a plain RuntimeError, a
+    NotImplementedError or a LinAlgError of the device code). A device error (continuity.SpanError,
+    jax.errors.JaxRuntimeError, MemoryError) of a Newton or continuity linear solve does not come here: solve()
+    solves that step with SuperLU, counts it in DDSolution.linear_errors and gives a RuntimeWarning. A device error
+    of the Gummel Poisson step (on the device for both linear options, not covered by that fallback) is a
+    RuntimeError, so it halves the step here (and is the cause of the final error). kw goes to solve() (not
+    ``guess``: sweep sets it)."""
     if "guess" in kw:
         raise ValueError("sweep starts from poisson.solve at 0 V and sets guess itself: do not give guess")
     cur = solve(dev, 0.0, 0.0, method=method, **kw)
     if not cur.converged:
         raise RuntimeError("drift-diffusion did not converge at 0 V")
-    v_cur, h, out = 0.0, step, []
+    v_cur, h, out, last = 0.0, step, [], None
     for v in biases:
         while abs(v - v_cur) > 1e-12:
             dv = float(np.clip(v - v_cur, -h, h))
             v_new = v if abs(v - v_cur - dv) < 1e-12 else v_cur + dv
             try:
                 trial = solve(dev, 0.0, v_new, guess=cur, method=method, **kw)
-            except (RuntimeError, np.linalg.LinAlgError):
-                trial = None
+            except (RuntimeError, np.linalg.LinAlgError) as exc:
+                if (isinstance(exc, (NotImplementedError, RecursionError))
+                        or getattr(exc, "charge_gpu_device_solve", False)):
+                    raise
+                trial, last = None, exc
             if trial is not None and trial.converged:
-                cur, v_cur, h = trial, v_new, min(step, 1.5 * h)
+                cur, v_cur, h, last = trial, v_new, min(step, 1.5 * h), None
             else:
                 h /= 2
                 if h < min_step:
-                    raise RuntimeError(f"drift-diffusion did not converge from {v_cur} V to {v_new} V")
+                    cause = f" (last error: {type(last).__name__}: {last})" if last is not None else ""
+                    raise RuntimeError(f"drift-diffusion did not converge from {v_cur} V to {v_new} V{cause}") \
+                        from last
         out.append(cur)
     return out

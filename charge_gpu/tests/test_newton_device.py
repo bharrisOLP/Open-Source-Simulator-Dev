@@ -17,7 +17,7 @@ from charge_gpu import drift_diffusion as dd  # noqa: E402
 from charge_gpu.injection import rib_index_change, rib_pin  # noqa: E402
 from charge_gpu.modulator import rib_pn  # noqa: E402
 from charge_gpu.poisson import thermal_voltage  # noqa: E402
-from test_drift_diffusion import TAU_LB, _Guess, long_base  # noqa: E402
+from test_drift_diffusion import NOISE, TAU_LB, _Guess, long_base  # noqa: E402
 from test_junction import junction  # noqa: E402
 
 VT = thermal_voltage()
@@ -196,7 +196,8 @@ def test_far_starts_without_continuation():
     """The device Newton from far starts, with no continuation: 0 V from the perturbed state of test_drift_diffusion
     (20 mV on psi, 30 % on n and p) gives poisson.solve; the 1-D junction at 0.6 V forward and 3 V reverse from the
     poisson.solve guess, and the block with an xmin and a ymax contact (an L-shaped current path) of
-    test_drift_diffusion at 0.4 V: the SuperLU Newton solution (at most 2 more Newton steps), no fallback."""
+    test_drift_diffusion at 0.4 V: the SuperLU Newton solution (psi 1e-13 V, n and p 1e-11; Newton steps at most 2
+    more than SuperLU and at most 20), no fallback; at 3 V the current to 1e-9 A/m (absolute, see below)."""
     from charge_gpu.poisson import Contact, Device, solve as poisson_solve
 
     dev, _ = junction(n=400)
@@ -225,8 +226,22 @@ def test_far_starts_without_continuation():
               f"max residual {s.linear_error:.2e}, linear solves {s.timings['linear_s']:.3f} s "
               f"(SuperLU {r.timings['linear_s']:.3f} s)")
         assert s.converged and s.linear_fallbacks == 0 and not s.linear_errors
-        assert s.iterations <= r.iterations + 2 and s.linear_error <= coupled.ACCEPT
-        assert diff[0] < 1e-12 and diff[1] < 1e-9 and diff[2] < 1e-9, diff
+        assert s.iterations <= min(r.iterations + 2, 20) and s.linear_error <= coupled.ACCEPT
+        assert diff[0] < 1e-13 and diff[1] < 1e-11 and diff[2] < 1e-11, diff
+        if v_n > 0:
+            # 3 V reverse: the current is the generation current of the depletion region, at most
+            # q (n_i / 2 tau) W A (SRH with n, p << n_i; W of the depletion approximation, Sze; A = 1 um x 1 m):
+            # 8e-11 A/m, below the round-off floor of the contact currents (NOISE, 1e-9 A/m; the majority drift and
+            # diffusion terms of a contact face are about 1e5 A/m). So a relative difference of the two currents is
+            # noise (some percent in earlier runs); the check is absolute, to NOISE.
+            from charge_gpu.poisson import EPS0, Q
+            vbi = VT * np.log(1e24 * 1e24 / d.n_i**2)
+            w_dep = np.sqrt(2 * 11.7 * EPS0 * (vbi + v_n - 2 * VT) / Q * 2 / 1e24)
+            i_gen = Q * d.n_i / (2 * dd.TAU_SI) * w_dep * d.y[-1]
+            print(f"  3 V: I = {s.current:.2e} A/m (SuperLU {r.current:.2e} A/m), difference "
+                  f"{abs(s.current - r.current):.1e} A/m; generation current at most {i_gen:.1e} A/m")
+            assert i_gen < NOISE and abs(s.current) < NOISE and abs(r.current) < NOISE
+            assert abs(s.current - r.current) < NOISE
 
 
 def test_a_device_solve_that_fails_is_not_used(monkeypatch):
@@ -257,26 +272,33 @@ def test_a_device_solve_that_fails_is_not_used(monkeypatch):
     assert np.max(np.abs(g.psi - ref.psi)) < 1e-12
 
 
-def _device_oom(*args, **kw):
-    """A device error as jax gives it at a device out of memory (jax.errors.JaxRuntimeError, a RuntimeError)."""
-    raise jax.errors.JaxRuntimeError("RESOURCE_EXHAUSTED: out of memory (test)")
+# the device errors that fall back to SuperLU, as they come: jax.errors.JaxRuntimeError (a device out of memory,
+# RESOURCE_EXHAUSTED; a RuntimeError) and MemoryError (host memory)
+DEVICE_ERRORS = [jax.errors.JaxRuntimeError, MemoryError]
 
 
+def device_error_of(kind):
+    def fail(*args, **kw):
+        raise kind("RESOURCE_EXHAUSTED: out of memory (test)")
+    return fail
+
+
+@pytest.mark.parametrize("kind", DEVICE_ERRORS, ids=lambda k: k.__name__)
 @pytest.mark.parametrize("where", ["solve", "setup"])
-def test_a_device_error_falls_back_to_superlu(monkeypatch, where):
-    """A device solve that raises jax.errors.JaxRuntimeError (as at a device out of memory), in the solve or in the
-    setup of the solver: that Newton step uses SuperLU, the error is counted by type in linear_errors and given as a
-    RuntimeWarning that points to the caller (this file), and the solution is the SuperLU solution. sweep() reaches
-    the bias with no step halving (before, the error went to sweep, which halved the step down to min_step and then
-    reported "did not converge")."""
+def test_a_device_error_falls_back_to_superlu(monkeypatch, where, kind):
+    """A device solve that raises jax.errors.JaxRuntimeError (as at a device out of memory) or MemoryError, in the
+    solve or in the setup of the solver: that Newton step uses SuperLU, the error is counted by type in
+    linear_errors and given as a RuntimeWarning that points to the caller (this file), and the solution is the
+    SuperLU solution. sweep() reaches the bias with no step halving (before, the error went to sweep, which halved
+    the step down to min_step and then reported "did not converge")."""
     dev, _ = junction(n=200)
     ref = dd.solve(dev, 0.0, 0.6)
-    monkeypatch.setattr(coupled.Solver, "solve" if where == "solve" else "__init__", _device_oom)
-    with pytest.warns(RuntimeWarning, match="device linear solve failed.*JaxRuntimeError.*out of memory") as rec:
+    monkeypatch.setattr(coupled.Solver, "solve" if where == "solve" else "__init__", device_error_of(kind))
+    with pytest.warns(RuntimeWarning, match=f"device linear solve failed.*{kind.__name__}.*out of memory") as rec:
         g = dd.solve(dev, 0.0, 0.6, linear="device")
     assert all(w.filename == __file__ for w in rec if "device linear solve" in str(w.message))
     assert g.converged and g.linear_fallbacks == g.iterations
-    assert g.linear_errors == {"JaxRuntimeError": g.iterations}
+    assert g.linear_errors == {kind.__name__: g.iterations}
     assert g.krylov_iterations == 0 and g.linear_error is None
     assert np.max(np.abs(g.psi - ref.psi)) < 1e-12
     calls = []
@@ -290,7 +312,7 @@ def test_a_device_error_falls_back_to_superlu(monkeypatch, where):
     with pytest.warns(RuntimeWarning, match="device linear solve failed"):
         s = dd.sweep(dev, [0.1], step=0.05, linear="device")[0]
     assert s.converged and s.bias == pytest.approx(0.1) and calls == [0.0, 0.05, 0.1]
-    assert s.linear_errors == {"JaxRuntimeError": s.iterations}
+    assert s.linear_errors == {kind.__name__: s.iterations}
 
 
 @pytest.mark.parametrize("error", [TypeError("a programming error (test)"),
@@ -309,9 +331,65 @@ def test_other_errors_of_the_device_solve_propagate(monkeypatch, error):
     monkeypatch.setattr(coupled.Solver, "solve", fail)
     with warnings.catch_warnings(record=True) as caught:
         warnings.simplefilter("always")
-        with pytest.raises(type(error), match="test"):
+        with pytest.raises(type(error), match="test") as raised:
             dd.solve(dev, 0.0, 0.6, linear="device")
     assert not [w for w in caught if "device linear solve failed" in str(w.message)]
+    assert raised.value.charge_gpu_device_solve and "not a device error" in " ".join(raised.value.__notes__)
+
+
+@pytest.mark.parametrize("method", ["newton", "gummel"])
+@pytest.mark.parametrize("kind", [RuntimeError, NotImplementedError, np.linalg.LinAlgError], ids=lambda k: k.__name__)
+def test_sweep_raises_an_error_of_the_device_solve_at_once(monkeypatch, method, kind):
+    """sweep() takes a RuntimeError or a LinAlgError of a solve as a failed bias step (for example a singular LU
+    factor of SuperLU) and halves the step. An error of the device linear solve that is not a device error (here: a
+    plain RuntimeError, a NotImplementedError, a LinAlgError, raised after the 0 V solve) is a programming error:
+    sweep() raises it at once, with its type and text (before, it halved the step down to min_step and raised
+    "did not converge" with no cause)."""
+    dev, _ = junction(n=200)
+    target = coupled.Solver if method == "newton" else continuity.Solver
+    real = target.solve
+    count = {"calls": 0, "solves": 0}
+
+    def fail_later(self, *args, **kw):
+        count["calls"] += 1
+        if count["solves"] >= 1:
+            raise kind(f"a {kind.__name__} of the device code (test)")
+        return real(self, *args, **kw)
+
+    real_solve = dd.solve
+
+    def counted(*args, **kw):
+        out = real_solve(*args, **kw)
+        count["solves"] += 1
+        return out
+
+    monkeypatch.setattr(target, "solve", fail_later)
+    monkeypatch.setattr(dd, "solve", counted)
+    with pytest.raises(kind, match="of the device code") as raised:
+        dd.sweep(dev, [0.1], step=0.05, method=method, linear="device")
+    assert type(raised.value) is kind and raised.value.charge_gpu_device_solve
+    assert count["solves"] == 1 and count["calls"] > 1    # the 0 V solve only: no step halving
+
+
+def test_sweep_names_the_cause_of_a_failed_step(monkeypatch):
+    """A RuntimeError of a solve that is not from the device solve (as a singular LU factor of SuperLU) at every
+    step: sweep() halves the step down to min_step, then raises RuntimeError "did not converge" that names the last
+    error and has it as its cause."""
+    dev, _ = junction(n=200)
+    real_solve = dd.solve
+    calls = []
+
+    def singular(dev_, v_n, v_p, **kw):
+        calls.append(v_p)
+        if len(calls) > 1:
+            raise RuntimeError("Factor is exactly singular")
+        return real_solve(dev_, v_n, v_p, **kw)
+
+    monkeypatch.setattr(dd, "solve", singular)
+    with pytest.raises(RuntimeError, match="did not converge.*last error: RuntimeError: Factor is exactly") as raised:
+        dd.sweep(dev, [0.1], step=0.1, min_step=0.03)
+    assert isinstance(raised.value.__cause__, RuntimeError) and "singular" in str(raised.value.__cause__)
+    assert calls[1:] == pytest.approx([0.1, 0.05])
 
 
 def test_solution_info():

@@ -185,27 +185,31 @@ unknowns.
   its true relative residual is at most 1e-6 (`coupled.ACCEPT`): an inexact Newton step (Dembo, Eisenstat and
   Steihaug 1982), and the residual F of each Newton step is exact (host). Why not 1e-10 as the limit: in some Newton
   steps far from the solution the true residual stagnates above 1e-10 (the test of the 1-D junction at 3 V reverse,
-  started from `poisson.solve`, uses a solve at about 8e-9: 8.1e-9 and 8.5e-9 in two runs; probably round-off: the
-  preconditioned vectors span many decades); with 1e-10 as the limit such a step would use SuperLU. In all
-  continuation tests every solve reaches 1e-10 (largest 9.97e-11; the tests check 1e-9).
+  started from `poisson.solve`, uses a solve at 9.3e-9 in the run of 2026-11-07; probably round-off: the
+  preconditioned vectors span many decades); with 1e-10 as the limit such a step would use SuperLU. In the
+  continuation tests every solve is at most 1e-9 (asserted; at most 9.98e-11 in the run of 2026-11-07).
 - A solve that is not used (above 1e-6, not finite) or that raises a device error is replaced by SuperLU for that
   Newton step and counted in `linear_fallbacks`. The device errors are only these: `continuity.SpanError` (the span
   limit of the Slotboom scaling), `jax.errors.JaxRuntimeError` (an error of the device runtime, for example
   RESOURCE_EXHAUSTED at a device out of memory) and MemoryError. They are counted by type in `linear_errors`, and
   each one other than the span limit also gives a RuntimeWarning at the call of the user (so `sweep()` does not
-  take a device error for a failed bias step). All other errors propagate: also a ValueError, a plain RuntimeError
-  or a NotImplementedError of the device solve (programming errors; tests). `krylov_iterations` (FGMRES steps),
-  `linear_error` (the largest relative residual of the device solves; None when no device solve was used) and
-  `timings` (assembly, setup, krylov, linear) report the solves.
+  take a device error for a failed bias step). All other errors propagate, with their type and a note: also a
+  ValueError, a plain RuntimeError, a NotImplementedError or a LinAlgError of the device solve (programming
+  errors; tests). `sweep()` raises such an error at once and does not take it for a failed bias step (it halves
+  the step only for a solve that does not converge, or for a RuntimeError or LinAlgError that is not from the
+  device solve, for example a singular LU factor; its final error names the last one and has it as its cause).
+  `krylov_iterations` (FGMRES steps), `linear_error` (the largest relative residual of the device solves; None
+  when no device solve was used) and `timings` (assembly, setup, krylov, linear) report the solves.
 - Cost per Newton step: the Jacobian assembly on the host (as for SuperLU), the three hierarchies on the host (the
   2 x 2 coarsening and a 256-cell LU inverse), the copies to the device, and on average 19 to 27 FGMRES steps in
-  the logged bench rows (9.1 to 22.9 in the test prints), each 2.2 to 2.9 ms on the RX 7900 XT (logged rows). The
-  first solve on a new mesh compiles the step (the one-step warm-up of the bench: 1.5 s at 36 600 cells, 2.4 s at
-  146 400 cells). Memory: two blocks of 61 and 60 vectors of the unknowns (170 MB at 146 400 cells).
+  the logged bench rows (9.1 to 22.8 in the test prints of the run of 2026-11-07), each 2.2 to 2.9 ms on the
+  RX 7900 XT (logged rows). The first solve on a new mesh compiles the step (the one-step warm-up of the bench:
+  1.5 s at 36 600 cells, 2.4 s at 146 400 cells). Memory: two blocks of 61 and 60 vectors of the unknowns (170 MB
+  at 146 400 cells).
 - Default: SuperLU. The device path is faster on the 2-D rib (bench below) but slower on small meshes: on the 1-D
-  junction (400 cells, 0.6 V from `poisson.solve`, 11 Newton steps) its linear solves take 0.21 to 0.23 s against
-  0.007 s with SuperLU (test prints of three runs). It also adds the compile time per mesh. Use `linear="device"`
-  for 2-D meshes like the rib of the bench (36 600 cells and more).
+  junction (400 cells, 0.6 V from `poisson.solve`, 11 Newton steps) its linear solves took 0.164 s against
+  0.005 s with SuperLU (test prints of the run of 2026-11-07). It also adds the compile time per mesh. Use
+  `linear="device"` for 2-D meshes like the rib of the bench (36 600 cells and more).
 
 ## Checks (`tests/test_junction.py`, `tests/test_rc.py`)
 
@@ -297,19 +301,26 @@ All values from the GPU computer (the FGMRES loops on the RX 7900 XT, rocm:0). R
 SuperLU (same discretization, same scaled system). The differences: psi in V; n and p relative, where the
 reference is above 1 cm^-3; the contact currents relative to the largest contact current. Continuation in 50 mV
 steps (forward) or 0.5 V steps (reverse) from 0 V, each bias step started from the last device solution.
+"Tests" are the asserted bounds. The measured values are the test prints (`pytest -q -s`) of one run, the run of
+2026-11-07 (77 passed; its output is `benchmarks/2026-11-07/charge-tests.txt`); they change from run to run in the
+last digits (the order of the sums on the GPU; at the
+far starts also the number of Newton steps, see that row).
 
 | Case | Reference | Agreement |
 |---|---|---|
 | ELL product of J_s on the device, PIN rib (10 nm, contacts 1 um from the center), first Newton step from 0.95 V to 1.0 V | the scipy product | test 1e-14 of \|J_s\| \|v\| per row |
 | One linear solve, the same step (high injection) | SuperLU of the same scaled system | 21 FGMRES steps, true relative residual 2.2e-11; max \|y - y_SuperLU\| / max \|y_SuperLU\| = 1.5e-10 (test 1e-8); with 2 steps the flag is False |
-| PIN rib, 0 to 1.0 V (21 solves, 119 Newton steps, 2219 FGMRES steps), tau 1 ns | SuperLU Newton (`sweep`) | no fallback; at 0.6, 0.9, 1.0 V: the same Newton steps (6, 6, 5); psi 2.3e-15, 3.2e-15, 2.8e-15 V; n and p 3.3e-14 or better; contact currents 3.4e-11, 8.4e-14, 2.9e-14 (I = 0.0107, 5.49, 31.2 A/m); rib index change 2.4e-15 or better (tests 1e-11 V, 1e-8, 1e-8, 1e-8, 1e-8); each column carries I to 1e-9 of I (test) |
-| PIN rib at 2 V reverse; the depletion-modulator rib (`rib_pn`, 3e17 cm^-3, 10 nm, contacts 1 um from the center) at 1 and 4 V reverse | SuperLU Newton | no fallback; psi 1.0e-14, 7.3e-15, 2.8e-14 V; n and p 2.0e-13 or better (tests 1e-11 V, 1e-8); the generation currents (-1.121e-7, -7.493e-9, -2.249e-8 A/m) the same to the 4 printed digits, except -7.493e-9 against -7.494e-9 A/m at 1 V (test 1e-9 A/m) |
-| 1-D junction (1e18 cm^-3, 2.5 nm cells) at 1, 5, 25 V reverse (51 solves, 304 Newton steps) | SuperLU Newton | no fallback; psi 2.3e-15, 1.1e-14, 4.3e-13 V; n 7.2e-14, 2.3e-13, 3.7e-12; p 8.7e-14, 3.7e-13, 4.6e-12 (tests 1e-12 V, 1e-9) |
-| Long-base diode of the Shockley check, 0 to 0.8 V (17 solves, 82 Newton steps) | Shockley J0 (exp(V/V_T) - 1); SuperLU Newton | J / J_Shockley = 1.897020, 1.004094, 1.001546, 0.999355, 0.990809, 0.939446 at 0.3, 0.6, 0.65, 0.7, 0.75, 0.8 V: the SuperLU values to all 7 digits (test 1 % from 0.6 to 0.75 V); the current equals the SuperLU current exactly (difference 0.0 in two runs; test 1e-8 of I or 1e-9 A/m); psi below 1e-15 V, n and p below 5e-14 (two runs: 6.1e-16 and 7.8e-16 V; 2.8e-14 and 3.1e-14; the values change slightly from run to run); the contact sum and each cross-section (tests 1e-12 and 1e-9 A/m, as the SuperLU test) |
-| Far starts, no continuation: 1-D junction at 0 V from the perturbed state (20 mV, 30 %); at 0.6 V and 3 V reverse from `poisson.solve`; the L-shaped block (xmin and ymax contacts) at 0.4 V | `poisson.solve` at 0 V (tests 1e-11 V, 1e-9); SuperLU Newton for the other three | no fallback; the other three: Newton steps 11, 13, 8 (SuperLU 11, 16 or 17, 8; the 3 V counts change from run to run, the start `poisson.solve` runs on the GPU; test: at most 2 more than SuperLU); psi below 5e-14 V, n and p below 1e-12 (tests 1e-12 V, 1e-9; at 3 V in two runs: psi 1.2e-14 and 1.6e-14 V, n 3.7e-13 and 6.1e-13, p 3.2e-13 and 4.3e-13; at 0.6 V and 0.4 V: psi 2.2e-16 and 5.6e-17 V, n and p 7.1e-15 or better); at 3 V one solve stops at a relative residual of about 8e-9 (8.1e-9 and 8.5e-9 in two runs; stagnation; used, because it is below 1e-6) |
-| A device solve flagged not converged; `SPAN_MAX` below the psi span | SuperLU Newton | every Newton step solved with SuperLU (`linear_fallbacks` = the Newton steps), psi to 1e-12 V (tests); `linear_error` None; `linear_errors` = {"SpanError": the Newton steps}, no warning |
-| A device solve or the setup of the device solver raises `jax.errors.JaxRuntimeError` (as at a device out of memory); also inside `sweep()`; the same for a Gummel continuity solve and its setup (`tests/test_dd_device.py`) | SuperLU Newton | every step solved with SuperLU, `linear_errors` = {"JaxRuntimeError": the steps}, a RuntimeWarning with the error text at the line of the caller, psi to 1e-12 V; `sweep(dev, [0.1], step=0.05)` solves at 0, 0.05 and 0.1 V only (no step halving) (tests) |
-| The device solve raises a TypeError, a ValueError (as a numpy broadcast error), a plain RuntimeError or a NotImplementedError (programming errors) | | the error leaves `dd.solve` unchanged, no fallback, no warning (tests; Gummel: a TypeError, in the solve and in the setup) |
+| PIN rib, 0 to 1.0 V, tau 1 ns | SuperLU Newton (`sweep`) | tests: no fallback, every solve at a relative residual of at most 1e-9; at 0.6, 0.9, 1.0 V psi 1e-11 V, n and p 1e-8, contact currents 1e-8, rib index change 1e-8; each column carries I to 1e-9 of I. Run of 2026-11-07: 21 solves, 119 Newton steps, 2215 FGMRES steps; at 0.6, 0.9, 1.0 V the same Newton steps as SuperLU (6, 6, 5); psi 1.7e-15, 4.6e-15, 5.0e-15 V; n and p 5.2e-14 or better; contact currents 6.9e-11, 5.6e-14, 1.9e-14 (I = 0.0107, 5.49, 31.2 A/m); rib index change 8.5e-15 or better |
+| PIN rib at 2 V reverse; the depletion-modulator rib (`rib_pn`, 3e17 cm^-3, 10 nm, contacts 1 um from the center) at 1 and 4 V reverse | SuperLU Newton | tests: no fallback, residual 1e-9; psi 1e-11 V, n and p 1e-8, the generation currents to 1e-9 A/m. Run of 2026-11-07: psi 1.6e-14, 9.3e-15, 2.3e-14 V; n and p 3.6e-13 or better; currents -1.121e-7, -7.493e-9 (SuperLU -7.494e-9), -2.249e-8 A/m |
+| 1-D junction (1e18 cm^-3, 2.5 nm cells) at 1, 5, 25 V reverse (51 solves, 304 Newton steps) | SuperLU Newton | tests: no fallback, residual 1e-9; psi 1e-12 V, n and p 1e-9. Run of 2026-11-07: psi 9.4e-16, 8.9e-15, 2.6e-13 V; n 3.8e-14, 2.2e-13, 3.3e-12; p 2.8e-14, 1.7e-13, 7.1e-12 |
+| Long-base diode of the Shockley check, 0 to 0.8 V (17 solves, 82 Newton steps) | Shockley J0 (exp(V/V_T) - 1); SuperLU Newton | tests: no fallback, residual 1e-9; J / J_Shockley within 1 % from 0.6 to 0.75 V; the current of SuperLU to 1e-8 of I or 1e-9 A/m; psi 1e-11 V, n and p 1e-8; the contact sum 1e-12 A/m, each cross-section 1e-9 A/m (as the SuperLU test). Run of 2026-11-07: J / J_Shockley = 1.897020, 1.004094, 1.001546, 0.999355, 0.990809, 0.939446 at 0.3, 0.6, 0.65, 0.7, 0.75, 0.8 V, the SuperLU values to all 7 digits; the current equal to SuperLU (difference 0.0, at 0.7 V 1.6e-15 A/m); psi 1.6e-15 V or better, n and p 6.3e-14 or better |
+| Far starts, no continuation: 1-D junction at 0 V from the perturbed state (20 mV, 30 %); at 0.6 V and 3 V reverse from `poisson.solve`; the L-shaped block (xmin and ymax contacts) at 0.4 V | `poisson.solve` at 0 V (tests 1e-11 V, 1e-9); SuperLU Newton for the other three | tests: no fallback; every solve at most 1e-6 (ACCEPT); the other three: psi 1e-13 V, n and p 1e-11, Newton steps at most 2 more than SuperLU and at most 20; at 3 V the current of SuperLU to 1e-9 A/m, and both currents below 1e-9 A/m. Run of 2026-11-07, the other three: Newton steps 11, 13, 8 (SuperLU 11, 17, 8; the SuperLU count at 3 V changes from run to run: 16, 17 and 23 in the runs of the review records); psi 2.8e-16, 6.0e-15, 5.6e-17 V; n and p 1.6e-13 or better; at 3 V one solve stops at the relative residual 9.3e-9 (stagnation; used, because it is below 1e-6) |
+| The same, 3 V reverse: the contact current | the SRH generation current of the depletion region, at most q (n_i / 2 tau) W A = 8.0e-11 A/m (n, p << n_i; W = 0.10 um of the depletion approximation, Sze; tau 1 us, A = 1 um x 1 m) | below the round-off floor of the contact currents (1e-9 A/m: the majority drift and diffusion terms of a contact face are about 1e5 A/m), so only absolute checks are valid (tests above). Run of 2026-11-07: -2.71e-10 A/m (SuperLU -2.96e-10 A/m), difference 2.5e-11 A/m. The relative difference (8.3e-2 in this run) is the noise of a current near the floor, not an error of the device solve |
+| A device solve flagged not converged; `SPAN_MAX` below the psi span | SuperLU Newton | every Newton step solved with SuperLU (`linear_fallbacks` = the Newton steps), psi to 1e-12 V (tests); `linear_error` None; `linear_errors` = {"SpanError": the Newton steps}, no warning (tests, also for Gummel) |
+| A device solve or the setup of the device solver raises `jax.errors.JaxRuntimeError` (as at a device out of memory) or MemoryError; also inside `sweep()`; the same for a Gummel continuity solve and its setup (`tests/test_dd_device.py`) | SuperLU Newton | every step solved with SuperLU, `linear_errors` = {the error type: the steps}, a RuntimeWarning with the error text at the line of the caller (Newton and Gummel tests check the file), psi to 1e-12 V; `sweep(dev, [0.1], step=0.05)` solves at 0, 0.05 and 0.1 V only (no step halving) (tests) |
+| The device solve raises a TypeError, a ValueError (as a numpy broadcast error), a plain RuntimeError or a NotImplementedError (programming errors) | | the error leaves `dd.solve` with its type, a note and the attribute `charge_gpu_device_solve`; no fallback, no warning (tests; Gummel: a TypeError, a ValueError and a RuntimeError, in the solve and in the setup) |
+| In `sweep()`: the device solve (Newton or Gummel) raises a plain RuntimeError, a NotImplementedError or a LinAlgError after the 0 V solve | | `sweep()` raises that error at once, with its type and text; no step halving (tests). Before, `sweep()` took it for a failed bias step and raised "did not converge" with no cause |
+| In `sweep()`: every solve after 0 V raises a RuntimeError that is not from the device solve (as a singular LU factor of SuperLU) | | the step is halved down to `min_step` (0.1 V, then 0.05 V), then RuntimeError "did not converge ... (last error: RuntimeError: Factor is exactly singular)", with that error as its cause (test) |
 | Solution info | | `linear`, `device`, `linear_error` (above 0, at most 1e-6; None when no device solve was used), `timings` (assembly, setup, krylov, linear); SuperLU: `linear_error` None |
 
 ## Example: depletion modulator (`examples/pn_modulator.py`)
@@ -519,20 +530,22 @@ GPU (10 and 5 nm), and to 3.3e-10 (10 nm) and 5.6e-10 (5 nm) with it on the CPU.
 - Drift-diffusion solvers: both methods can run their linear solves on the device (`linear="device"`). On the SOI
   rib (the bench above) the device Newton is the fastest path: 0.44 to 0.50 s at 10 nm and 0.81 to 0.83 s at 5 nm,
   against 0.76 to 0.77 s and 4.8 s with SuperLU and 1.08 to 20.5 s for the device Gummel path. SuperLU stays the
-  default: on small meshes (the 1-D tests) it is much faster (0.007 s against 0.21 to 0.23 s of linear solves on
-  the 400-cell junction), and the device path compiles once per mesh (1.5 to 2.4 s). Gummel converges linearly (16
-  iterations at 0.6 V, 42 at 0.9 V) and stalls on long devices with large cells (the 1.6 mm long-base diode); the
-  device Newton does not (the long-base diode test).
+  default: on small meshes (the 1-D tests) it is much faster (0.005 s against 0.164 s of linear solves on the
+  400-cell junction, the run of 2026-11-07), and the device path compiles once per mesh (1.5 to 2.4 s). Gummel
+  converges linearly (16 iterations at 0.6 V, 42 at 0.9 V) and stalls on long devices with large cells (the 1.6 mm
+  long-base diode); the device Newton does not (the long-base diode test).
 - The device Newton: the Jacobian is assembled on the host and the hierarchies are built on the host per Newton
   step (about half of its time at 5 nm); the host loop of FGMRES makes two device-to-host transfers per step
   (2.2 to 2.9 ms per step in the logged bench). Its preconditioner leaves out the upper-triangle couplings
   (Poisson from the quasi-Fermi levels, electrons from holes): 19 to 27 FGMRES steps per Newton step on average in
   the logged bench. Far from the solution (reverse bias from `poisson.solve`) some solves stagnate above the target
-  1e-10 (about 8e-9 in the 3 V far-start test); they are used as inexact Newton steps (limit 1e-6). Not tested: meshes
-  above 146 400 cells. Above a psi span of 31 V (the Slotboom limit of `continuity.py`) every Newton step uses
-  SuperLU. A device error (`jax.errors.JaxRuntimeError`, for example an out of memory, or MemoryError) makes that
-  step use SuperLU, with a RuntimeWarning; other errors propagate. A device error of the Gummel Poisson step is not
-  covered: it goes to the caller (in `sweep()` it halves the step).
+  1e-10 (9.3e-9 in the 3 V far-start test, run of 2026-11-07); they are used as inexact Newton steps (limit
+  1e-6). Not tested: meshes above 146 400 cells. Above a psi span of 31 V (the Slotboom limit of `continuity.py`)
+  every Newton step uses SuperLU. A device error (`jax.errors.JaxRuntimeError`, for example an out of memory, or
+  MemoryError) makes that step use SuperLU, with a RuntimeWarning; other errors propagate (`sweep()` raises them at
+  once). A persistent device error is tried again at each step (a real out of memory takes about 10 s before it
+  fails, review record of 2026-11-07). A device error of the Gummel Poisson step is not covered: it goes to the
+  caller (in `sweep()` it halves the step, and the final error names it).
 - The device continuity solver is tested from 1.0 V forward (PIN rib) to 25 V reverse (1-D junction, 1e18 cm^-3);
   its limit is a psi span of 1200 V_T (31 V) in the semiconductor (float64 range of the Slotboom scaling). A solve
   that does not converge, or a span above the limit, falls back to SuperLU for that step (`linear_fallbacks`).
