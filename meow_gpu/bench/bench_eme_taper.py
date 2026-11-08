@@ -15,10 +15,12 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import time
-from concurrent.futures import ProcessPoolExecutor
 
-import numpy as np
+os.environ.setdefault("OMP_NUM_THREADS", "1")   # before numpy: OpenBLAS reads it when it loads
+import time  # noqa: E402
+from concurrent.futures import ProcessPoolExecutor  # noqa: E402
+
+import numpy as np  # noqa: E402
 
 
 def build(n_cells: int, dx: float, w0: float = 0.5, w1: float = 2.0, length: float = 10.0):
@@ -109,5 +111,4 @@ def main():
 
 
 if __name__ == "__main__":
-    os.environ.setdefault("OMP_NUM_THREADS", "1")
     main()

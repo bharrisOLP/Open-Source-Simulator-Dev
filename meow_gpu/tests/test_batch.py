@@ -215,28 +215,88 @@ def test_compute_modes_gpu_batch_equals_per_cell(batch):
     assert all(i.warm for i in s.last_batch_info) == (batch < len(css))
 
 
+def _logged_solver(events: list) -> GPUModeSolver:
+    """A single-precision solver that adds "solve" to events at the start of each batched solve."""
+    s = GPUModeSolver(precision="single", extra=4)
+    solve_batch = s.solve_batch
+
+    def logged(*args, **kwargs):
+        events.append("solve")
+        return solve_batch(*args, **kwargs)
+
+    s.solve_batch = logged
+    return s
+
+
 def test_batch_post_processing_runs_beside_the_solve():
-    """The post-processing of each cell runs in a second thread (beside the solve of the next batch), and an error
-    in it reaches the caller."""
+    """The post-processing of each cell runs in a second thread, beside the solve of the next batch. At most one batch
+    waits for its post-processing: the post-processing of batch j ends before the solve of batch j + 2 starts. An
+    error in the post-processing reaches the caller after the next solve, not after the last solve."""
     import threading
-    css = _taper(n_cells=3)
-    in_main = []
+    css = _taper(n_cells=4)                   # batch=1: 4 batches of 1 cell, in the order of the cells
+    events, in_main = [], []
 
     def pp(modes):
         in_main.append(threading.current_thread() is threading.main_thread())
-        return post_process_modes(modes)
+        out = post_process_modes(modes)
+        events.append("post")
+        return out
 
-    got = compute_modes_gpu_batch(css, num_modes=K, solver=GPUModeSolver(precision="single", extra=4), post_process=pp,
-                                  batch=2)
-    assert len(got) == 3 and all(len(m) > 0 for m in got)
-    assert len(in_main) == 3 and not any(in_main)
+    got = compute_modes_gpu_batch(css, num_modes=K, solver=_logged_solver(events), post_process=pp, batch=1)
+    assert len(got) == 4 and all(len(m) > 0 for m in got)
+    assert len(in_main) == 4 and not any(in_main)
+    solves = [i for i, e in enumerate(events) if e == "solve"]
+    posts = [i for i, e in enumerate(events) if e == "post"]
+    assert len(solves) == 4 and len(posts) == 4
+    assert all(posts[j] < solves[j + 2] for j in range(2))
 
     def bad(modes):
         raise RuntimeError("an error in the post-processing")
 
+    events.clear()
     with pytest.raises(RuntimeError, match="an error in the post-processing"):
-        compute_modes_gpu_batch(css, num_modes=K, solver=GPUModeSolver(precision="single", extra=4), post_process=bad,
-                                batch=2)
+        compute_modes_gpu_batch(css, num_modes=K, solver=_logged_solver(events), post_process=bad, batch=1)
+    assert events == ["solve", "solve"]       # the error of batch 0 comes after the solve of batch 1
+
+
+def test_host_pool_keeps_one_blas_thread():
+    """The host thread pool of the batched solve runs with one BLAS thread (threadpoolctl), also when the BLAS has
+    more threads, and the BLAS thread count is the same after the pool."""
+    tp = pytest.importorskip("threadpoolctl")
+    import meow_gpu.fde.eigensolver as E
+
+    def blas_threads():
+        return [i["num_threads"] for i in tp.threadpool_info() if i["user_api"] == "blas"]
+
+    if E.HOST_THREADS < 2:
+        pytest.skip("one CPU: no host thread pool")
+    with tp.threadpool_limits(limits=4, user_api="blas"):
+        before = blas_threads()
+        assert before and max(before) > 1
+        seen = E._host_map(blas_threads, [()] * 4)
+        assert all(n and set(n) == {1} for n in seen)
+        assert blas_threads() == before
+
+
+def test_host_pool_without_a_blas_limit(monkeypatch):
+    """Without threadpoolctl and without OMP_NUM_THREADS=1, the host steps run in the main thread, with a warning;
+    with OMP_NUM_THREADS=1 they run in the pool."""
+    import threading
+
+    import meow_gpu.fde.eigensolver as E
+    monkeypatch.setattr(E, "ThreadpoolController", None)
+    monkeypatch.setattr(E, "HOST_THREADS", 4)
+    monkeypatch.setattr(E, "_WARNED", [False])
+    monkeypatch.delenv("OPENBLAS_NUM_THREADS", raising=False)
+    monkeypatch.setenv("OMP_NUM_THREADS", "4")
+
+    def name():
+        return threading.current_thread().name
+
+    with pytest.warns(UserWarning, match="run in one thread"):
+        assert E._host_map(name, [()] * 3) == [threading.main_thread().name] * 3
+    monkeypatch.setenv("OMP_NUM_THREADS", "1")
+    assert all(n.startswith("meow-gpu-host") for n in E._host_map(name, [()] * 3))
 
 
 def test_compute_modes_gpu_batch_with_two_grid_shapes_and_a_fallback_cell(monkeypatch):

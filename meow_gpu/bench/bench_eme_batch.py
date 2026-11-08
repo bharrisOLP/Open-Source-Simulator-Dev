@@ -32,7 +32,7 @@ def _solve(css, a, batch: int, pp):
     """The modes of all cells, the time, and the iterations (per cell; for a batch: of each member, per batch)."""
     from meow_gpu.meow_backend import GPUModeSolver, compute_modes_gpu, compute_modes_gpu_batch
 
-    solver = GPUModeSolver(precision=a.precision, tol=a.tol, extra=a.extra)
+    solver = GPUModeSolver(precision=a.precision, tol=a.tol, extra=a.extra, switch_tol=a.switch_tol)
     its: list = []
     t0 = time.perf_counter()
     if batch == 0:
@@ -61,6 +61,7 @@ def main():
     ap.add_argument("--dx", type=float, default=0.02)
     ap.add_argument("--tol", type=float, default=None)
     ap.add_argument("--extra", type=int, default=8)
+    ap.add_argument("--switch-tol", type=float, default=None, help="complex64 stop of mixed (default: by polish)")
     ap.add_argument("--batches", default="4,8,16", help="batch sizes, comma-separated")
     ap.add_argument("--repeat", type=int, default=2)
     ap.add_argument("--post-process", choices=["meow_gpu", "meow"], default="meow_gpu")
@@ -81,7 +82,8 @@ def main():
             modes, seconds, its = _solve(css, a, batch, pp)
             times.append(seconds)
         row = {"case": "per_cell" if batch == 0 else "batch", "batch": batch or 1, "precision": a.precision,
-               "tol": a.tol, "extra": a.extra, "cells": a.cells, "modes": a.modes, "grid": list(css[0].nx.shape),
+               "tol": a.tol, "switch_tol": a.switch_tol, "extra": a.extra, "cells": a.cells, "modes": a.modes,
+               "grid": list(css[0].nx.shape),
                "solver_device": device_summary(), "modes_s": times[-1], "modes_s_first": times[0],
                "omp_num_threads": os.environ.get("OMP_NUM_THREADS")}
         if batch == 0:

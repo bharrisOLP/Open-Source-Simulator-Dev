@@ -31,7 +31,9 @@ leading batch axis; each member keeps its own host state (projected matrix, subs
 
 from __future__ import annotations
 
+import contextlib
 import os
+import warnings
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from functools import partial
@@ -42,6 +44,11 @@ import numpy as np
 
 from meow_gpu.device import put, solver_device
 from meow_gpu.fde.operator import DeviceOperator, FDEProblem, apply
+
+try:                      # optional: the BLAS thread limit of the host thread pool (``_blas_limit``)
+    from threadpoolctl import ThreadpoolController
+except ImportError:
+    ThreadpoolController = None
 
 PC_DTYPE = jnp.complex64
 STALL_FLOOR = 1e-3
@@ -335,9 +342,10 @@ def _correction_krylov(op: DeviceOperator, pc: Preconditioner, q: jax.Array, the
     (b, steps + 1, steps) and the norms of the rows of rhs (b,). The solution is ``_correction_solution``.
 
     The basis has the block axis first: the Gram-Schmidt products are then batched products with the batch axis
-    first, and XLA does not transpose the basis. With the basis as (steps + 1, b, n) (before 2026-10-30), one call
-    of 20 steps took 78 ms on the RX 7900 XT for b = 18 and 36k unknowns, 35 ms with this layout
-    (bench/kernel_reduce.py).
+    first. With the basis as (steps + 1, b, n) (before 2026-10-30), one call of 20 steps took 78 ms on the RX 7900 XT
+    for b = 18 and 36k unknowns, 35 ms with this layout (bench/kernel_reduce.py). With the batch axis second, XLA
+    transposes the basis for the products: the optimized HLO of that layout has 5 transposes of the size of the
+    basis, that of this layout none (benchmarks/2026-11-07/meow-kernel-reduce.txt).
     """
     b = rhs.shape[0]
     shape = rhs.shape
@@ -669,16 +677,48 @@ def _switch_tol(polish: str, switch_tol: float | None) -> float:
 
 HOST_THREADS = max(1, min(8, os.cpu_count() or 1))
 _POOL: ThreadPoolExecutor | None = None
+_BLAS = None              # the threadpoolctl controller (made at the first call of the pool)
+_WARNED = [False]
+
+
+def _blas_limit():
+    """A context that keeps the BLAS of numpy at one thread while the host thread pool runs, or None when that is
+    not possible (no threadpoolctl, and neither OPENBLAS_NUM_THREADS nor OMP_NUM_THREADS is 1).
+
+    Reason (bench/kernel_reduce.py, 8 eigenproblems of 72 x 72 on the CPU of the RX 7900 XT computer): with the
+    default OpenBLAS threads, a pool of 8 threads took 102 ms against 48 ms in one thread (the logged run), and 45 ms
+    against 50 ms (the run of the review); with one BLAS thread, set before numpy loads, the pool took 5.4 ms.
+    threadpoolctl changes the thread count of the BLAS for the whole process, so the limit holds only while the main
+    thread waits for the pool."""
+    global _BLAS
+    if ThreadpoolController is not None:
+        if _BLAS is None:
+            _BLAS = ThreadpoolController()
+        if all(i["num_threads"] == 1 for i in _BLAS.info() if i["user_api"] == "blas"):
+            return contextlib.nullcontext()
+        return _BLAS.limit(limits=1, user_api="blas")
+    env = os.environ.get("OPENBLAS_NUM_THREADS", os.environ.get("OMP_NUM_THREADS"))
+    return contextlib.nullcontext() if env == "1" else None
 
 
 def _host_map(f, args: list[tuple]) -> list:
-    """[f(*a) for a in args], in the host thread pool when there is more than one item."""
+    """[f(*a) for a in args], in the host thread pool (with one BLAS thread, ``_blas_limit``) when there is more than
+    one item. Without a BLAS limit the items run one after the other, with a warning (once)."""
     global _POOL
     if len(args) < 2 or HOST_THREADS < 2:
         return [f(*a) for a in args]
+    limit = _blas_limit()
+    if limit is None:
+        if not _WARNED[0]:
+            _WARNED[0] = True
+            warnings.warn("meow_gpu: the host steps of the batched solve run in one thread. For the thread pool, "
+                          "install threadpoolctl, or set OMP_NUM_THREADS=1 before numpy is imported (a pool with a "
+                          "multi-threaded BLAS was up to 2x slower than one thread).", stacklevel=2)
+        return [f(*a) for a in args]
     if _POOL is None:
         _POOL = ThreadPoolExecutor(HOST_THREADS, thread_name_prefix="meow-gpu-host")
-    return list(_POOL.map(lambda a: f(*a), args))
+    with limit:
+        return list(_POOL.map(lambda a: f(*a), args))
 
 
 def stack(trees):

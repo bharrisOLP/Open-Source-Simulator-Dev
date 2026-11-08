@@ -46,8 +46,10 @@ import numpy as np
 
 from meow_gpu.device import put, solver_device
 from meow_gpu.fde.eigensolver import (
+    DAVIDSON_SWITCH_TOL,
     POLISHES,
     REFINE_INNER,
+    REFINE_SWITCH_TOL,
     davidson,
     davidson_batch,
     make_preconditioner,
@@ -63,6 +65,7 @@ TOL = {"single": 1e-5, "mixed": 1e-10, "double": 1e-10}
 TOL_POWER_FLOW = 1e2 * float(np.finfo(np.float32).eps) / 10   # = tidy3d TOL_POWER_FLOW_DIRECTION
 SINGLE_FLOOR = 1e-3     # complex64: a stall below this residual is convergence to working precision
 SINGLE_TOL_CAP = 1e-3   # the adaptive single-precision tolerance never goes above this (warning when capped)
+COLD_SWITCH_TOL = DAVIDSON_SWITCH_TOL   # "mixed", "refine": the complex64 stop after a cold start (_switch_tol)
 FLOOR_FACTOR = 10.0   # single precision: tol >= FLOOR_FACTOR * eps32 * |A| / |theta|
 
 
@@ -105,7 +108,8 @@ class GPUModeSolver:
     iterations on clustered spectra). ``polish`` (precision "mixed" only): "refine" (mixed-precision refinement
     of the eigenpairs: complex128 residuals and Rayleigh-Ritz, complex64 correction solves) or "davidson" (the
     earlier complex128 Davidson polish). ``switch_tol``: the residual at which the complex64 Davidson of "mixed"
-    stops (None: the default of the polish). ``refine_inner``: the GMRES steps of each correction solve."""
+    stops (None: the default of the polish; "refine" after a cold start: COLD_SWITCH_TOL, see ``_switch_tol``).
+    ``refine_inner``: the GMRES steps of each correction solve."""
 
     precision: str = "single"
     extra: int = 8
@@ -140,7 +144,7 @@ class GPUModeSolver:
         if floor is not None:
             _warn_floor(floor)
         res = davidson(op, pc, num_modes, target, x0, tol=tol, max_iter=self.max_iter, precision=self.precision,
-                       polish=self.polish, switch_tol=self.switch_tol, inner=self.refine_inner)
+                       polish=self.polish, switch_tol=self._switch_tol(warm), inner=self.refine_inner)
         self._memory[key] = res.vectors
         self.last_info = self._info(res.iterations, res.matvecs, res.converged, warm, res.residuals,
                                     res.matvecs_hi, res.polish)
@@ -209,7 +213,8 @@ class GPUModeSolver:
         if any(f is not None for f in floors):
             _warn_floor(max(f for f in floors if f is not None))
         res = davidson_batch(op, pc, num_modes, targets, x0, tol=np.array(tols), max_iter=self.max_iter,
-                             precision=self.precision, polish=self.polish, switch_tol=self.switch_tol,
+                             precision=self.precision, polish=self.polish,
+                             switch_tol=np.array([self._switch_tol(w) for w in warm]),
                              inner=self.refine_inner)
         self._memory[batch_key] = res.vectors
         self._memory[kinds_key] = tuple(kinds)
@@ -261,6 +266,25 @@ class GPUModeSolver:
     def _operator128(self, problems: list[FDEProblem]):
         bend_arrays = any(p.bent for p in problems)
         return stack([p.device(jnp.complex128, bend_arrays=bend_arrays) for p in problems])
+
+    def _switch_tol(self, warm: bool) -> float:
+        """The residual at which the complex64 Davidson of "mixed" stops. The given ``switch_tol``, else: the default
+        of the polish after a warm start, and COLD_SWITCH_TOL after a cold start with the "refine" polish.
+
+        Reason (2026-11-07, tests/test_refine.py::test_example_grid_gives_the_modes_of_the_earlier_polish, the SiN
+        tip of examples/chip_to_fiber_coupling.py, cold start): from a cold start the complex64 Davidson stopped at
+        1e-3 before a near-degenerate pair of window modes nearer the target (neff 1.4418809, 1.4418766) was in its
+        block. Then the refinement either stalled (the fallback gave the right modes) or converged to the next pair
+        (1.4412281, 1.4411957), and the BLAS thread count decided which: with OPENBLAS_NUM_THREADS=1 at the start of
+        the process it converged to the wrong pair, also with the admission rule (RX 7900 XT computer,
+        bench/diag_tip.py). With the stop of the earlier polish (2e-5), the complex64 Davidson explores as long as
+        that of the earlier polish. A warm start (the next cell of a taper) begins from the modes of a similar
+        problem, so it keeps the early switch of the refinement (the speed of "mixed")."""
+        if self.switch_tol is not None:
+            return self.switch_tol
+        if self.polish != "refine":
+            return DAVIDSON_SWITCH_TOL
+        return REFINE_SWITCH_TOL if warm else COLD_SWITCH_TOL
 
     def _tolerance(self, anorm: float, target: float) -> tuple[float, float | None]:
         """The tolerance, and the complex64 floor when the cap applies (else None). ``anorm``: max |lambda| of the
@@ -370,7 +394,9 @@ def compute_modes_gpu_batch(css, num_modes: int = 10, target_neff: float | None 
     Cross-sections that the GPU solver does not support use ``compute_modes_gpu`` (the tidy3d fallback).
 
     The post-processing (meow's normalization and Gram-Schmidt, on the CPU) of a batch runs in a second thread while
-    the GPU solves the next batch. The results do not change (the same function on the same arrays).
+    the GPU solves the next batch. The results do not change (the same function on the same arrays). After each solve,
+    the results of the previous batch are collected before the new batch goes into the queue: at most one batch waits
+    for its post-processing, and an error of the post-processing reaches the caller after the next solve.
     """
     if batch < 1:
         raise ValueError("batch must be 1 or more")
@@ -385,7 +411,13 @@ def compute_modes_gpu_batch(css, num_modes: int = 10, target_neff: float | None 
             out[i] = _tidy3d_fallback(cs, why, num_modes, target_neff, post_process)
         else:
             groups.setdefault(tuple(np.shape(cs.nx)), []).append(i)
-    pending = []
+    pending: list = []                         # the post-processing of the last batch: (cell, future)
+
+    def collect():
+        for c, done in pending:
+            out[c] = done.result()                 # an error of the post-processing raises here
+        pending.clear()
+
     with ThreadPoolExecutor(1, thread_name_prefix="meow-gpu-post") as post:
         for idx in groups.values():
             n = len(idx)
@@ -395,11 +427,11 @@ def compute_modes_gpu_batch(css, num_modes: int = 10, target_neff: float | None 
                 pos = [i * runs + j for i in range(width)]
                 cells = [idx[min(q, n - 1)] for q in pos]
                 results = solver.solve_batch([_problem(css[c]) for c in cells], num_modes, target_neff)
+                collect()                          # the previous batch (it ran beside this solve)
                 for q, c, (neff, e, h) in zip(pos, cells, results):
                     if q < n:
                         pending.append((c, post.submit(_modes, css[c], neff, e, h, post_process)))
-        for c, done in pending:
-            out[c] = done.result()
+        collect()
     return out
 
 

@@ -17,8 +17,10 @@ from structures import coupler, sin_tip, strip
 import meow_gpu.fde.eigensolver as eigensolver
 from meow_gpu.device import put
 from meow_gpu.fde.eigensolver import (
+    DAVIDSON_SWITCH_TOL,
     REFINE_INNER,
     REFINE_STALL,
+    REFINE_SWITCH_TOL,
     _refine_with_fallback,
     _selection,
     _track,
@@ -28,7 +30,7 @@ from meow_gpu.fde.eigensolver import (
     refine,
 )
 from meow_gpu.fde.operator import assemble, make_problem
-from meow_gpu.meow_backend import GPUModeSolver
+from meow_gpu.meow_backend import COLD_SWITCH_TOL, GPUModeSolver
 
 K = 4
 
@@ -232,7 +234,10 @@ def test_fallback_stops_by_its_stall_rule_and_keeps_the_better_result(strip_case
 def test_batched_fallback():
     """The fallback in the batched path (``_refine_members``, ``BatchEigResult.polishes``): a tolerance out of reach
     (both members: "refine+davidson", stopped by the stall rule), and the weakly guided SiN tip in a batch of 1 (the
-    result of ``solve``)."""
+    result of ``solve``). For the tip, the complex64 stage of a cold start goes to COLD_SWITCH_TOL (2026-11-07):
+    then the refinement converges alone or stalls and the fallback finishes, and the rounding (the batched kernels,
+    the BLAS) decides which (on the RX 7900 XT: "refine" per cell, "refine+davidson" in the batch, in the full test
+    run); the modes must be the same."""
     probs = [make_problem(*strip(width=w, dx=0.04, dy=0.04, w_dom=2.4, h_dom=1.6), 1.55) for w in (0.45, 0.5)]
     s = GPUModeSolver(precision="mixed", extra=4, tol=1e-17, warm_start=False)
     with pytest.warns(UserWarning, match="did not converge"):
@@ -246,7 +251,7 @@ def test_batched_fallback():
     bat = GPUModeSolver(precision="mixed", extra=8, warm_start=False)
     ((n_bat, e_bat, _),) = bat.solve_batch([p], K)
     assert bat.last_batch_info[0].converged and one.last_info.converged
-    assert bat.last_batch_info[0].polish_used == one.last_info.polish_used == "refine+davidson"
+    assert {bat.last_batch_info[0].polish_used, one.last_info.polish_used} <= {"refine", "refine+davidson"}
     assert np.max(np.abs(n_bat - n_one)) < 1e-9
     assert np.all(_cos(e_bat[:2], e_one[:2]) > 1 - 1e-6)
 
@@ -321,7 +326,12 @@ def test_example_grid_gives_the_modes_of_the_earlier_polish(example_tip, monkeyp
     in the block). admission=False turns off the admission rule of ``_track``: then only the fallback (the steps of
     the earlier polish from the complex64 block) protects the result, and it must give the same modes. All 4 neff
     against the earlier polish and the double solve; the fields of the guided modes by overlap, the near-degenerate
-    pair by its subspace."""
+    pair by its subspace.
+
+    2026-11-07: this test failed for admission=False with OMP_NUM_THREADS=4 and for both values with
+    OPENBLAS_NUM_THREADS=1 (at the start of the process): the complex64 stage stopped at 1e-3 before the pair
+    1.4418809 / 1.4418766 was in its block, and the refinement converged to the next pair (1.4412281, 1.4411957),
+    so no fallback ran. Since then a cold start explores to COLD_SWITCH_TOL (``GPUModeSolver._switch_tol``)."""
     p, (n_old, e_old, _), (n_dbl, e_dbl, _) = example_tip
     if not admission:
         track = eigensolver._track
@@ -335,6 +345,29 @@ def test_example_grid_gives_the_modes_of_the_earlier_polish(example_tip, monkeyp
         assert np.all(_cos(e[:2], ref[:2]) > 1 - 1e-6)
         qa, qb = np.linalg.qr(_unit(e[2:4]).T)[0], np.linalg.qr(_unit(ref[2:4]).T)[0]
         assert np.linalg.svd(qa.conj().T @ qb, compute_uv=False).min() > 1 - 1e-6
+
+
+def test_cold_start_uses_the_switch_of_the_earlier_polish(strip_case, monkeypatch):
+    """After a cold start, the complex64 stage of "refine" stops at COLD_SWITCH_TOL (the stop of the earlier polish);
+    after a warm start at REFINE_SWITCH_TOL; per cell and for each member of a batch. A given switch_tol and the
+    earlier polish keep their stop."""
+    import meow_gpu.meow_backend as backend
+    p = strip_case[0]
+    seen = []
+    one, many = backend.davidson, backend.davidson_batch
+    monkeypatch.setattr(backend, "davidson", lambda *a, **kw: seen.append(kw["switch_tol"]) or one(*a, **kw))
+    monkeypatch.setattr(backend, "davidson_batch",
+                        lambda *a, **kw: seen.append(list(kw["switch_tol"])) or many(*a, **kw))
+    s = GPUModeSolver(precision="mixed", extra=4)
+    s.solve(p, K)
+    s.solve(p, K)
+    GPUModeSolver(precision="mixed", extra=4).solve_batch([p, p], K)
+    s.solve_batch([p, p], K)                  # the members start from the memory of solve: warm
+    GPUModeSolver(precision="mixed", extra=4, switch_tol=3e-4).solve(p, K)
+    GPUModeSolver(precision="mixed", polish="davidson", extra=4).solve(p, K)
+    assert COLD_SWITCH_TOL == DAVIDSON_SWITCH_TOL
+    assert seen == [COLD_SWITCH_TOL, REFINE_SWITCH_TOL, [COLD_SWITCH_TOL] * 2, [REFINE_SWITCH_TOL] * 2, 3e-4,
+                    DAVIDSON_SWITCH_TOL]
 
 
 def test_mixed_iteration_limit_inside_the_refinement(strip_case):

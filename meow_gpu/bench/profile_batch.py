@@ -15,7 +15,7 @@ The host steps in the thread pool are timed as a whole (``_host_map: <function>`
 is slower than run 2 (no overlap of host and device work): use the shares, not the sums.
 
 One JSON line: the times of run 2 and run 3, the iterations, and for each part the exclusive seconds, the calls and
-the share of run 3.
+the share of run 3. ``--summarize <log>`` prints the category shares of the README table from such lines.
 """
 from __future__ import annotations
 
@@ -105,8 +105,56 @@ def instrument():
     B.GPUModeSolver.solve_batch = timed("solver.solve_batch (Python)", B.GPUModeSolver.solve_batch)
 
 
+# The categories of the README table "Profile of the batched path": each part of a JSON row goes into one category.
+# The exclusive time of _svqb and _svqb_b (in the device-kernel categories) is the host code around their kernels
+# and the copy of their Gram matrix to the host; their kernels (_gram, _combine, _gram_b, _combine_b) are in the
+# same categories.
+CATEGORIES = {
+    "batched device kernels (complex64 Davidson)":
+        ["_ritz_b", "_expand_b", "_project_out_b", "_apply_b", "_insert_b", "_reset_b", "_select_b", "_h_new_b",
+         "_gram_b", "_combine_b", "_svqb_b", "precondition_batch"],
+    "GMRES of the refinement (device)": ["_correction_krylov", "_correction_solution"],
+    "per-cell device kernels (batched solve: the refinement)":
+        ["_ritz", "precondition", "_project_out", "_apply_block", "_insert", "_gram", "_combine", "_svqb",
+         "_take_rows"],
+    "host eigenproblems of the projected matrices": ["_host_map: _ritz_coef", "np.linalg.eig (main thread)"],
+    "host SVQB, GMRES least squares, tracking":
+        ["_host_map: _svqb_coef", "_svqb_coef", "_gmres_coef", "_track", "_selection"],
+    "host-to-device copies": ["put", "backend.put"],
+    "Python of the solver loops":
+        ["_davidson_batch_fixed (Python)", "_davidson_fixed (Python)", "refine (Python)", "_refine_members (Python)",
+         "_refine_with_fallback (Python)", "davidson (Python)", "davidson_batch (Python)", "solver.solve (Python)",
+         "solver.solve_batch (Python)"],
+    "fields, direction rule, problem setup":
+        ["backend._orient", "backend.fields", "backend._fields_batch", "backend.make_problem",
+         "backend.make_preconditioner", "backend.stack", "backend._problem"],
+    "meow post-processing in the main thread": ["backend._modes"],
+}
+
+
+def summarize(path: str) -> None:
+    """Print the category shares (percent of run 3) of each JSON row of a profile log. The parts that are in no
+    category, and ``outside_wrapped_s`` (in the batched path: the wait for the last post-processing), go into
+    "other"."""
+    for line in Path(path).read_text().splitlines():
+        if not line.startswith("{"):
+            continue
+        r = json.loads(line)
+        parts, total = r["parts"], r["profiled_s"]
+        print(f"== precision {r['precision']} batch {r['batch']}: run 3 {total} s, run 2 {r['wall_s']} s, "
+              f"first run {r['first_s']} s, compiles in run 2: {r['compiles_run2']}")
+        used = set()
+        for name, keys in CATEGORIES.items():
+            used |= set(keys)
+            print(f"  {name:58s} {100 * sum(parts[k]['s'] for k in keys if k in parts) / total:5.1f} %")
+        rest = [k for k in parts if k not in used]
+        other = sum(parts[k]["s"] for k in rest) + r["outside_wrapped_s"]
+        print(f"  {'other (' + ', '.join(rest) + ') and outside_wrapped_s':58s} {100 * other / total:5.1f} %")
+
+
 def main():
     ap = argparse.ArgumentParser()
+    ap.add_argument("--summarize", metavar="JSONL", help="print the category shares of a profile log, then stop")
     ap.add_argument("--precision", default="single")
     ap.add_argument("--batch", type=int, default=8, help="0: per cell (compute_modes_gpu)")
     ap.add_argument("--cells", type=int, default=30)
@@ -114,6 +162,9 @@ def main():
     ap.add_argument("--dx", type=float, default=0.02)
     ap.add_argument("--extra", type=int, default=8)
     a = ap.parse_args()
+    if a.summarize:
+        summarize(a.summarize)
+        return
 
     import jax
     jax.config.update("jax_enable_x64", True)

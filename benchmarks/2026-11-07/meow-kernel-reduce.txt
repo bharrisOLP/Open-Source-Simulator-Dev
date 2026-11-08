@@ -1,0 +1,107 @@
+== OMP_NUM_THREADS=1 (OPENBLAS_NUM_THREADS=1)
+grid (200, 91) n 36400 b 18 M 72 device rocm:0
+Gram <v_i, t_j> (72 x 18), complex64:
+  _gram (current)                             0.344 ms
+  _gram t,t (18 x 18)                         0.224 ms
+  fused multiply-reduce                       0.440 ms
+    max rel diff 8.7e-07
+  fused multiply-reduce (t,t)                 0.185 ms
+  split P=16                                  0.364 ms
+    max rel diff 0.0e+00
+  split P=16 (t,t)                            0.235 ms
+  split P=64                                  0.383 ms
+    max rel diff 0.0e+00
+  split P=64 (t,t)                            0.240 ms
+  split P=256                                 0.380 ms
+    max rel diff 9.5e-07
+  split P=256 (t,t)                           0.226 ms
+  split, chunk axis first P=16                0.356 ms
+    max rel diff 4.9e-07
+  split, chunk axis first P=16 (t,t)          0.253 ms
+  split, chunk axis first P=64                0.373 ms
+    max rel diff 7.5e-07
+  split, chunk axis first P=64 (t,t)          0.194 ms
+  split, chunk axis first P=256               0.304 ms
+    max rel diff 9.4e-07
+  split, chunk axis first P=256 (t,t)         0.203 ms
+vmap over B = 8 members:
+  vmap _gram (current)                        1.617 ms
+  vmap split P=16                             1.621 ms
+  vmap split P=64                             1.634 ms
+  vmap split P=256                            1.638 ms
+  vmap _project_out (current)                 3.967 ms
+  _project_out (one member)                   0.854 ms
+  _combine (one member)                       0.138 ms
+refinement kernels (b = 18, 20 steps):
+  _correction_krylov, (steps+1, b, n) basis   76.827 ms
+  _correction_krylov, (b, steps+1, n) basis   35.534 ms
+    max |dH| 2.1e-04  |H| 1.9e+00
+    optimized HLO, (steps+1, b, n): transposes and copies of >= 13759200 elements: {'transpose': 5}
+    optimized HLO, (b, steps+1, n): transposes and copies of >= 13759200 elements: {}
+refinement kernels, vmap over B = 8 members (a batched refinement):
+  vmap _correction_krylov, (steps+1, b, n)  622.868 ms
+  vmap _correction_krylov, (b, steps+1, n)  270.878 ms
+  precondition                                0.788 ms
+  _apply_block                                0.104 ms
+host eig of the projected matrix (complex, 72 x 72):
+  serial, 8 members    31.425 ms
+  pool of 2, 8 members   15.792 ms
+  pool of 4, 8 members   11.840 ms
+  pool of 8, 8 members   11.452 ms
+  _host_map (threadpoolctl)     8.719 ms
+  one stacked call     30.380 ms
+  scipy serial         31.643 ms
+== default OpenBLAS threads (no OMP or OPENBLAS variable)
+grid (200, 91) n 36400 b 18 M 72 device rocm:0
+Gram <v_i, t_j> (72 x 18), complex64:
+  _gram (current)                             0.323 ms
+  _gram t,t (18 x 18)                         0.223 ms
+  fused multiply-reduce                       0.410 ms
+    max rel diff 8.7e-07
+  fused multiply-reduce (t,t)                 0.179 ms
+  split P=16                                  0.363 ms
+    max rel diff 0.0e+00
+  split P=16 (t,t)                            0.220 ms
+  split P=64                                  0.366 ms
+    max rel diff 0.0e+00
+  split P=64 (t,t)                            0.224 ms
+  split P=256                                 0.365 ms
+    max rel diff 9.5e-07
+  split P=256 (t,t)                           0.225 ms
+  split, chunk axis first P=16                0.356 ms
+    max rel diff 4.9e-07
+  split, chunk axis first P=16 (t,t)          0.272 ms
+  split, chunk axis first P=64                0.347 ms
+    max rel diff 7.5e-07
+  split, chunk axis first P=64 (t,t)          0.194 ms
+  split, chunk axis first P=256               0.332 ms
+    max(null): No such file or directory
+ rel diff 9.4e-07
+  split, chunk axis first P=256 (t,t)         0.187 ms
+vmap over B = 8 members:
+  vmap _gram (current)                        1.811 ms
+  vmap split P=16                             1.843 ms
+  vmap split P=64                             2.214 ms
+  vmap split P=256                            2.282 ms
+  vmap _project_out (current)                 3.925 ms
+  _project_out (one member)                   0.641 ms
+  _combine (one member)                       0.161 ms
+refinement kernels (b = 18, 20 steps):
+  _correction_krylov, (steps+1, b, n) basis   77.620 ms
+  _correction_krylov, (b, steps+1, n) basis   36.001 ms
+    max |dH| 1.8e-04  |H| 1.9e+00
+    optimized HLO, (steps+1, b, n): transposes and copies of >= 13759200 elements: {'transpose': 5}
+    optimized HLO, (b, steps+1, n): transposes and copies of >= 13759200 elements: {}
+refinement kernels, vmap over B = 8 members (a batched refinement):
+  vmap _correction_krylov, (steps+1, b, n)  623.369 ms
+  vmap _correction_krylov, (b, steps+1, n)  270.740 ms
+  precondition                                0.759 ms
+  _apply_block                                0.118 ms
+host eig of the projected matrix (complex, 72 x 72):
+  serial, 8 members  1023.520 ms
+  pool of 2, 8 members  350.237 ms
+  pool of 4, 8 members  307.454 ms
+  pool of 8, 8 members  264.808 ms
+  _host_map (threadpoolctl)    12.644 ms
+  one stacked call   1305.838 ms
+  scipy serial         35.916 ms

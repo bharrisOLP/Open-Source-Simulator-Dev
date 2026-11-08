@@ -104,6 +104,18 @@ def krylov_before():
     return k
 
 
+def large_moves(compiled_text: str, min_elements: int) -> dict:
+    """The transpose and copy instructions of an optimized HLO text (with the fused computations) whose result has
+    at least ``min_elements`` elements: {kind: count}."""
+    import re
+    out: dict = {}
+    for line in compiled_text.splitlines():
+        m = re.search(r"= (\w+)\[([\d,]*)\]\{[^}]*\} (transpose|copy)\(", line)
+        if m and m.group(2) and np.prod([int(d) for d in m.group(2).split(",")]) >= min_elements:
+            out[m.group(3)] = out.get(m.group(3), 0) + 1
+    return out
+
+
 @jax.jit
 def fused_gram(a, b):
     fa, fb = a.reshape(a.shape[0], -1), b.reshape(b.shape[0], -1)
@@ -148,6 +160,11 @@ def main():
     _, hk0, _ = bench("_correction_krylov, (steps+1, b, n) basis", krylov_before(), op, pc, q, th, rhs, 20, n=5)
     _, hk, _ = bench("_correction_krylov, (b, steps+1, n) basis", E._correction_krylov, op, pc, q, th, rhs, 20, n=5)
     print(f"    max |dH| {np.abs(np.asarray(hk) - np.asarray(hk0)).max():.1e}  |H| {np.abs(np.asarray(hk0)).max():.1e}")
+    basis = 21 * b * rhs[0].size            # the elements of the Krylov basis (20 steps)
+    for name, f in (("(steps+1, b, n)", krylov_before()), ("(b, steps+1, n)", E._correction_krylov)):
+        text = f.lower(op, pc, q, th, rhs, 20).compile().as_text()
+        print(f"    optimized HLO, {name}: transposes and copies of >= {basis} elements: "
+              f"{large_moves(text, basis)}", flush=True)
     print("refinement kernels, vmap over B = 8 members (a batched refinement):")
     from meow_gpu.fde.eigensolver import stack
     opb, pcb = stack([op] * 8), stack([pc] * 8)
@@ -172,6 +189,12 @@ def main():
             for _ in range(5):
                 list(ex.map(np.linalg.eig, hs))
             print(f"  pool of {nt}, 8 members {(time.perf_counter() - t0) / 5 * 1e3:8.3f} ms", flush=True)
+    E._host_map(np.linalg.eig, [(h,) for h in hs])
+    t0 = time.perf_counter()
+    for _ in range(5):
+        E._host_map(np.linalg.eig, [(h,) for h in hs])
+    limit = "threadpoolctl" if E.ThreadpoolController is not None else "no threadpoolctl"
+    print(f"  _host_map ({limit})  {(time.perf_counter() - t0) / 5 * 1e3:8.3f} ms", flush=True)
     t0 = time.perf_counter()
     for _ in range(5):
         np.linalg.eig(np.stack(hs))

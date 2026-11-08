@@ -38,8 +38,10 @@ S, port_map = mw.compute_s_matrix(modes, cells=cells)   # the rest of meow does 
   runs of neighbouring cells, and batch j solves cell j of each run; member i starts from the last vectors of
   member i of the previous batch (the previous cell of its run). The modes go through the same post-processing and
   direction rule as `compute_modes_gpu`; the post-processing of a batch runs in a second thread while the GPU
-  solves the next batch. The host thread pool needs a single-threaded BLAS: set `OMP_NUM_THREADS=1` before the
-  import of numpy (see "Profile of the batched path").
+  solves the next batch (at most one batch waits for its post-processing). The host thread pool runs with one BLAS
+  thread: with threadpoolctl it limits the BLAS while the pool runs; without threadpoolctl it runs only when
+  `OMP_NUM_THREADS=1` (or `OPENBLAS_NUM_THREADS=1`) is set, else the host steps run in one thread, with a warning
+  (see "Profile of the batched path").
 - **Device.** klujax (imported by meow through sax) sets the JAX default platform to `cpu`. meow-gpu therefore puts
   its arrays on the GPU explicitly (`meow_gpu/device.py`). Set `MEOW_GPU_DEVICE=cpu` to force the CPU.
 
@@ -125,8 +127,9 @@ Earlier rows (the code of commit 0fabc92, OpenBLAS with its default threads, row
 The mixed columns used the earlier polish (now `polish="davidson"`). With that code the batched path was only about
 1.2x faster in single precision, and not faster in mixed precision, for this taper (30 cells, 36k unknowns per
 cell). The batched path stays an option; the per-cell path is the default.
-The iterations in the same rows show why (time = `modes_s`, which also includes meow's post-processing, about 0.6 s
-on a CPU):
+The iterations in the same rows show why (time = `modes_s`, which also includes meow's post-processing, about 1.1 s
+for the 30 cells on the CPU: `backend._modes` of the per-cell rows of `benchmarks/2026-10-30/meow-profile-batch.jsonl`,
+1.07 s in single and 1.10 s in mixed precision):
 
 - Single precision: a per-cell iteration takes about 11.5 ms (5.53 s for 480 iterations). A batch iteration takes
   about 27 / 43 / 63 ms with 4 / 8 / 15 members (174 / 105 / 73 iterations). So one batch iteration costs 2.4x /
@@ -170,21 +173,33 @@ those of run 3. "Before": the code of commit b495484 (the profile script then im
 `OMP_NUM_THREADS=1`, so OpenBLAS had its default threads, as in the earlier bench rows; development runs, not
 logged). "After": this version (rows in `benchmarks/2026-10-30/meow-profile-batch.jsonl`). Commands:
 `python bench/profile_batch.py --precision single --batch 8` (the same with `--precision mixed`, and with
-`--batch 0` for the per-cell path). Each category adds the parts of the JSON row: the batched device kernels are
-the functions `*_b`; the GMRES is `_correction_krylov` and `_correction_solution`; the other refinement kernels are
-`_insert`, `_gram`, `_combine`, `_project_out`, `_ritz`, `_apply_block`, `_svqb` and `_take_rows`; the host
-eigenproblems are `_host_map: _ritz_coef` and `np.linalg.eig`; the other host steps are `_svqb_coef`, `_gmres_coef`,
-`_track` and `_selection`; the copies are `put`; the Python rows end in "(Python)"; the setup rows start with
-`backend.`; "wait, other" is `outside_wrapped_s`.
+`--batch 0` for the per-cell path). Each category adds the parts of the JSON row, with the mapping
+`CATEGORIES` of `bench/profile_batch.py`; `python bench/profile_batch.py --summarize <log>` prints the shares of
+each row of a log (for the "after" columns: `benchmarks/2026-10-30/meow-profile-batch.jsonl`):
 
-| Part of the solve (share of run 3) | single, B = 8: before | after | mixed, B = 8: before | after |
+- batched device kernels: the functions `*_b` (with `_svqb_b`) and `precondition_batch`;
+- GMRES: `_correction_krylov` and `_correction_solution`;
+- other device kernels of the refinement: `_insert`, `_gram`, `_combine`, `_project_out`, `_ritz`, `_apply_block`,
+  `precondition`, `_svqb` and `_take_rows`;
+- host eigenproblems: `_host_map: _ritz_coef` and `np.linalg.eig (main thread)`; the other host steps:
+  `_host_map: _svqb_coef`, `_svqb_coef`, `_gmres_coef`, `_track` and `_selection`;
+- copies: `put` and `backend.put`; Python: the parts that end in "(Python)";
+- fields, direction rule, setup: `backend._orient`, `backend.fields`, `backend._fields_batch`,
+  `backend.make_problem`, `backend.make_preconditioner`, `backend.stack` and `backend._problem`;
+- post-processing: `backend._modes`; "wait, other": the parts in no category and `outside_wrapped_s`.
+
+The exclusive time of `_svqb` and `_svqb_b` is not device time: it is the host code around their kernels and the
+copy of their Gram matrix to the host (1.3 % and 0.8 % of run 3 in the logged B = 8 rows, single and mixed). The
+"before" columns used the same mapping.
+
+| Part (share of run 3) | single, B = 8: before (not logged) | after | mixed, B = 8: before (not logged) | after |
 |---|---|---|---|---|
 | batched device kernels (complex64 Davidson) | 41.2 % | 53.5 % | 13.7 % | 17.3 % |
 | GMRES of the refinement (device, member after member) | - | - | 48.2 % | 36.7 % |
 | other device kernels of the refinement (member after member) | - | - | 9.2 % | 15.3 % |
 | host eigenproblems of the projected matrices | 20.4 % | 7.7 % | 6.4 % | 3.1 % |
 | host SVQB, GMRES least squares, tracking | 2.0 % | 2.9 % | 1.6 % | 2.4 % |
-| host-to-device copies (`put`) | 5.7 % | 6.3 % | 4.8 % | 6.7 % |
+| host-to-device copies (`put`, `backend.put`) | 5.7 % | 6.3 % | 4.8 % | 6.7 % |
 | Python of the solver loops | 10.5 % | 15.7 % | 7.7 % | 13.1 % |
 | fields, direction rule, problem setup | 2.7 % | 5.4 % | 1.1 % | 2.2 % |
 | meow's post-processing in the main thread | 17.3 % | 0 (second thread) | 7.1 % | 0 (second thread) |
@@ -197,30 +212,42 @@ JIT compiles: none in run 2 or run 3 of any case (no recompile for each member o
 1.9 to 3.4 s more in the logged rows. The changes, from the largest share:
 
 1. **GMRES of the refinement** (`_correction_krylov`): the Krylov basis is now (b, steps + 1, n), with the block
-   axis first. With the earlier layout (steps + 1, b, n), XLA transposed the basis for each Gram-Schmidt product.
-   One call (20 steps, b = 18, 36k unknowns) takes 35.0 ms instead of 77.9 ms (`bench/kernel_reduce.py`; the two
-   logged runs are in `benchmarks/2026-10-30/meow-kernel-reduce.txt`). This change makes `mixed` faster in the
-   per-cell path too.
+   axis first. With the earlier layout (steps + 1, b, n), XLA transposed the basis for the Gram-Schmidt products
+   (the batch axis of the products was not the first axis): the optimized HLO of the earlier layout has 5 transposes
+   with at least the size of the basis (13,759,200 elements), that of this layout none
+   (`benchmarks/2026-11-07/meow-kernel-reduce.txt`, both runs). One call (20 steps, b = 18, 36k unknowns) takes
+   35.0 ms instead of 77.9 ms (`bench/kernel_reduce.py`; the two logged runs are in
+   `benchmarks/2026-10-30/meow-kernel-reduce.txt`; 2026-11-07: 35.5 / 36.0 ms instead of 76.8 / 77.6 ms). This
+   change makes `mixed` faster in the per-cell path too.
 2. **Host eigenproblems.** The bench scripts set `OMP_NUM_THREADS=1` after the import of numpy, so OpenBLAS had its
    default threads, and the thread pool of the batched solve oversubscribed the cores. Eight eigenproblems of
    72 x 72 (complex) take 5.4 ms in a pool of 8 threads with `OMP_NUM_THREADS=1` (31 ms in one thread), and
    102 ms in the pool with the default OpenBLAS threads (48 ms in one thread). Two logged runs of
-   `bench/kernel_reduce.py`: one with `OMP_NUM_THREADS=1` in the environment, one without. The bench scripts now set
-   it before the import of numpy.
+   `bench/kernel_reduce.py`: one with `OMP_NUM_THREADS=1` in the environment, one without. The review measured 45 ms
+   in the pool against 50 ms in one thread without the variable: with the default threads, the pool gains nothing,
+   and it was up to 2x slower than one thread. The bench scripts now set the variable before the import of numpy,
+   and the library now keeps the BLAS at one thread while the pool runs (`_blas_limit` in `fde/eigensolver.py`,
+   with threadpoolctl; without threadpoolctl and without `OMP_NUM_THREADS=1`, the host steps run in one thread,
+   with a warning). With the limit (`benchmarks/2026-11-07/meow-kernel-reduce.txt`, threadpoolctl 3.8.0), the
+   library `_host_map` takes 8.7 ms for the 8 eigenproblems with `OMP_NUM_THREADS=1` and 12.6 ms without thread
+   variables, against 102 ms in the pool without the limit (2026-10-30). In the 2026-11-07 run without thread
+   variables, one thread took 1024 ms and the pool without the limit 265 ms (another session used the computer).
 3. **meow's post-processing** (17.3 % and 7.1 % of run 3 in the "before" columns: about 0.85 to 0.91 s for the
-   30 cells, on the CPU) of a batch now runs in a second thread while
-   the GPU solves the next batch (`compute_modes_gpu_batch`). Only the post-processing of the last batch stays on the
-   critical path.
+   30 cells, on the CPU) of a batch now runs in a second thread while the GPU solves the next batch
+   (`compute_modes_gpu_batch`). After each solve, the results of the previous batch are collected before the new
+   batch goes into the queue: at most one batch waits, and an error of the post-processing reaches the caller after
+   the next solve. Only the post-processing of the last batch stays on the critical path.
 
 Why the batched path gains less in mixed precision, and what was not changed:
 
 - **A batched refinement (`jax.vmap` over the members) does not make the GMRES faster.** The GMRES kernel under
-  `jax.vmap` over 8 members takes 271 ms, and 8 calls take 8 x 35.0 = 280 ms (`bench/kernel_reduce.py`). The
-  device kernels are limited by their throughput, not by the fixed cost of a call: a Gram matrix of 72 x 18 vectors
-  takes 0.31 to 0.35 ms for one member and 1.59 to 1.60 ms for 8 members; `_project_out` 0.65 ms and 3.97 to
-  3.98 ms. So the refinement
-  still runs member after member. A batched refinement in lockstep can only remove the other costs of each member
-  (about 15 % small device kernels and part of the 13.1 % Python in the mixed case), not the GMRES (36.7 %).
+  `jax.vmap` over 8 members takes 271 ms, and 8 calls take 8 x 35.0 = 280 ms (`bench/kernel_reduce.py`): a gain
+  of 1.03x. For the smaller kernels the gain of `jax.vmap` is also small: a Gram matrix of 72 x 18 vectors takes
+  0.31 to 0.35 ms for one member and 1.59 to 1.60 ms for 8 members, `_project_out` 0.65 ms and 3.97 to 3.98 ms
+  (in each of the two logged runs, 8 members take 4.6 to 6.2x the time of one: a gain of 1.3 to 1.8x for each
+  member). So the refinement still runs member after member. A batched refinement in lockstep can only remove the
+  other costs of each member (about 15 % small device kernels and part of the 13.1 % Python in the mixed case),
+  not the GMRES (36.7 %).
 - **The device kernels run far below the peak rate of the card.** A Gram matrix of 72 x 18 vectors of 36k
   complex64 values reads 26 MB and does 0.38 GFLOP in 0.31 to 0.35 ms (about 75 to 84 GB/s and 1.1 to 1.2
   TFLOP/s). The variants that
@@ -281,6 +308,23 @@ earlier polish; the refinement alone did not converge there, and the fallback fi
 `test_example_grid_gives_the_modes_of_the_earlier_polish` checks all 4 modes on the 50 nm grid of the example,
 with and without the admission rule. `polish="davidson"` gives the earlier method; `GPUModeSolver(switch_tol=...,
 refine_inner=...)` changes the two parameters.
+
+**Cold starts (2026-11-07).** After a cold start (no warm-start vectors), the complex64 stage of `refine` stops at
+`COLD_SWITCH_TOL` (2e-5, the stop of the earlier polish) instead of 1e-3 (`GPUModeSolver._switch_tol`; also for each
+cold member of a batch; a given `switch_tol` is kept). Reason: the protection above was not stable. On the 50 nm
+grid of the example (cold start), the complex64 stage stopped at 1e-3 before the near-degenerate pair at neff
+1.4418809 / 1.4418766 was in its block. Then the refinement either stalled (the fallback gave the right modes) or
+converged to the next pair (1.4412281, 1.4411957), and the BLAS decided which: with `OPENBLAS_NUM_THREADS=1` at
+the start of the process it converged to the wrong pair also with the admission rule; with 4 threads only without
+the admission rule; the code of commit f8c16ec gave the same results (`bench/diag_tip.py` and the test, RX 7900 XT
+computer). The BLAS thread count changed while the process ran (threadpoolctl, 1 to 4 threads) gave the same
+results as the count at the start. With the stop at 2e-5, the test passes with 1 and with 4 BLAS threads. A warm
+start (the next cell of a taper) keeps the stop at 1e-3: on the 30-cell taper the change costs nothing measurable
+(`bench_refine.py --cases double,mixed-refine --repeat 2`, with `OMP_NUM_THREADS=4`: 8.04 s, 497 iterations,
+1724 complex128 applies, against 8.13 s, 489 iterations, 1736 applies, with `--switch-tol 1e-3`; max |dneff|
+against double 2.1e-12 and 1.7e-12; `bench_eme_batch.py --precision mixed --batches 8 --repeat 2`: 7.17 s against
+7.11 s, 126 against 104 batch iterations, the extra iterations in the cold first batch; rows in
+`benchmarks/2026-11-07/meow-cold-switch.jsonl`, the same commands without and with `--switch-tol 1e-3`).
 
 **Checks** (`tests/test_refine.py`; the numbers below are from the same cases on the RX 7900 XT, run through
 `tools/gpu_run.sh`). 4 modes and 4 extra block vectors. The agreement columns are those of the refinement; the last
@@ -462,8 +506,10 @@ cells instead of 0.952 / 0.955, and the 3-D FDTD of the same taper gives 0.9961 
   batched refinement in lockstep (it removes the small kernels, copies and Python steps of each member, not the
   GMRES time), and faster inner products (the Gram matrices with a long contraction run far below the peak rate of
   the card).
-- The host thread pool of the batched solve needs a single-threaded BLAS (`OMP_NUM_THREADS=1` before the import
-  of numpy). With the default OpenBLAS threads, the pool is slower than one thread.
+- The host thread pool of the batched solve needs one BLAS thread. With threadpoolctl, the library sets it while
+  the pool runs. Without threadpoolctl, set `OMP_NUM_THREADS=1` before the import of numpy; else the host steps
+  run in one thread (with a warning). With the default OpenBLAS threads, the pool gained nothing in one run and was
+  up to 2x slower than one thread in another run.
 - Limits of the batched solve: a batch costs the iterations of its slowest member (a member that stopped still
   goes through the kernels, as zero rows). The first batch starts cold in all members (no warm start). The host
   eigenproblems grow with B (one for each member, in a thread pool of up to 8 threads). All members need the same
@@ -482,6 +528,10 @@ cells instead of 0.952 / 0.955, and the 3-D FDTD of the same taper gives 0.9961 
   and in A V (96 b n bytes).
 - On a CPU the refinement is not faster than the earlier polish: the complex128 rate of a CPU is not low, and the
   refinement does more complex64 work. Not measured with the code of this version.
+- The mode set of `mixed` after a warm start comes from a complex64 stage that stops at 1e-3: a near-degenerate
+  pair nearer the target that is not in its block can be missed, and then the result depends on the rounding (see
+  "Cold starts"). The warm start makes this less probable (the block holds the modes of a similar problem), but it
+  is not checked. Use `switch_tol=2e-5` (or `polish="davidson"`) when such a pair is probable.
 - All precisions can miss eigenvalues nearer the target than the kept modes. Taper cell 18 (`bench_refine.py`):
   ARPACK on the assembled matrix finds lambda = -1.9350 and -1.9038 (box modes below cutoff, neff 1.391 and 1.380)
   between the 9th (-1.9871) and the 10th kept mode (-1.8877); the double, the mixed and the single solves keep
@@ -514,7 +564,8 @@ iterations give the results of `davidson` from the same initial block), the stop
 limit of each member, and the tidy3d direction rule for modes below cutoff. On the CPU the iterations and the
 matvecs must be the same as those of the per-cell solve (all three precisions); on a GPU the iteration check has a
 slack and is not done in single precision.
-`tests/test_refine.py` checks the mixed-precision refinement (above): the strip against the double solve and the
+`tests/test_refine.py` checks the mixed-precision refinement (above): the stop of the complex64 stage after a cold
+and a warm start (`COLD_SWITCH_TOL`, per cell and batched), the strip against the double solve and the
 SciPy residuals, the two-core cluster against ARPACK, a mode count that cuts a near-degenerate pair (1 and 3 modes
 of the two cores, 3 start blocks, against ARPACK and the double solve by neff and field overlap), the complex128
 applies against the earlier polish, the tracking and the selection of the pairs, the weakly guided SiN tip (the
