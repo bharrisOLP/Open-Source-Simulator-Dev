@@ -22,4 +22,6 @@ packages = ["src/photonsuite"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+# photonsuite.fdtd_avg imports fdtd_gpu (not a dependency, as fdtdx): the tests find it also when it is not installed
+pythonpath = ["../fdtd_gpu/src"]
 markers = ["slow: longer multiphysics runs"]

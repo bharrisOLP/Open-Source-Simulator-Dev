@@ -21,6 +21,15 @@ def test_straight_guide_transmits_one():
     assert abs(r.transmission - 1.0) < 1e-4 and r.total_right <= 1.0 + 1e-6
 
 
+def test_one_cell_per_segment():
+    """cell_length=None: one EME cell per segment (the device is sampled exactly along z); a straight guide in three
+    unequal segments transmits 1 and reflects nothing."""
+    xs = CrossSection(SIO2, (Rect(-0.25, 0.25, 0.0, 0.22, SI),))
+    segs = [Segment(0.0, 0.7, xs), Segment(0.7, 0.93, xs), Segment(0.93, 2.0, xs)]
+    r = transmission(segs, (-1.5, 1.5), (-0.8, 1.02), 1.55, step=0.04, cell_length=None, num_modes=6)
+    assert r.n_cells == 3 and abs(r.transmission - 1.0) < 1e-4 and r.total_left < 1e-6
+
+
 def test_a_polygon_segment_continues_the_guide():
     rect = CrossSection(SIO2, (Rect(-0.25, 0.25, 0.0, 0.22, SI),))
     poly = CrossSection(SIO2, (Polygon(((-0.25, 0.0), (0.25, 0.0), (0.25, 0.22), (-0.25, 0.22)), SI),))

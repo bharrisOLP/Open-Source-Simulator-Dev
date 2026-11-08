@@ -2,10 +2,14 @@
 
 The same device description as photonsuite.fdtd (Segment(z0, z1, CrossSection)): each Rect of a segment becomes a
 meow Box over the z range of its segment, and each Polygon a prism along z; meow cuts the device into cells of length
-``cell_length`` (each cell takes the cross-section at its center). meow 0.15 never projects a Prism with axis "z"
-inside its z range (``_project_axis_z`` tests ``z < h_max`` where it means ``z > h_max``), so the adapter uses a
-subclass with the corrected test. The S-matrix comes from meow (overlaps, interfaces, SAX cascade) with its default
-interface settings; ``interface_kwargs`` passes other settings to meow.compute_interface_s_matrices.
+``cell_length`` (each cell takes the cross-section at its center); with ``cell_length=None`` each segment is one cell,
+so the EME samples the piecewise-constant device exactly (no error from the cell length). meow 0.15 never projects
+a Prism with axis "z" inside its z range (``_project_axis_z`` tests ``z < h_max`` where it means ``z > h_max``), so
+the adapter uses a subclass with the corrected test. The S-matrix comes from meow (overlaps, interfaces, SAX
+cascade) with its default interface settings; ``interface_kwargs`` passes other settings to
+meow.compute_interface_s_matrices. On a short taper these settings change T00 by 0.02 to 0.03: the default passivity
+correction ("invert") turns the power gain of the truncated interface solve into a loss (README, "EME against 3-D
+FDTD with subpixel averaging").
 """
 
 from __future__ import annotations
@@ -34,6 +38,7 @@ class EMEResult:
     total_right: float           # the sum of |S|^2 over all right ports (power into all kept modes)
     n_cells: int
     modes_kept: list
+    total_left: float = float("nan")    # the sum of |S|^2 over all left ports (power reflected into kept modes)
 
 
 def structures(segments, x_range, y_range):
@@ -66,8 +71,10 @@ def structures(segments, x_range, y_range):
     return out
 
 
-def transmission(segments, x_range, y_range, wavelength: float, step: float = 0.02, cell_length: float = 0.25,
-                 num_modes: int = 10, precision: str = "mixed", interface_kwargs: dict | None = None) -> EMEResult:
+def transmission(segments, x_range, y_range, wavelength: float, step: float = 0.02,
+                 cell_length: float | None = 0.25, num_modes: int = 10, precision: str = "mixed",
+                 interface_kwargs: dict | None = None) -> EMEResult:
+    """Fundamental-mode transmission |S21|^2 at one wavelength (um). cell_length=None: one EME cell per segment."""
     import jax
     import meow as mw
 
@@ -77,8 +84,13 @@ def transmission(segments, x_range, y_range, wavelength: float, step: float = 0.
     structures_ = structures(segments, x_range, y_range)
     mesh = mw.Mesh2D(x=np.arange(x_range[0], x_range[1] + step / 2, step),
                      y=np.arange(y_range[0], y_range[1] + step / 2, step))
-    n_cells = max(1, int(round((z_hi - z_lo) / cell_length)))
-    cells = mw.create_cells(structures_, mesh, np.full(n_cells, (z_hi - z_lo) / n_cells), z_min=z_lo)
+    if cell_length is None:
+        lengths = np.array([s.z1 - s.z0 for s in segments])
+    else:
+        n_cells = max(1, int(round((z_hi - z_lo) / cell_length)))
+        lengths = np.full(n_cells, (z_hi - z_lo) / n_cells)
+    n_cells = len(lengths)
+    cells = mw.create_cells(structures_, mesh, lengths, z_min=z_lo)
     env = mw.Environment(wl=wavelength, T=25.0)
     solver = GPUModeSolver(precision=precision)
     modes = [compute_modes_gpu(mw.CrossSection.from_cell(cell=c, env=env), num_modes=num_modes, solver=solver)
@@ -90,4 +102,5 @@ def transmission(segments, x_range, y_range, wavelength: float, step: float = 0.
     S = np.asarray(S)
     t = float(abs(S[pm["left@0"], pm["right@0"]]) ** 2)
     total = float(sum(abs(S[pm["left@0"], pm[k]]) ** 2 for k in pm if k.startswith("right")))
-    return EMEResult(t, total, n_cells, [len(m) for m in modes])
+    left = float(sum(abs(S[pm["left@0"], pm[k]]) ** 2 for k in pm if k.startswith("left")))
+    return EMEResult(t, total, n_cells, [len(m) for m in modes], left)

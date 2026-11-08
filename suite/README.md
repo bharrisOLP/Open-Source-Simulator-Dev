@@ -138,7 +138,9 @@ segment must be at least 1 um and the last at least 0.5 um long (the source and 
 - `eme.transmission(segments, x_range, y_range, wavelength, step, cell_length, num_modes)`: meow with the
   meow-gpu mode solver. `Rect` and `Polygon` shapes (a polygon becomes a prism along z; meow 0.15 drops such
   prisms, and the adapter corrects that: `docs/upstream-issues.md`). Each shape gets its own meow mesh order, so a
-  later shape replaces an earlier one, as in `CrossSection`.
+  later shape replaces an earlier one, as in `CrossSection`. `cell_length=None`: one cell per segment.
+- `fdtd_avg.mode_transmission(segments, x_range, y_range, wavelengths, resolution)`: fdtd_gpu with subpixel
+  averaging, a band of wavelengths in one run (the last section).
 
 | Case (`bench/`, JSON rows in `benchmarks/2026-10-30/fdtd-v3.jsonl`) | Result |
 |---|---|
@@ -181,6 +183,113 @@ and output). `bench/eme_taper.py` runs `photonsuite.eme` on the segment list of 
 (0.10 % lower than with vertical walls), and the FDTD 0.9975 at 20 nm (0.14 % higher; 0.9985 at 25 nm, 0.11 %
 higher). The two methods do not agree on the sign of this small change; it is below the accuracy of this comparison
 (the FDTD flux transmission is 0.03 % to 0.2 % above 1, and the EME loses 0.6 % of the power).
+
+## EME against 3-D FDTD with subpixel averaging (`photonsuite.fdtd_avg`)
+
+`fdtd_avg.mode_transmission(segments, x_range, y_range, wavelengths, resolution)` runs the same segment list with
+fdtd_gpu (this repository; fdtdx inside): subpixel averaging of the permittivity at each Yee E component (Kottke et
+al.; second order in the fdtd_gpu checks), a mode source, and mode monitors whose modes the fdtdx mode solver
+computes at each frequency, so one run gives the whole band. The first segment must be at least 1.5 um long,
+the last at least 1.0 um and the device at least 2.0 um (the planes stay 0.5 um from the segment ends). The mode
+coefficient |alpha|^2 of a pure mode differs from its flux by the factor b (the co-located fields of the Yee grid;
+b = 0.992 for the 0.5 um strip at 40 cells per um), and b depends on the mode, so two more runs (straight guides of
+the input and the output cross-section) measure it: T00 = (|a_out|^2 / b_out) / (|a_in|^2 / b_in).
+`eme.transmission(..., cell_length=None)` gives one EME cell per segment, so the EME samples the piecewise-constant
+device exactly along z.
+`fdtd_gpu` is not a dependency (as fdtdx); the tests find it through `pythonpath` in `pyproject.toml`.
+
+The case (`bench/eme_fdtd_taper.py`; textbook indices, constant over the band: Si 3.476, SiO2 1.444): a Si strip
+220 nm thick in SiO2, 1.5 um straight at 0.5 um width, a linear taper to 2.0 um over 2 um in 20 segments of 0.1 um
+(each with the width at its center), 1 um straight at 2.0 um; window x -2 to 2 um, y -0.8 to 1.02 um; TE; five
+wavelengths from 1.50 to 1.60 um. The taper is short, so about 9 % of the power goes into higher modes (T00 near 0.91):
+the comparison tests the mode coupling, not only a transmission near 1.
+
+Results: the rows of `benchmarks/2026-11-08/suite-eme-fdtd-taper.jsonl` (the commands below; RX 7900 XT, shared
+computer). T00 at 1.50, 1.525, 1.55, 1.575 and 1.60 um.
+
+FDTD (subpixel averaging; the times are the FDTD loops of the three runs):
+
+| cells per um | cells | T00 | T_flux | b_in / b_out at 1.55 um | time |
+|---|---|---|---|---|---|
+| 30 | 1.8 M | 0.9082, 0.9129, 0.9171, 0.9207, 0.9238 | 1.0017 to 1.0029 | 0.9864 / 0.9901 | 9.6 s |
+| 40 | 4.3 M | 0.9032, 0.9081, 0.9125, 0.9163, 0.9197 | 1.0005 to 1.0014 | 0.9923 / 0.9944 | 28.6 s |
+| 50 | 8.3 M | 0.9012, 0.9063, 0.9109, 0.9150, 0.9185 | 0.99996 to 1.0006 | 0.9950 / 0.9964 | 86.2 s |
+| 60 | 14.4 M | 0.9008, 0.9058, 0.9103, 0.9143, 0.9178 | 0.9996 to 1.0002 | 0.9966 / 0.9975 | 172.7 s |
+
+- Convergence: the change of T00 from 30 to 40, 40 to 50 and 50 to 60 cells per um is -0.0041 to -0.0050,
+  -0.0012 to -0.0020 and -0.0004 to -0.0008 (over the band): faster than first order, but the ratios of the steps
+  scatter (1.6 to 5.5 for the last two), so no single order fits. A second-order extrapolation from 50 and 60 gives
+  0.9000, 0.9047, 0.9090, 0.9128, 0.9161, within 0.0017 of the res-60 values: the FDTD limit is known to about 2e-3.
+- Power: T_flux goes to 1 (0.9996 to 1.0002 at res 60), so the taper radiates little; the rest of the power is in the
+  higher modes. The straight guides of the calibration transmit 0.99984 and 0.99996 of the flux.
+- The mode factor: b goes to 1 at about second order; b_in / b_out changes T00 by 0.37 % (res 30) to 0.09 % (res 60).
+- The FDTD and the EME see the same cross-sections: the TE0 index of the fdtdx mode solver at the planes (1.55 um,
+  res 30 to 60) is 2.4460, 2.4479, 2.4505, 2.4468 (0.5 um strip) and 2.8207, 2.8243, 2.8260, 2.8232 (2.0 um);
+  meow-gpu (`bench/taper_modes.py`, grids 0.04, 0.02, 0.01 um) gives 2.4518, 2.4436, 2.4450 and 2.8252, 2.8194,
+  2.8213. The FDTD propagation index (the phase of a_out / a_in in the straight guides, res 60) is 2.4493 and 2.8273:
+  above the mode solver by 0.0026 and 0.0041, the dispersion of the Yee grid, (k n dx)^2 (1 - S^2) / 24 relative with
+  S = c dt / (n dx), which also gives 0.0026 and 0.0041. This index error changes the beat phase of TE0 and TE2 in
+  the taper; it is a probable cause of the change of T00 with the grid (not tested separately).
+- Staircase (`--staircase`, res 40): 0.9019, 0.9069, 0.9115, 0.9156, 0.9193, 0.0004 to 0.0013 below the average.
+
+EME (one cell per segment, 22 cells; 0.02 um grid; times for the five wavelengths 44 s at 10 modes, 105 s at 20, 198 s
+at 30, 300 s at 40):
+
+| meow interface setting | modes | T00 | power in the right modes |
+|---|---|---|---|
+| TSVD rcond 1e-3, passivity "invert" (default) | 10 | 0.8705, 0.8731, 0.8761, 0.8784, 0.8809 | 0.9875 to 0.9879 |
+| the same | 20 | 0.8727, 0.8759, 0.8791, 0.8784, 0.8808 | 0.9869 to 0.9871 |
+| passivity "clip" | 20 | 0.8853, 0.8887, 0.8920, 0.8907, 0.8932 | 0.9984 to 0.9991 |
+| passivity "none" | 10 | 0.8922, 0.8952, 0.8980, 0.9010, 0.9035 | 1.0107 to 1.0122 |
+| passivity "none" | 20 | 0.8983, 0.9019, 0.9053, 0.9035, 0.9061 | 1.0100 to 1.0113 |
+| passivity "none" | 30 | 0.9096, 0.9123, 0.9145, 0.9165, 0.9183 | 1.0095 to 1.0105 |
+| passivity "none" | 40 | 0.9132, 0.9163, 0.9189, 0.9214, 0.9235 | 1.0080 to 1.0094 |
+| passivity "none", TSVD rcond 1e-8 | 20 | unstable | 1.6 to 132 |
+
+Agreement and its causes:
+- At 1.55 um the EME differs from the FDTD (0.9103 at res 60) by -0.034 and -0.031 with the meow defaults (10 and 20
+  modes), -0.018 with "clip", and -0.012, -0.005, +0.004, +0.009 without a correction (10, 20, 30, 40 modes). The
+  FDTD is converged to about 2e-3; the EME is not converged.
+- The EME is limited by its interfaces, not by its grid or its cells. Without a correction the kept modes carry 0.8
+  to 1.2 % more power than the input: the overlap solve of meow with a truncated set of modes in the closed window
+  (PEC walls; the box modes stand for the radiation) does not conserve power. "invert" replaces each singular value
+  1 + d of an interface by 1 / (1 + d), so the gain becomes a loss of the same size and T00 falls by 0.022 (10
+  modes) and 0.026 (20 modes); "clip" removes only the gain. With more modes the uncorrected T00 rises (0.898,
+  0.905, 0.915, 0.919 at 10 to 40 modes) and the power error stays near 1 %: no convergence up to 40 modes. The
+  FDTD value is between the 20- and the 30-mode values. Almost no truncation of the solve (rcond 1e-8) is unstable.
+- The EME grid: 0.04 to 0.02 um changes T00 at 1.55 um by +0.0022 (20 modes, "invert"; 0.8769 against 0.8791), 0.02
+  to 0.01 um by +0.0007 ("none", 20 modes; 0.9060 against 0.9053).
+- The slope over the band: from 1.50 to 1.60 um the FDTD T00 rises by 0.0169 (res 60; 0.0156 at res 30), the EME by
+  0.0078 to 0.0113 (all rows above but the unstable one). The slopes differ by about 0.007, more than the FDTD
+  slope changes with the grid (0.0013).
+- The earlier comparison on the 10 um taper (above: EME 0.9912 with "invert", FDTD 0.9961, and the EME lost 0.6 % of
+  the power) has the sign of the same interface loss; it is not repeated here.
+
+Commands (from the repository folder on the GPU computer; the logged runs set `PYTHONPATH`, which is not
+necessary when `tools/env/rocm_jax.sh` installed fdtd_gpu into .venv-rocm):
+
+```bash
+B="python bench/eme_fdtd_taper.py"
+for r in 30 40 50 60; do bash tools/gpu_run.sh suite env PYTHONPATH=../fdtd_gpu/src $B fdtd --resolution $r; done
+bash tools/gpu_run.sh suite env PYTHONPATH=../fdtd_gpu/src $B fdtd --resolution 40 --staircase
+for a in "--modes 10" "--modes 20" "--modes 20 --step 0.04" "--modes 20 --passivity clip" \
+         "--modes 10 --passivity none" "--modes 20 --passivity none" "--modes 30 --passivity none" \
+         "--modes 40 --passivity none" "--modes 20 --passivity none --rcond 1e-8" \
+         "--modes 20 --passivity none --step 0.01 --wavelengths 1.55"; do bash tools/gpu_run.sh suite $B eme $a; done
+bash tools/gpu_run.sh suite python bench/taper_modes.py
+```
+
+Tests (`tests/test_fdtd_avg.py`): the staircase of the adapter equals the suite's own sampling at every cell center
+(three segments: a Rect, a sloped Polygon, a fill order), the averaged eps along the propagation axis keeps the
+area of each cross-section to 2e-3, the planes must stay off the segment ends, and a straight guide at 20 cells per um
+gives T00 within 3e-3 of 1, T_flux within 1e-2, 0.9 < b < 1.01 and a phase index within 0.05 of the mode solver.
+`tests/test_eme.py`: one cell per segment on a straight guide (T within 1e-4 of 1).
+
+Limits: the EME has no converged value on this taper (its interface treatment, above); the FDTD runs in float32, with
+non-dispersive indices, and gives only the fundamental-mode coefficient (TE2 and higher: not compared yet). The
+older adapter `photonsuite.fdtd` puts its input detector 1.0 um into the device, on the end of a 1.0 um first segment
+in `bench/fdtd_taper*.py`: its overlap ratio `transmission` sees the start of the taper there (its calibrated T00 uses
+the input flux, which does not depend on the plane); not changed.
 
 ## Next
 

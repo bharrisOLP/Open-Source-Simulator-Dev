@@ -84,8 +84,9 @@ def test_runs_on_the_gpu_after_an_eme_run():
     9 times slower before), and reports the device of the field arrays."""
     from photonsuite.eme import transmission as eme_transmission
 
-    gpus = [d for d in jax.devices() if d.platform != "cpu"]
-    if not gpus:
+    try:                        # not jax.devices(): klujax (imported with meow) makes the CPU the default backend
+        gpus = jax.devices("gpu")
+    except RuntimeError:
         pytest.skip("no GPU")
     xs = CrossSection(SIO2, (Rect(-0.25, 0.25, 0.0, 0.22, SI),))
     eme_transmission([Segment(0.0, 2.0, xs)], (-1.5, 1.5), (-0.8, 1.02), 1.55, step=0.04, cell_length=1.0,
