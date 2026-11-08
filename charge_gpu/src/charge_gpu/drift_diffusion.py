@@ -527,6 +527,48 @@ def _gummel(dev, m: _Mesh, psi, n, p, tau_n, tau_p, tol, max_iter, linear="super
     return psi, n, p, max_iter, False, err, stats
 
 
+@dataclass(frozen=True)
+class FaceCurrents:
+    """The Scharfetter-Gummel face currents of a solution (DDSolution.face_currents), with the geometry of the faces:
+    the numbers of the continuity equations of the solver, not a recomputation.
+
+    Cells are flat indices into the (nx, ny) cell grid in C order (i ny + j); ``semiconductor`` and ``area`` give
+    the cells. The currents are those of the module docstring: j = J / q integrated over the face, in 1/(m s) (the
+    number of carriers per second and per m of device length along z; times poisson.Q: A/m), positive when the
+    conventional current of that carrier flows in the stated direction.
+
+    Interior faces, one per pair of semiconductor cells with a common side: b is the +x neighbor of a (axis 0) or
+    the +y neighbor (axis 1); jn and jp are the electron and the hole current from a to b. The x faces come first,
+    then the y faces. Contact faces, one per semiconductor cell under the mask of an ohmic contact:
+    jnc and jpc are the electron and the hole current from the cell to the contact node (out of the device); the
+    node is half a cell from the cell center and has the potential contact_psi and both quasi-Fermi levels at the
+    contact voltage contact_voltage. For each contact k, poisson.Q times the sum of jnc + jpc over contact == k is
+    DDSolution.contact_currents[k]."""
+
+    shape: tuple                 # (nx, ny)
+    semiconductor: np.ndarray    # (nx, ny) bool: the cells with carriers
+    area: np.ndarray             # (nx, ny) cell areas (m^2): the volume of a cell per m of device length
+    a: np.ndarray                # interior faces: flat index of the cell a
+    b: np.ndarray                # flat index of the cell b (the +x or +y neighbor of a)
+    axis: np.ndarray             # 0: an x face (b = a + ny), 1: a y face (b = a + 1)
+    jn: np.ndarray               # electron current from a to b, / q (1/(m s))
+    jp: np.ndarray               # hole current from a to b, / q (1/(m s))
+    contact_cell: np.ndarray     # contact faces: flat index of the cell
+    contact: np.ndarray          # the index of the contact (Device.contacts, DDSolution.contact_currents)
+    contact_psi: np.ndarray      # potential of the contact node (V)
+    contact_voltage: np.ndarray  # the voltage of the contact (V): v_n for an n contact, v_p for a p contact
+    jnc: np.ndarray              # electron current from the cell to the contact node, / q (1/(m s))
+    jpc: np.ndarray              # hole current from the cell to the contact node, / q (1/(m s))
+
+    def current(self) -> np.ndarray:
+        """The total current (A/m) of each interior face, from a to b: q (jn + jp)."""
+        return Q * (self.jn + self.jp)
+
+    def contact_current(self) -> np.ndarray:
+        """The total current (A/m) of each contact face, out of the device: q (jnc + jpc)."""
+        return Q * (self.jnc + self.jpc)
+
+
 @dataclass
 class DDSolution:
     psi: np.ndarray          # (nx, ny) potential (V)
@@ -583,6 +625,23 @@ class DDSolution:
             phi_n = np.where(semi, self.psi - m.vt * np.log(self.n / m.n_i), np.nan)
             phi_p = np.where(semi, self.psi + m.vt * np.log(self.p / m.n_i), np.nan)
         return phi_n, phi_p
+
+    def face_currents(self) -> FaceCurrents:
+        """The Scharfetter-Gummel currents of all interior and contact faces at this solution, with the face and cell
+        geometry (FaceCurrents). They are the currents of the continuity equations of the solve (the same function,
+        on the same arrays), so they satisfy those equations to the residual of the solve: for each semiconductor
+        cell, the electron current out of the cell is q R A and the hole current out of it is -q R A."""
+        m = self.mesh
+        (_, _, _, jn, jp), (_, _, _, jnc, jpc) = _fluxes(m, np.asarray(self.psi, float).ravel(),
+                                                         self.n.ravel()[m.sflat], self.p.ravel()[m.sflat])
+        semi = np.zeros(m.n_cells, bool)
+        semi[m.sflat] = True
+        return FaceCurrents(shape=tuple(m.shape), semiconductor=semi.reshape(m.shape), area=m.vol.reshape(m.shape),
+                            a=m.fa.copy(), b=m.fb.copy(), axis=np.where(m.fcol >= 0, 0, 1), jn=jn, jp=jp,
+                            contact_cell=m.cflat.copy(), contact=m.cid.copy(), contact_psi=m.cpsi.copy(),
+                            contact_voltage=np.where(np.asarray(self.contact_kinds)[m.cid] == "n", self.v_n,
+                                                     self.v_p),
+                            jnc=jnc, jpc=jpc)
 
     def x_currents(self) -> np.ndarray:
         """Total current (A/m, in +x) through each interior column boundary x_(i+1) (nx - 1 values). Only the x faces

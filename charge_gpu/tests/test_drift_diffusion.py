@@ -230,21 +230,100 @@ def test_rib_pin_needs_boundaries_on_cell_edges():
     assert yc[slab_rows].min() > 0
 
 
-def test_contact_on_a_y_side():
-    """A p block with an xmin contact and an n block with a ymax contact (an L-shaped current path), 0.4 V: the
-    contact currents sum to zero; x_currents (x faces only) refuses this device."""
+def l_block():
+    """A p block (x < 0.5 um) with an xmin contact and an n block with a ymax contact over x > 0.5 um: an L-shaped
+    current path; 1 x 1 um, 50 nm cells, 1e17 cm^-3."""
     from charge_gpu.poisson import Contact, Device
     x = np.linspace(0, 1e-6, 21)
     y = np.linspace(0, 1e-6, 21)
     xc = 0.5 * (x[1:] + x[:-1])
     n_net = np.where(xc[:, None] < 0.5e-6, -1e23, 1e23) * np.ones((20, 20))
-    dev = Device(x=x, y=y, eps_r=np.full((20, 20), 11.7), n_net=n_net, semiconductor=np.ones((20, 20), bool),
-                 contacts=[Contact("xmin", np.ones(20, bool), 0.0), Contact("ymax", xc > 0.5e-6, 0.0)])
-    sol = dd.solve(dev, 0.0, 0.4)
+    return Device(x=x, y=y, eps_r=np.full((20, 20), 11.7), n_net=n_net, semiconductor=np.ones((20, 20), bool),
+                  contacts=[Contact("xmin", np.ones(20, bool), 0.0), Contact("ymax", xc > 0.5e-6, 0.0)])
+
+
+def test_contact_on_a_y_side():
+    """A p block with an xmin contact and an n block with a ymax contact (an L-shaped current path), 0.4 V: the
+    contact currents sum to zero; x_currents (x faces only) refuses this device."""
+    sol = dd.solve(l_block(), 0.0, 0.4)
     assert sol.converged and sol.current > 0
     assert abs(np.sum(sol.contact_currents)) < 1e-7 * sol.current          # round-off: 1.7e-8 measured
     with pytest.raises(ValueError, match="xmin and xmax"):
         sol.x_currents()
+
+
+def check_face_currents(dev, s):
+    """The checks of DDSolution.face_currents that hold on every device; returns the largest continuity residual of a
+    cell (electron and hole equations) divided by the terminal current / q."""
+    f = s.face_currents()
+    m = s.mesh
+    (_, _, _, jn, jp), (_, _, _, jnc, jpc) = dd._fluxes(m, s.psi.ravel(), s.n.ravel()[m.sflat], s.p.ravel()[m.sflat])
+    for public, solver in ((f.jn, jn), (f.jp, jp), (f.jnc, jnc), (f.jpc, jpc)):
+        assert np.array_equal(public, solver)                     # the arrays of the solver, bit for bit
+    nx, ny = f.shape
+    nc = nx * ny
+    semi = f.semiconductor.ravel()
+    assert f.shape == dev.n_net.shape and np.array_equal(f.semiconductor, dev.semiconductor)
+    assert np.allclose(f.area, np.outer(np.diff(dev.x), np.diff(dev.y)), rtol=1e-14, atol=0)
+    assert np.all(np.where(f.axis == 0, f.b - f.a == ny, f.b - f.a == 1))
+    assert semi[f.a].all() and semi[f.b].all() and semi[f.contact_cell].all()
+    # every pair of semiconductor neighbors has one face
+    sm = np.asarray(dev.semiconductor, bool)
+    assert f.a.size == np.sum(sm[:-1] & sm[1:]) + np.sum(sm[:, :-1] & sm[:, 1:])
+    # the contact faces: on the side of their contact, under its mask, at its voltage, sum = contact_currents
+    for k, c in enumerate(dev.contacts):
+        i, j = np.divmod(f.contact_cell[f.contact == k], ny)
+        on = {"xmin": i == 0, "xmax": i == nx - 1, "ymin": j == 0, "ymax": j == ny - 1}[c.side]
+        assert on.all() and np.asarray(c.mask)[j if c.side in ("xmin", "xmax") else i].all()
+        assert np.all(f.contact_voltage[f.contact == k] == (s.v_n if s.contact_kinds[k] == "n" else s.v_p))
+    assert np.allclose(np.bincount(f.contact, f.contact_current(), len(dev.contacts)), s.contact_currents, rtol=1e-13,
+                       atol=0)
+    # the continuity equations of each cell with the public recombination: electrons out = R A, holes out = -R A
+    ra = (s.recombination() * f.area).ravel()
+    out_n = np.bincount(f.a, f.jn, nc) - np.bincount(f.b, f.jn, nc) + np.bincount(f.contact_cell, f.jnc, nc)
+    out_p = np.bincount(f.a, f.jp, nc) - np.bincount(f.b, f.jp, nc) + np.bincount(f.contact_cell, f.jpc, nc)
+    assert np.all(out_n[~semi] == 0) and np.all(out_p[~semi] == 0)
+    scale = abs(s.current) / Q
+    return max(np.max(np.abs(out_n - ra)), np.max(np.abs(out_p + ra))) / scale
+
+
+def test_face_currents_against_the_terminal_current(pin_sweep):
+    """DDSolution.face_currents on the PIN rib at 0.8 and 0.9 V: the arrays of the solver; the geometry; the total
+    current of the x faces through every column boundary equals the terminal current; the contact faces give
+    contact_currents; the continuity equations of each cell hold with the public recombination()."""
+    dev, sols = pin_sweep
+    for s in sols[1:]:
+        f = s.face_currents()
+        nx, ny = f.shape
+        x = f.axis == 0
+        through = np.bincount(f.a[x] // ny, f.current()[x], nx - 1)
+        rel = np.max(np.abs(through / s.current - 1))
+        res = check_face_currents(dev, s)
+        print(f"{s.bias} V: I' = {s.current:.6e} A/m; column boundaries against I': {rel:.1e}; "
+              f"cell continuity residual / (I'/q): {res:.1e}")
+        assert rel < 1e-9 and res < 1e-8
+        assert np.allclose(through, s.x_currents(), rtol=1e-13, atol=0)     # the sum of x_currents
+
+
+def test_face_currents_on_a_y_side():
+    """The L-shaped block at 0.4 V (contacts on xmin and on ymax): the current of the y faces through each cut
+    between two rows equals the current out of the contact faces above that cut (the xmin faces above it and the
+    ymax faces); the checks of check_face_currents."""
+    dev = l_block()
+    s = dd.solve(dev, 0.0, 0.4)
+    f = s.face_currents()
+    nx, ny = f.shape
+    out = f.contact_current()
+    worst = 0.0
+    for j in range(ny - 1):
+        cut = (f.axis == 1) & (f.a % ny == j)
+        up = np.sum(f.current()[cut])
+        above = np.sum(out[f.contact_cell % ny > j])
+        worst = max(worst, abs(up - above) / s.current)
+    res = check_face_currents(dev, s)
+    print(f"L-shaped block: I' = {s.current:.6e} A/m; y cuts against the contacts above: {worst:.1e}; "
+          f"cell continuity residual / (I'/q): {res:.1e}")
+    assert worst < 1e-7 and res < 1e-7
 
 
 def test_sweep_halves_the_step_after_a_solver_exception(monkeypatch):

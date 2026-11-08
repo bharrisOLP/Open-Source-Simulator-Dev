@@ -6,19 +6,25 @@ charge-gpu example; the sum of the heat source equals I' V (also on a 1-D diode,
 grid); the sum of J . E equals I' (V - V_c) of the contact potentials (analytic); the thermal part against
 physics.phase_shifter_ppi with the same heat in the same cells; both parts against the first-order perturbation
 (a second-order difference); the limits dn/dT = 0 and no plasma dispersion; the mode is the fundamental mode
-(the largest index of a 4-mode solve); the signs and the cross-over."""
+(the largest index of a 4-mode solve); the signs and the cross-over. The heat through the public face currents of
+charge-gpu is the heat of the private fields (0753ed0) bit for bit. The two-way electro-thermal loop: without a
+temperature rise it gives the 300 K result; it converges (the residual per step); its first step is the logged
+one-pass feedback; its fixed point is that of a root finder (brentq) and does not depend on the damping; the heat
+equals I' V at the converged state."""
 import dataclasses
 
 import jax
 import numpy as np
 import pytest
+from scipy.interpolate import RegularGridInterpolator
 
 jax.config.update("jax_enable_x64", True)
 
 from photonsuite.physics import (ConvergenceError, Window, charge_device, phase_shifter_ppi,  # noqa: E402
                                  thermal_problem)
-from photonsuite.pin import (SI, SIO2, PinElectrical, cell_overlap, heat_source, pin_electrical,  # noqa: E402
-                             pin_optical, pin_rib, to_thermal, uniform_heat)
+from photonsuite.pin import (SI, SIO2, PinElectrical, cell_overlap, electrothermal, heat_source,  # noqa: E402
+                             pin_electrical, pin_optical, pin_phase_shifter, pin_rib, steady_temperature,
+                             to_thermal, uniform_heat)
 
 XS = pin_rib()
 OPTICS = Window(-1.5, 1.5, -0.5, 0.9, 0.02)
@@ -28,6 +34,9 @@ BIASES = (0.9, 1.0, 1.1, 1.2)
 # benchmarks/2026-10-30/charge-dd.jsonl, examples/pin_phase_shifter.py of charge-gpu (tau 1 ns): I' at 0.9 and 1.0 V
 LOGGED_CURRENT = {0.9: 3.8282742963924745, 1.0: 15.920944272975659}
 LOGGED_DNEFF_09 = -0.0007230039242824837          # the same file, the example with --modes: dneff at 0.9 V
+# benchmarks/2026-11-08/suite-pin.jsonl (the first run, --device-temperature): the one-pass feedback, I_hot_rel
+LOGGED_ONE_PASS = {0.9: 0.018622148456324483, 1.0: 0.04516366047616849, 1.1: 0.0641118753021257,
+                   1.2: 0.06381327412045867}
 
 
 @pytest.fixture(scope="module")
@@ -41,7 +50,42 @@ def result(electrical):
 
 
 def one_bias(el, k):
-    return PinElectrical(el.device, el.window, el.biases[k:k + 1], el.solutions[k:k + 1], el.reference, 0.0)
+    return dataclasses.replace(el, biases=el.biases[k:k + 1], solutions=el.solutions[k:k + 1], seconds=0.0)
+
+
+@pytest.fixture(scope="module")
+def two_way(electrical):
+    el = electrothermal(XS, THERMAL, electrical)
+    return el, pin_optical(XS, OPTICS, THERMAL, 1.55, el, core_tag="core")
+
+
+def heat_0753ed0(sol):
+    """heat_source of 0753ed0 (it read the private _fluxes and _Mesh fields of charge-gpu): the reference of the
+    change to the public face currents. Returns (joule, recombination, je)."""
+    from charge_gpu.drift_diffusion import _fluxes, srh
+    from charge_gpu.poisson import Q
+
+    m = sol.mesh
+    psi = np.asarray(sol.psi, float).ravel()
+    n, p = sol.n.ravel()[m.sflat], sol.p.ravel()[m.sflat]
+    (_, _, _, jn, jp), (_, _, _, jnc, jpc) = _fluxes(m, psi, n, p)
+    ps = psi[m.sflat]
+    phi_n = ps - m.vt * np.log(n / m.n_i)
+    phi_p = ps + m.vt * np.log(p / m.n_i)
+    v_c = np.where(np.asarray(sol.contact_kinds)[m.cid] == "n", sol.v_n, sol.v_p)
+    face = -Q * (jn * (phi_n[m.sb] - phi_n[m.sa]) + jp * (phi_p[m.sb] - phi_p[m.sa]))
+    cface = -Q * (jnc * (v_c - phi_n[m.cs]) + jpc * (v_c - phi_p[m.cs]))
+    ns = m.n_semi
+    joule = 0.5 * (np.bincount(m.sa, face, ns) + np.bincount(m.sb, face, ns)) + np.bincount(m.cs, cface, ns)
+    rec = Q * srh(n, p, m.n_i, sol.tau_n, sol.tau_p)[0] * m.svol * (phi_p - phi_n)
+    je = -Q * (np.sum((jn + jp) * (psi[m.fb] - psi[m.fa])) + np.sum((jnc + jpc) * (m.cpsi - psi[m.cflat])))
+
+    def grid(v):
+        out = np.zeros(m.n_cells)
+        out[m.sflat] = v
+        return out.reshape(m.shape)
+
+    return grid(joule), grid(rec), float(je)
 
 
 def test_the_cross_section_gives_the_rib_of_charge_gpu():
@@ -274,3 +318,140 @@ def test_a_thermal_solve_that_does_not_converge_raises(monkeypatch, electrical):
     monkeypatch.setattr(ts, "solve_steady", lambda *a, **k: real(*a, **k, max_iter=2))
     with pytest.raises(ConvergenceError, match="thermal"):
         pin_optical(XS, OPTICS, THERMAL, 1.55, one_bias(electrical, 0))
+
+
+def test_the_heat_of_the_public_face_currents_is_that_of_0753ed0(electrical, two_way):
+    # the same numbers bit for bit, at 300 K (the one-way path) and at the loop temperatures
+    for sol in [*electrical.solutions, *two_way[0].solutions]:
+        h = heat_source(sol)
+        joule, rec, je = heat_0753ed0(sol)
+        assert np.array_equal(h.joule, joule) and np.array_equal(h.recombination, rec) and h.je == je
+
+
+def test_the_loop_without_a_temperature_rise_is_the_300_K_result(monkeypatch, electrical, result):
+    # dT forced to 0 (the steady temperature of the module returns t_ambient everywhere): one solve per bias at
+    # Device.T = 300 K, from the 300 K solution; the same currents, carriers and carrier part
+    import photonsuite.pin as pin
+
+    real = pin.steady_temperature
+
+    def no_rise(xs, win, q, t_ambient=300.0, *a, **k):
+        th = real(xs, win, q, t_ambient, *a, **k)
+        zero = RegularGridInterpolator((th.x, th.y), np.zeros_like(th.T), bounds_error=False, fill_value=None)
+        return dataclasses.replace(th, rise=zero, T=np.full_like(th.T, t_ambient))
+
+    monkeypatch.setattr(pin, "steady_temperature", no_rise)
+    el = electrothermal(XS, THERMAL, electrical)
+    assert np.all(el.loop.iterations == 1) and np.all(el.loop.temperature == 300.0)
+    assert np.all(el.loop.residual == 0.0) and np.all(el.loop.spread == 0.0)
+    worst = {"I": 0.0, "n": 0.0, "psi": 0.0}
+    for s, s0 in zip(el.solutions, electrical.solutions):
+        assert s.converged and s.mesh.vt == s0.mesh.vt and s.mesh.n_i == s0.mesh.n_i and s.tau_n == s0.tau_n
+        semi = electrical.device.semiconductor
+        worst["I"] = max(worst["I"], abs(s.current / s0.current - 1))
+        worst["n"] = max(worst["n"], np.max(np.abs(s.n[semi] / s0.n[semi] - 1)), np.max(np.abs(s.p[semi] / s0.p[semi]
+                                                                                               - 1)))
+        worst["psi"] = max(worst["psi"], np.max(np.abs(s.psi - s0.psi)))
+    r = pin_optical(XS, OPTICS, THERMAL, 1.55, one_bias(el, 2))
+    rel = abs(r.dneff_carrier[0] / result.dneff_carrier[2] - 1)
+    print(f"dT = 0: I' {worst['I']:.1e}, n and p {worst['n']:.1e}, psi {worst['psi']:.1e} V; dneff_carrier at 1.1 V "
+          f"{rel:.1e}, dneff_thermal {abs(r.dneff_thermal[0]):.1e}")
+    assert worst["I"] < 1e-10 and worst["n"] < 1e-9 and worst["psi"] < 1e-12
+    assert rel < 1e-8 and abs(r.dneff_thermal[0]) < 1e-10
+
+
+def test_the_loop_converges_to_a_consistent_state(electrical, result, two_way):
+    from charge_gpu.poisson import thermal_voltage
+
+    el, r = two_way
+    loop = el.loop
+    print("| V | T (K) | solves | residual per step (K) | I' one-way | I' two-way | one pass | two-way |")
+    for k, v in enumerate(el.biases):
+        h = np.array(loop.history[k])                     # (steps, 4): T, I', T from the heat, residual
+        res = np.abs(h[:, 3])
+        ratio = res[1:] / res[:-1]
+        print(f"| {v} | {loop.temperature[k]:.6f} | {loop.iterations[k]} | "
+              f"{' '.join(f'{x:.1e}' for x in h[:, 3])} | {h[0, 1]:.6g} | {el.solutions[k].current:.6g} | "
+              f"{h[1, 1] / h[0, 1] - 1:.5f} | {el.solutions[k].current / h[0, 1] - 1:.5f} |")
+        assert loop.iterations[k] == len(h) - 1 and res[-1] <= loop.tol and loop.residual[k] == h[-1, 3]
+        assert np.all(ratio < 0.2)                         # a contraction: the gain dG/dT (0.018 to 0.066)
+        # step 0: the 300 K solution of the sweep; step 1: the one-pass feedback of the logged bench
+        assert h[0, 0] == 300.0 and h[0, 1] == electrical.solutions[k].current and h[1, 0] == h[0, 2]
+        assert abs(h[1, 1] / h[0, 1] - 1 - LOGGED_ONE_PASS[v]) < 1e-8
+        # the converged state: the device temperature of the solution; the optical part finds the same mean rise
+        assert el.solutions[k].mesh.vt == thermal_voltage(loop.temperature[k]) == thermal_voltage(h[-1, 0])
+        assert abs(300.0 + r.rise_semiconductor[k] - loop.temperature[k]) <= loop.tol
+        assert 0 < loop.spread[k] < r.rise_semiconductor[k]
+        # energy: the heat integral is I' V at the converged state (on the charge cells and on the thermal grid)
+        assert abs(heat_source(el.solutions[k]).total.sum() / r.power[k] - 1) < 1e-9
+        assert abs(r.heat[k] / r.power[k] - 1) < 1e-9
+    # the feedback raises the current, the carrier change and the heat; the 0 V reference stays at 300 K
+    assert np.all(r.current > result.current) and np.all(r.rise_core > result.rise_core)
+    assert np.all(r.dneff_carrier.real < result.dneff_carrier.real)
+    assert np.all(r.dneff_thermal.real > result.dneff_thermal.real)
+    assert el.reference is electrical.reference and np.array_equal(r.biases, result.biases)
+    x, x1 = r.crossover(), result.crossover()
+    print("| V | dneff_carrier one-way | two-way | dneff_thermal one-way | two-way | dneff one-way | two-way |")
+    for k, v in enumerate(r.biases):
+        print(f"| {v} | {result.dneff_carrier[k].real:.4e} | {r.dneff_carrier[k].real:.4e} | "
+              f"{result.dneff_thermal[k].real:.4e} | {r.dneff_thermal[k].real:.4e} | {result.dneff[k].real:.4e} | "
+              f"{r.dneff[k].real:.4e} |")
+    print("crossover one-way", x1, "two-way", x)
+    assert x is not None and x["interval"] == (1.1, 1.2)
+
+
+def test_the_fixed_point_of_a_root_finder(electrical, two_way):
+    # 1.2 V (the largest feedback): G(T) - T = 0 by brentq, with G from a fresh solve at T (from the 300 K solution)
+    # and the mean of charge_gpu.temperature.mean_temperature; the loop has |G(T) - T| <= tol = 1e-4 K and a gain
+    # below 0.1, so it is within about 1.1e-4 K of the root
+    from charge_gpu import drift_diffusion as dd
+    from charge_gpu.temperature import mean_temperature
+    from scipy.optimize import brentq
+
+    el, _ = two_way
+    k, v = 3, 1.2
+    dev, sol0 = electrical.device, electrical.solutions[k]
+    xe, ye = np.asarray(dev.x) * 1e6, np.asarray(dev.y) * 1e6
+    xc, yc = 0.5 * (xe[1:] + xe[:-1]), 0.5 * (ye[1:] + ye[:-1])
+    pts = np.stack([a.ravel() for a in np.meshgrid(xc, yc, indexing="ij")], -1)
+    calls = []
+
+    def f(t):
+        s = dd.solve(dataclasses.replace(dev, T=t), 0.0, v, guess=sol0, tau_n=1e-9, tau_p=1e-9)
+        assert s.converged
+        th = steady_temperature(XS, THERMAL, to_thermal(heat_source(s).total, xe, ye, THERMAL))
+        calls.append(t)
+        return mean_temperature(dev, 300.0 + th.rise(pts).reshape(xc.size, yc.size))[0] - t
+
+    root = brentq(f, 300.0, el.loop.history[k][1][0] + 10.0, xtol=1e-7)
+    print(f"1.2 V: brentq {root:.7f} K ({len(calls)} solves), the loop {el.loop.temperature[k]:.7f} K "
+          f"({el.loop.iterations[k]} solves), difference {el.loop.temperature[k] - root:.1e} K")
+    assert abs(el.loop.temperature[k] - root) < 1.2e-4
+
+
+def test_the_damping_does_not_change_the_fixed_point(electrical, two_way):
+    el, _ = two_way
+    d = electrothermal(XS, THERMAL, one_bias(electrical, 0), damping=0.5).loop
+    h = np.array(d.history[0])
+    print(f"0.9 V: damping 0.5: {d.temperature[0]:.7f} K in {d.iterations[0]} solves; damping 1: "
+          f"{el.loop.temperature[0]:.7f} K in {el.loop.iterations[0]} solves; residuals "
+          f"{' '.join(f'{x:.1e}' for x in h[:, 3])}")
+    assert d.iterations[0] > el.loop.iterations[0] and abs(d.residual[0]) <= d.tol
+    assert abs(d.temperature[0] - el.loop.temperature[0]) < 2.5e-4
+    assert np.all(np.abs(h[1:, 3]) < np.abs(h[:-1, 3]))
+
+
+def test_input_checks_of_the_loop(electrical):
+    el = one_bias(electrical, 3)
+    with pytest.raises(ConvergenceError, match="electro-thermal loop at 1.2 V"):
+        electrothermal(XS, THERMAL, el, max_iter=1)                  # one solve leaves a residual of about 1.5 K
+    for kw, match in ((dict(tol=0.0), "tol"), (dict(damping=0.0), "damping"), (dict(damping=1.5), "damping"),
+                      (dict(max_iter=0), "max_iter")):
+        with pytest.raises(ValueError, match=match):
+            electrothermal(XS, THERMAL, el, **kw)
+    with pytest.raises(ValueError, match="tau"):
+        electrothermal(XS, THERMAL, PinElectrical(el.device, el.window, el.biases, el.solutions, el.reference, 0.0))
+    with pytest.raises(ValueError, match="mobility"):
+        electrothermal(XS, THERMAL, dataclasses.replace(el, options={"mobility": (0.1, 0.04)}))
+    with pytest.raises(ValueError, match="coupling"):
+        pin_phase_shifter(XS, OPTICS, CHARGE, THERMAL, 1.55, [0.9], coupling="both")

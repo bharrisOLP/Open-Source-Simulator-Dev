@@ -17,13 +17,14 @@ A forward current changes the index of the waveguide in two ways, with opposite 
    phi_n and phi_p are the quasi-Fermi potentials (J_n = -q mu_n n grad(phi_n), J_p = -q mu_p p grad(phi_p)). The
    first two terms are the Joule heat of the two currents (|J|^2 / sigma: never negative); the last term is the heat
    of the recombination (positive in forward bias). The discrete form uses the Scharfetter-Gummel currents of
-   charge-gpu: a face between two semiconductor cells a and b gives -I_n (phi_n,b - phi_n,a) - I_p (phi_p,b -
-   phi_p,a), with I_n and I_p the face currents from a to b, one half to each cell; a contact face gives the same
-   with the contact voltage at the contact node, all to its cell; each cell gives q R A (phi_p - phi_n). Summation by
-   parts with the discrete continuity equations (div J_n = q R, div J_p = -q R in each cell) gives sum H = I' V
-   exactly, to the residual of the solve: all of the electrical power becomes heat. This sum is an identity of the
-   discrete scheme (it holds for any cell potentials): it checks the continuity residual and the flux code, not where
-   the heat goes; the local check is that each term is not negative.
+   charge-gpu (the public DDSolution.face_currents): a face between two semiconductor cells a and b gives
+   -I_n (phi_n,b - phi_n,a) - I_p (phi_p,b - phi_p,a), with I_n and I_p the face currents from a to b, one half to
+   each cell; a contact face gives the same with the contact voltage at the contact node, all to its cell; each
+   cell gives q R A (phi_p - phi_n). Summation by parts with the discrete continuity equations (div J_n = q R,
+   div J_p = -q R in each cell) gives sum H = I' V exactly, to the residual of the solve: all of the electrical
+   power becomes heat. This sum is an identity of the discrete scheme (it holds for any cell potentials): it checks
+   the continuity residual and the flux code, not where the heat goes; the local check is that each term is not
+   negative.
    The electrostatic J . E = -J . grad(psi) is not the heat source: its sum is I' (psi_p - psi_n) at the two contact
    nodes, I' (V - V_c) with V_c = V_T (asinh(N_A / 2 n_i) + asinh(N_D / 2 n_i)) (0.952 V at 1e18 cm^-3 and 300 K), so
    it is negative below V_c. Heat.je gives its sum (a check).
@@ -39,18 +40,21 @@ A forward current changes the index of the waveguide in two ways, with opposite 
 
 Outputs per bias (PinPhaseShifter): dneff_carrier, dneff_thermal, dneff (both changes in one solve), the phase per
 length, L_pi, P_pi, I_pi, the loss that the current adds, and the bias and current where the two parts cancel
-(crossover). The carriers are solved at one temperature (t_ambient): the heat does not change the currents.
+(crossover).
 
-Limit: heat_source reads the private helper charge_gpu.drift_diffusion._fluxes and the private fields of its _Mesh
-(face and contact indices, the contact node potentials, the cell areas). A refactor of charge-gpu can change them;
-the tests of the heat sum find a change of the flux convention. A public accessor of the face currents in
-charge-gpu is a later change of that package.
+Coupling: by default (one-way) the carriers are solved at 300 K: the heat does not change the currents.
+electrothermal (pin_phase_shifter(coupling="two-way")) adds the feedback: the drift-diffusion at a device temperature
+that equals t_ambient plus the mean rise of the Si that its own heat makes, iterated to a fixed point. charge-gpu
+takes one temperature per device, so the loop uses the area mean over the Si cells of the charge window, not the
+field. The 0 V reference of the carrier change stays at 300 K. The one-way path is the code of the default, with the
+same results.
 """
 
 from __future__ import annotations
 
+import dataclasses
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import numpy as np
 from scipy.interpolate import RegularGridInterpolator
@@ -94,12 +98,15 @@ def pin_rib(width=0.5, height=0.22, slab=0.09, half_span=1.5, gap=0.3, doping=1e
 
 @dataclass
 class PinElectrical:
-    device: object          # the charge_gpu Device of the cross-section on the charge window
+    device: object          # the charge_gpu Device of the cross-section on the charge window (at 300 K)
     window: Window
     biases: np.ndarray      # forward biases V = v_p - v_n (V)
-    solutions: list         # drift_diffusion.DDSolution per bias
-    reference: object       # the DDSolution at 0 V
+    solutions: list         # drift_diffusion.DDSolution per bias (at 300 K; electrothermal: at the loop temperature)
+    reference: object       # the DDSolution at 0 V (300 K)
     seconds: float          # the time of the sweep
+    tau: float | None = None                       # the SRH lifetimes tau_n = tau_p at 300 K (s)
+    options: dict = field(default_factory=dict)    # the options of drift_diffusion.solve of the sweep
+    loop: ElectroThermal | None = None             # electrothermal: the record of the loop; else None
 
 
 def pin_electrical(xs: CrossSection, charge: Window, biases, tau: float = 1e-9, **kw) -> PinElectrical:
@@ -126,7 +133,8 @@ def pin_electrical(xs: CrossSection, charge: Window, biases, tau: float = 1e-9, 
     bad = [s.bias for s in sols if not s.converged]
     if bad:
         raise ConvergenceError(f"drift-diffusion at {bad} V: not converged")
-    return PinElectrical(dev, charge, biases, sols[1:], sols[0], seconds)
+    options = {k: v for k, v in kw.items() if k not in ("step", "min_step")}     # the options of sweep only
+    return PinElectrical(dev, charge, biases, sols[1:], sols[0], seconds, tau, options)
 
 
 @dataclass
@@ -143,32 +151,26 @@ class Heat:
 
 def heat_source(sol) -> Heat:
     """The heat of a drift-diffusion solution (charge_gpu.drift_diffusion.DDSolution), per charge cell (module
-    docstring, step 2). The face currents are those of the solver (drift_diffusion._fluxes, a private helper of
-    charge-gpu: a change there can change the heat; the tests check the sum against I' V)."""
-    from charge_gpu.drift_diffusion import _fluxes, srh
+    docstring, step 2). The face currents and the cell areas come from the public DDSolution.face_currents (the
+    Scharfetter-Gummel currents of the solve), the quasi-Fermi potentials from DDSolution.quasi_fermi and R from
+    DDSolution.recombination, all at the temperature of the solution (Device.T)."""
     from charge_gpu.poisson import Q
 
-    m = sol.mesh
+    f = sol.face_currents()
     psi = np.asarray(sol.psi, float).ravel()
-    n, p = sol.n.ravel()[m.sflat], sol.p.ravel()[m.sflat]
-    (_, _, _, jn, jp), (_, _, _, jnc, jpc) = _fluxes(m, psi, n, p)
-    ps = psi[m.sflat]
-    phi_n = ps - m.vt * np.log(n / m.n_i)
-    phi_p = ps + m.vt * np.log(p / m.n_i)
-    v_c = np.where(np.asarray(sol.contact_kinds)[m.cid] == "n", sol.v_n, sol.v_p)
-    face = -Q * (jn * (phi_n[m.sb] - phi_n[m.sa]) + jp * (phi_p[m.sb] - phi_p[m.sa]))
-    cface = -Q * (jnc * (v_c - phi_n[m.cs]) + jpc * (v_c - phi_p[m.cs]))
-    ns = m.n_semi
-    joule = 0.5 * (np.bincount(m.sa, face, ns) + np.bincount(m.sb, face, ns)) + np.bincount(m.cs, cface, ns)
-    rec = Q * srh(n, p, m.n_i, sol.tau_n, sol.tau_p)[0] * m.svol * (phi_p - phi_n)
-    je = -Q * (np.sum((jn + jp) * (psi[m.fb] - psi[m.fa])) + np.sum((jnc + jpc) * (m.cpsi - psi[m.cflat])))
-
-    def grid(v):
-        out = np.zeros(m.n_cells)
-        out[m.sflat] = v
-        return out.reshape(m.shape)
-
-    return Heat(grid(joule), grid(rec), float(je))
+    phi_n, phi_p = (a.ravel() for a in sol.quasi_fermi())        # NaN outside the semiconductor
+    semi = f.semiconductor.ravel()
+    v_c = f.contact_voltage
+    face = -Q * (f.jn * (phi_n[f.b] - phi_n[f.a]) + f.jp * (phi_p[f.b] - phi_p[f.a]))
+    cface = -Q * (f.jnc * (v_c - phi_n[f.contact_cell]) + f.jpc * (v_c - phi_p[f.contact_cell]))
+    nc = psi.size
+    joule = (0.5 * (np.bincount(f.a, face, nc) + np.bincount(f.b, face, nc))
+             + np.bincount(f.contact_cell, cface, nc))
+    rec = np.zeros(nc)
+    rec[semi] = Q * sol.recombination().ravel()[semi] * f.area.ravel()[semi] * (phi_p - phi_n)[semi]
+    je = -Q * (np.sum((f.jn + f.jp) * (psi[f.b] - psi[f.a]))
+               + np.sum((f.jnc + f.jpc) * (f.contact_psi - psi[f.contact_cell])))
+    return Heat(joule.reshape(f.shape), rec.reshape(f.shape), float(je))
 
 
 def cell_overlap(src, dst) -> np.ndarray:
@@ -226,6 +228,124 @@ def steady_temperature(xs: CrossSection, win: Window, q, t_ambient: float = 300.
         raise ConvergenceError(f"thermal solve: residual {res.residual:.1e} after {res.iterations} iterations")
     rise = RegularGridInterpolator((xc, yc), res.T - t_ambient, bounds_error=False, fill_value=None)
     return Temperature(rise, res.T, xc, yc, res.iterations, res.residual)
+
+
+def _charge_cells(dev):
+    """The cell edges and centers (um) of a charge Device, the area of its semiconductor cells (um^2, 0 elsewhere)
+    and the centers of its semiconductor cells ((k, 2), um)."""
+    xe, ye = np.asarray(dev.x) * 1e6, np.asarray(dev.y) * 1e6
+    xc, yc = _centers(xe), _centers(ye)
+    semi_area = np.where(dev.semiconductor, np.outer(np.diff(xe), np.diff(ye)), 0.0)
+    semi_pts = np.stack([a[dev.semiconductor] for a in np.meshgrid(xc, yc, indexing="ij")], -1)
+    return xe, ye, xc, yc, semi_area, semi_pts
+
+
+def _mean_rise(dev, semi_area, rise_si) -> float:
+    """The area mean of the rise (K) at the centers of the semiconductor cells of dev."""
+    return float(np.sum(semi_area[dev.semiconductor] * rise_si) / np.sum(semi_area[dev.semiconductor]))
+
+
+def _heat_and_temperature(xs, thermal, sol, v, heat, xe, ye, t_ambient, top_h, side_temperature):
+    """The heat (Heat) of one solution at the bias v, its heat density on the thermal cells (W/m^3) and the steady
+    temperature (module docstring, steps 2 and 3)."""
+    hs = heat_source(sol)
+    if isinstance(heat, str) and heat == DRIFT_DIFFUSION:
+        q = to_thermal(hs.total, xe, ye, thermal)
+    else:
+        q = uniform_heat(xs, thermal, heat, sol.current * v)
+    return hs, q, steady_temperature(xs, thermal, q, t_ambient, top_h, side_temperature)
+
+
+@dataclass
+class ElectroThermal:
+    """The record of the electro-thermal loop (electrothermal), per bias."""
+    temperature: np.ndarray     # K: the converged device temperature (Device.T of the returned solution)
+    spread: np.ndarray          # K: max - min of the temperature rise over the Si cells of the charge window
+    iterations: np.ndarray      # the drift-diffusion solves at a device temperature (at least 1)
+    history: list               # per bias: (T of the device (K), I' (A/m), T from its heat (K), residual (K)) per
+    #                             step; step 0 is the 300 K solution of the sweep (the one-way result), step k the
+    #                             k-th solve (step 1 is the one-pass feedback); residual = T from the heat - T
+    tol: float                  # K: the stop rule |residual| <= tol
+    damping: float              # T_next = T + damping residual
+    seconds: float              # the time of the loop
+
+    @property
+    def residual(self) -> np.ndarray:
+        """K: the residual of the returned solution per bias (|residual| <= tol)."""
+        return np.array([h[-1][3] for h in self.history])
+
+
+def electrothermal(xs: CrossSection, thermal: Window, electrical: PinElectrical, heat=DRIFT_DIFFUSION,
+                   t_ambient: float = 300.0, top_h: float = 10.0, side_temperature: float | None = None,
+                   tol: float = 1e-4, damping: float = 1.0, max_iter: int = 30) -> PinElectrical:
+    """Two-way electro-thermal coupling: the drift-diffusion at a device temperature T that equals t_ambient plus the
+    mean temperature rise that the heat of its own current makes (a fixed point), at each bias of pin_electrical.
+
+    charge-gpu takes one temperature per device (Device.T: V_T, n_i(T), the mobility and the lifetimes; its
+    temperature.py), not a field. So T is the area mean of the steady temperature over the Si cells of the charge
+    window (the rise_semiconductor of pin_optical); the spread of the field over these cells is in the record.
+    The fixed-point iteration, from the 300 K solution of the sweep:
+        G(T) = t_ambient + the mean rise of the heat of the solution at T (heat and thermal model of pin_optical)
+        T_1 = G(300 K); then T_k+1 = T_k + damping (G(T_k) - T_k), until |G(T_k) - T_k| <= tol (K)
+    Each step solves the drift-diffusion at Device.T = T_k from the last solution (Newton; the options of the sweep).
+    Step 1 is the one-pass feedback of the bench (the device at 300 K plus the rise of the 300 K heat). The loop
+    converges when the gain dG/dT (the rise times the relative change of the current per K) is below 1; damping < 1
+    is for a gain near 1. Raises ConvergenceError after max_iter solves, or when a solve does not converge.
+
+    Returns a PinElectrical with the converged solutions (the same device, window, biases and 0 V reference at 300 K)
+    and .loop (ElectroThermal); pin_optical takes it as it is. heat, t_ambient, top_h and side_temperature must be
+    those of the pin_optical call (pin_phase_shifter passes them)."""
+    from charge_gpu import drift_diffusion as dd
+    from charge_gpu.temperature import T_REF
+
+    if not tol > 0:
+        raise ValueError("tol: a positive change of the device temperature (K)")
+    if not 0 < damping <= 1:
+        raise ValueError("damping: 0 < damping <= 1")
+    if int(max_iter) < 1:
+        raise ValueError("max_iter: at least 1")
+    if electrical.tau is None:
+        raise ValueError("electrical.tau is None: use the PinElectrical of pin_electrical")
+    if "mobility" in electrical.options:
+        raise ValueError("a user mobility is the value at one temperature: the loop needs the temperature model of "
+                         "charge-gpu (no mobility= in pin_electrical)")
+    dev = electrical.device
+    if dev.T != T_REF:
+        raise ValueError(f"the device of pin_electrical must be at {T_REF} K, not {dev.T} K")
+    t0 = time.perf_counter()
+    xe, ye, _, _, semi_area, semi_pts = _charge_cells(dev)
+
+    def g(sol, v):
+        rise = _heat_and_temperature(xs, thermal, sol, v, heat, xe, ye, t_ambient, top_h,
+                                     side_temperature)[2].rise(semi_pts)
+        return t_ambient + _mean_rise(dev, semi_area, rise), float(np.max(rise) - np.min(rise))
+
+    sols, temps, spreads, iters, history = [], [], [], [], []
+    for v, sol in zip(electrical.biases, electrical.solutions):
+        t_dev, s = float(dev.T), sol
+        t_new, spread = g(s, v)
+        rows = [(t_dev, s.current, t_new, t_new - t_dev)]
+        for _ in range(int(max_iter)):
+            t_dev = t_dev + damping * (t_new - t_dev)
+            s = dd.solve(dataclasses.replace(dev, T=t_dev), 0.0, float(v), guess=s, tau_n=electrical.tau,
+                         tau_p=electrical.tau, **electrical.options)
+            if not s.converged:
+                raise ConvergenceError(f"drift-diffusion at {v} V and {t_dev:.4f} K: not converged")
+            t_new, spread = g(s, v)
+            rows.append((t_dev, s.current, t_new, t_new - t_dev))
+            if abs(t_new - t_dev) <= tol:
+                break
+        else:
+            raise ConvergenceError(f"electro-thermal loop at {v} V: residual {t_new - t_dev:.2e} K after {max_iter} "
+                                   f"solves (tol {tol} K)")
+        sols.append(s)
+        temps.append(t_dev)
+        spreads.append(spread)
+        iters.append(len(rows) - 1)
+        history.append(rows)
+    loop = ElectroThermal(np.array(temps), np.array(spreads), np.array(iters), history, float(tol), float(damping),
+                          time.perf_counter() - t0)
+    return dataclasses.replace(electrical, solutions=sols, loop=loop)
 
 
 def carrier_index(sol, ref, xc, yc, wavelength: float, step: float, sub: int = 8, plasma=None):
@@ -344,10 +464,7 @@ def pin_optical(xs: CrossSection, optics: Window, thermal: Window, wavelength: f
                          "another wavelength")
     t0 = time.perf_counter()
     dev = electrical.device
-    xe, ye = np.asarray(dev.x) * 1e6, np.asarray(dev.y) * 1e6
-    xc, yc = _centers(xe), _centers(ye)
-    semi_area = np.where(dev.semiconductor, np.outer(np.diff(xe), np.diff(ye)), 0.0)
-    semi_pts = np.stack([a[dev.semiconductor] for a in np.meshgrid(xc, yc, indexing="ij")], -1)
+    xe, ye, xc, yc, semi_area, semi_pts = _charge_cells(dev)
     xt, yt = thermal.edges()
     cell_m2 = np.outer(np.diff(xt), np.diff(yt)) * 1e-12
     core = None
@@ -371,19 +488,13 @@ def pin_optical(xs: CrossSection, optics: Window, thermal: Window, wavelength: f
     rows = {k: [] for k in ("heat", "joule", "rec", "je", "rise_s", "rise_c", "dc", "dt", "db", "fc", "ft")}
     temps = []
     for v, sol in zip(electrical.biases, electrical.solutions):
-        hs = heat_source(sol)
-        if isinstance(heat, str) and heat == DRIFT_DIFFUSION:
-            q = to_thermal(hs.total, xe, ye, thermal)
-        else:
-            q = uniform_heat(xs, thermal, heat, sol.current * v)
-        th = steady_temperature(xs, thermal, q, t_ambient, top_h, side_temperature)
+        hs, q, th = _heat_and_temperature(xs, thermal, sol, v, heat, xe, ye, t_ambient, top_h, side_temperature)
         temps.append(th)
         rows["heat"].append(float(np.sum(q * cell_m2)))
         rows["joule"].append(float(hs.joule.sum()))
         rows["rec"].append(float(hs.recombination.sum()))
         rows["je"].append(hs.je)
-        rows["rise_s"].append(float(np.sum(semi_area[dev.semiconductor] * th.rise(semi_pts))
-                                    / np.sum(semi_area[dev.semiconductor])))
+        rows["rise_s"].append(_mean_rise(dev, semi_area, th.rise(semi_pts)))
         if core is not None:
             rows["rise_c"].append(float(np.sum(cell_m2 * core * (th.T - t_ambient)) / np.sum(cell_m2 * core)))
 
@@ -409,8 +520,16 @@ def pin_optical(xs: CrossSection, optics: Window, thermal: Window, wavelength: f
 def pin_phase_shifter(xs: CrossSection, optics: Window, charge: Window, thermal: Window, wavelength: float, biases,
                       tau: float = 1e-9, heat=DRIFT_DIFFUSION, plasma=None, sub: int = 8, core_tag: str | None = None,
                       t_ambient: float = 300.0, top_h: float = 10.0, solver=None,
-                      side_temperature: float | None = None, **kw) -> PinPhaseShifter:
-    """pin_electrical, then pin_optical (module docstring). kw goes to charge_gpu.drift_diffusion.sweep."""
+                      side_temperature: float | None = None, coupling: str = "one-way", loop_tol: float = 1e-4,
+                      loop_damping: float = 1.0, loop_max_iter: int = 30, **kw) -> PinPhaseShifter:
+    """pin_electrical, then pin_optical (module docstring). kw goes to charge_gpu.drift_diffusion.sweep.
+    coupling: "one-way" (the default: the carriers at 300 K) or "two-way" (electrothermal between the two, with
+    tol=loop_tol (K), damping=loop_damping and max_iter=loop_max_iter; the record in result.electrical.loop)."""
+    if coupling not in ("one-way", "two-way"):
+        raise ValueError(f"coupling must be 'one-way' or 'two-way', not {coupling!r}")
     el = pin_electrical(xs, charge, biases, tau, **kw)
+    if coupling == "two-way":
+        el = electrothermal(xs, thermal, el, heat, t_ambient, top_h, side_temperature, loop_tol, loop_damping,
+                            loop_max_iter)
     return pin_optical(xs, optics, thermal, wavelength, el, heat, plasma, sub, core_tag, t_ambient, top_h, solver,
                        side_temperature)

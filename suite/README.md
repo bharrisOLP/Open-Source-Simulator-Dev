@@ -316,6 +316,10 @@ r.dneff_carrier, r.dneff_thermal, r.dneff     # complex changes of the mode inde
 r.current, r.power                            # I' (A/m) and I' V (W/m)
 r.phase_per_length, r.l_pi, r.p_pi, r.i_pi    # rad/m, m, W, A (from the net change)
 r.loss_db_per_cm, r.crossover()               # the loss that the current adds; the bias where the parts cancel
+# coupling="two-way": the carriers at the device temperature that their own heat makes (step 6)
+t = pin_phase_shifter(xs, optics, charge, Window(-5, 5, -5, 2.3, 0.05), 1.55, biases=[0.9, 1.0, 1.1, 1.2],
+                      tau=1e-9, core_tag="core", coupling="two-way")
+t.electrical.loop.temperature, t.electrical.loop.iterations, t.electrical.loop.history   # K, solves, per step
 ```
 
 1. Carriers (charge-gpu): the cross-section on the charge window (`physics.charge_device`: the cell centers, an
@@ -351,6 +355,22 @@ r.loss_db_per_cm, r.crossover()               # the loss that the current adds; 
    estimates of both parts (the weights of `switching.index_weights` times the complex dn), the Joule and
    recombination parts of the heat, the sum of J . E, and the mean temperature rise of the core and of the Si of
    the charge window.
+6. Coupling (`coupling`). "one-way" (the default): the carriers are solved at 300 K, so the heat does not change
+   the currents. This path is the code of 0753ed0, with the heat from the public face currents of charge-gpu in
+   place of its private fields (the same heat, bit for bit: test). "two-way" (`pin.electrothermal`): a fixed-point
+   loop on the device temperature T. charge-gpu takes one temperature per device (`Device.T`: V_T, n_i(T), the
+   mobility and the SRH lifetimes; `charge_gpu/README.md`, "Temperature"), not a field, so T is the area mean of
+   the steady temperature over the Si cells of the charge window:
+   - G(T) = 300 K + the mean rise of the heat of the drift-diffusion solution at T (the heat and the thermal model
+     of steps 2 and 3);
+   - T_1 = G(300 K) (step 1 is the one-pass feedback of `--device-temperature`), then
+     T_k+1 = T_k + damping (G(T_k) - T_k) (default damping 1: no damping), each step a Newton solve at
+     `Device.T` = T_k from the last solution;
+   - stop when |G(T_k) - T_k| <= `loop_tol` (default 1e-4 K); ConvergenceError after `loop_max_iter` (30) solves.
+
+   The returned solutions are those at the converged T; steps 2 to 5 use them as they are. The carrier change is
+   from the carriers at 0 V and 300 K (the unbiased device). The loop converges when the gain dG/dT (the rise
+   times the relative change of the current per K) is below 1; here it is 0.001 to 0.107 (below).
 
 Results: the rows of `benchmarks/2026-11-08/suite-pin.jsonl` (the commands below; RX 7900 XT, shared computer).
 `pin_rib`, the windows of the snippet, the fundamental mode at 1.55 um (neff = 2.58936 at 0 V), dneff from 0 V.
@@ -419,14 +439,23 @@ bounds are larger):
 | both changes in one solve | the sum of the two parts | the cross term is 2.4e-5 to 6.3e-4 of \|dneff_carrier\| |
 | dn/dT = 0 (all materials), 1.1 V | no heat: dneff_thermal = 0, dneff = dneff_carrier | 6.0e-14 or less; 4.6e-12 or less; the carrier part of the four-bias run to 7.8e-12 or less (three runs) |
 | no plasma dispersion (`plasma` gives 0), 1.1 V | no carriers: dneff_carrier = 0, dneff = dneff_thermal | 3.0e-13 or less; 4.7e-11 or less; the thermal part of the four-bias run to 1.6e-11 or less (three runs) |
+| the heat of `heat_source` from the public face currents, 0.9 to 1.2 V, at 300 K and at the loop temperatures | the heat of 0753ed0 (the private `_fluxes` and mesh fields of charge-gpu; its code is in the test) | the same arrays and the same J . E, bit for bit |
+| the two-way loop with the temperature rise forced to 0 (the steady temperature gives 300 K everywhere), 0.9 to 1.2 V | the 300 K (one-way) result | one solve per bias at 300 K; I' 4.0e-14, n and p 4.0e-15, psi 9.5e-15 V; dneff_carrier at 1.1 V 2.8e-12 |
+| the two-way loop, 0.9 to 1.2 V: G(T) - T per step | convergence | 0.9 V: 8.0e-1, 1.5e-2, 2.7e-4, 5.1e-6 K (3 solves); 1.0 V: 3.6, 1.6e-1, 7.4e-3, 3.3e-4, 1.5e-5 K (4); 1.1 V: to 1.0e-5 K (5); 1.2 V: 22, 1.4, 8.5e-2, 5.1e-3, 3.0e-4, 1.8e-5 K (5) (test: the ratio of two steps below 0.2) |
+| its first step (the device at 300 K plus the rise of the 300 K heat) | the one-pass feedback of the logged bench (`I_hot_rel` of `suite-pin.jsonl`, 0.9 to 1.2 V) | within the test bound 1e-8 (not printed) |
+| the converged state | its own heat (the mean rise of the Si that `pin_optical` finds again); the heat integral against I' V; `Device.T` of the solution (V_T) | within 1e-4 K (the stop rule); within 1e-9 (test bound, not printed; the identity of the checks above); V_T of T exactly |
+| the fixed point at 1.2 V | `scipy.optimize.brentq` on G(T) - T, with G from fresh solves at T (from the 300 K solution) and the mean of `charge_gpu.temperature.mean_temperature` | 323.62433 K against 323.62431 K: 1.9e-5 K (brentq: 6 solves; the loop: 5) |
+| damping 0.5 at 0.9 V | the loop without damping | 300.81087 K against 300.81093 K: 5.9e-5 K (the stop rule: the last residual 6.3e-5 K); 14 solves against 3 |
 
 Also tested: the errors for biases that are not positive and increasing, for a charge window without a p and an n
 contact, for a wavelength other than 1.55 um with the default plasma dispersion, for a heat source outside the
 thermal window, for a heat tag that no shape has, for a slab shorter than the contacts, and for a thermal solve
 that does not converge (ConvergenceError); `crossover()` at an exact zero on a bias and without a zero (synthetic
 values); the thermal options of `pin_rib` do not change the charge Device; the mode is the largest index of a
-4-mode solve (2.589362; the next is 2.199027). Time of a run of the 15 tests: 32.7 s (the drift-diffusion sweep to
-1.2 V on the CPU of the GPU computer: about 19 s).
+4-mode solve (2.589362; the next is 2.199027); the loop: ConvergenceError when one solve is the limit (1.2 V),
+ValueError for tol <= 0, a damping outside (0, 1], max_iter < 1, a PinElectrical without the lifetime, a user
+mobility (a value at one temperature), and an unknown `coupling`. Time of a run of the 21 tests: 53.5 s (the
+drift-diffusion sweep to 1.2 V on the CPU of the GPU computer: about 19 s; peak RSS 1.95 GiB).
 
 The bench `bench/pin_self_heating.py` writes one JSON row per bias (also the Joule and recombination parts, the
 first-order values and the rise of the Si) and one row per run with the cross-over. Its options: `--tau`
@@ -435,9 +464,10 @@ shapes with these tags, in place of the heat density), `--device-temperature` (t
 rise of the Si: the size of the feedback that the workflow leaves out), and the thermal environment:
 `--thermal-half-width W` (the thermal window and the substrate +-W um wide; default 5), `--substrate-depth D` (the
 substrate D um deep; default 3) and `--heat-sink` (a crude heat path to the contacts: the p+ and n+ slab continues
-to the window sides, and both window sides are at 300 K over their whole height; the carriers do not change). The
-rows of `benchmarks/2026-11-08/suite-pin.jsonl` come from these commands, in this order (from the repository
-folder on the GPU computer):
+to the window sides, and both window sides are at 300 K over their whole height; the carriers do not change), and
+`--two-way` (the loop of step 6, with `--loop-tol` and `--damping`; the rows also give the loop record and the
+one-way values of the same run). The rows of `benchmarks/2026-11-08/suite-pin.jsonl` come from these commands, in
+this order (from the repository folder on the GPU computer):
 
 ```bash
 B="python bench/pin_self_heating.py"
@@ -455,6 +485,13 @@ for a in "--thermal-half-width 20" "--thermal-half-width 20 --substrate-depth 18
          "--heat-sink --biases 0.8 0.85 0.9 0.95 1.0 1.05 1.1 1.15 1.2 1.25 1.3" \
          "--heat-sink --tau 1e-8 --biases 0.8 0.85 0.9 0.95 1.0 1.05 1.1 1.15 1.2 1.25 1.3"; do
   bash tools/gpu_run.sh suite $B $a; done
+```
+
+The rows of `benchmarks/2026-11-08/suite-pin-3.jsonl` (the two-way coupling) come from this command:
+
+```bash
+bash tools/gpu_run.sh suite python bench/pin_self_heating.py --two-way --tau 1e-9 1e-8 \
+  --biases 0.8 0.85 0.9 0.95 1.0 1.05 1.1 1.15 1.2 1.25 1.3
 ```
 
 Each run takes 24.7 to 34.7 s (the drift-diffusion sweep 19.5 to 20.9 s on the CPU; the thermal and mode part
@@ -500,12 +537,63 @@ Grids, heat models and thermal environments (lifetimes 1 ns; the two files):
 - Feedback of the device temperature (`--device-temperature`: one more drift-diffusion solve at 300 K plus the
   mean rise of the Si, from the 300 K solution; all converged): the current at the same bias rises by 0.36 %,
   1.86 %, 4.52 % and 6.69 % at 0.8, 0.9, 1.0 and 1.15 V (300.1, 300.8, 303.6 and 315.5 K), at 1 ns; at 10 ns by
-  up to 10.66 % (1.15 V, 322.5 K), and by 5.94 % at 1.3 V (362.9 K).
+  up to 10.66 % (1.15 V, 322.5 K), and by 5.94 % at 1.3 V (362.9 K). The two-way loop (below) gives the
+  self-consistent values; its first step is this one pass.
+
+Two-way coupling (`coupling="two-way"`, step 6; the rows of `benchmarks/2026-11-08/suite-pin-3.jsonl`, command
+above; each row has the one-way values of the same run). Lifetimes 1 ns, the default grids and thermal model:
+
+| V | T (K) | solves | I' one-way (A/m) | I' two-way: change | one pass (step 1) | core rise (K) | dneff_carrier | dneff_thermal | dneff (both) | L_pi (mm) | P_pi (mW) |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| 0.80 | 300.1105 | 2 | 0.5910 | +0.361 % | +0.360 % | 0.1143 | -1.9711e-4 | 2.1497e-5 | -1.7562e-4 | 4.41 | 2.09 |
+| 0.90 | 300.8109 | 3 | 3.828 | +1.898 % | +1.862 % | 0.829 | -7.3071e-4 | 1.5600e-4 | -5.7472e-4 | 1.35 | 4.73 |
+| 1.00 | 303.8151 | 4 | 15.92 | +4.730 % | +4.516 % | 3.85 | -1.6389e-3 | 7.2426e-4 | -9.1486e-4 | 0.847 | 14.12 |
+| 1.05 | 306.8010 | 4 | 26.80 | +5.981 % | +5.645 % | 6.83 | -2.1252e-3 | 1.2854e-3 | -8.4017e-4 | 0.922 | 27.5 |
+| 1.10 | 311.0272 | 5 | 41.23 | +6.844 % | +6.411 % | 11.03 | -2.6057e-3 | 2.0778e-3 | -5.2873e-4 | 1.47 | 71.0 |
+| 1.15 | 316.6172 | 5 | 59.36 | +7.153 % | +6.689 % | 16.59 | -3.0708e-3 | 3.1244e-3 | +5.2101e-5 | 14.9 | 1088 |
+| 1.20 | 323.6243 | 5 | 81.23 | +6.789 % | +6.381 % | 23.55 | -3.5132e-3 | 4.4355e-3 | +9.1995e-4 | 0.842 | 87.7 |
+| 1.25 | 332.0251 | 5 | 106.9 | +5.693 % | +5.417 % | 31.88 | -3.9267e-3 | 6.0070e-3 | +2.0768e-3 | 0.373 | 52.7 |
+| 1.30 | 341.7252 | 4 | 136.3 | +3.870 % | +3.754 % | 41.51 | -4.3071e-3 | 7.8217e-3 | +3.5096e-3 | 0.221 | 40.6 |
+
+(T: the converged device temperature, 300 K plus the mean rise of the Si; solves: the drift-diffusion solves of
+the loop; the one-way values of 0.8 to 1.2 V are those of the first table; one-way at 1.25 and 1.3 V: net dneff
++1.7221e-3 and +3.1065e-3, core rise 30.16 and 39.93 K.)
+
+- Convergence: 2 to 5 solves to |G(T) - T| <= 1e-4 K (the last residual 1.4e-6 to 6.4e-5 K). The ratio of two
+  successive residuals (the gain dG/dT) is 0.0036 at 0.8 V, 0.045 at 1.0 V, 0.060 to 0.067 from 1.1 to 1.2 V and
+  0.030 to 0.038 at 1.3 V, so no damping is necessary. The loop takes 19.0 s for the 11 biases (42 solves) on the
+  CPU of the GPU computer.
+- The converged current is 0.361 % (0.8 V) to 7.153 % (1.15 V) above the one-way current; the one pass gives
+  0.360 % to 6.689 %, so it misses up to 0.46 percentage points (1.15 V).
+- The two parts grow by different amounts: at 1.0 V the carrier change by 1.93 %, the thermal change by 4.66 %, so
+  the net change stays within 0.13 % of the one-way value (L_pi 0.847 mm against 0.846 mm), and P_pi rises by
+  4.9 % (the current rises by 4.7 %). The thermal part grows more than the carrier part at every bias (dneff_thermal /
+  |dneff_carrier| 0.442 against 0.430 at 1.0 V, 1.263 against 1.189 at 1.2 V), so the net change near the
+  cross-over changes much: at 1.15 V it has the other sign (+5.2e-5 against -1.1e-4).
+- The cross-over moves 11.8 mV lower: 1.1455 V, 61.85 A/m, 70.85 W/m (between 1.1 and 1.15 V) against 1.1573 V,
+  62.54 A/m, 72.38 W/m one-way: a shift of the same size as that of the wider thermal windows above (9.5 to 13 mV
+  higher), in the other direction.
+- Lifetimes 10 ns (the same command; `tau_s` 1e-8): 1 to 6 solves (the last residual 1.6e-6 to 9.1e-5 K); the
+  gain is 0.0010 at 0.8 V and 0.075 to 0.107 from 1.05 to 1.25 V. The converged current is 0.096 % (0.8 V) to
+  11.892 % (1.15 V) above the one-way current, against 0.096 % to 10.663 % of the one pass (up to 1.23 percentage
+  points less, at 1.15 V). T is 325.21 K at 1.15 V and 366.89 K at 1.3 V. Below the cross-over the shortest L_pi is
+  0.366 mm at 1.05 V (P_pi 14.37 mW; one-way 0.362 mm, 12.98 mW). The cross-over moves 20.6 mV lower: 1.1854 V,
+  125.4 A/m, 148.7 W/m (between 1.15 and 1.2 V) against 1.2060 V, 128.3 A/m, 154.7 W/m one-way; at 1.2 V the net
+  change has the other sign (+3.9229e-4 against -1.9330e-4). At 1.3 V: net dneff +4.4708e-3 (one-way
+  +3.5577e-3), L_pi 0.173 mm, P_pi 51.4 mW, a core rise of 66.10 K (62.10 K one-way). The loop takes 20.9 s
+  (47 solves); each lifetime of the command takes 49.9 to 51.4 s (the 300 K sweep about 20 s), peak RSS
+  1.91 and 2.00 GiB.
+- The rise is not uniform over the Si of the charge window: max - min is 0.013 K at 0.8 V and 4.54 K at 1.3 V
+  (1 ns), 7.36 K at 1.3 V (10 ns), 8 % to 13 % of the mean rise at every bias of both lifetimes. The loop gives
+  all the Si the mean temperature.
 
 Limits:
-- One-way coupling: the carriers are solved at 300 K, so the heat does not change the currents. The rows above
-  show the size of the missing feedback (one pass: up to 6.7 % more current at 1 ns, 10.7 % at 10 ns). So the bias
-  scale of the tables is that of a device at 300 K.
+- Coupling: by default one-way (the carriers at 300 K; the bias scale of the first tables is that of a device at
+  300 K). The two-way loop gives the device one temperature, the mean of the Si: charge-gpu has no temperature
+  field (a field needs the thermoelectric terms of the current equations), and the field varies by 8 % to 13 % of
+  the mean rise over the Si (above). The temperature models of charge-gpu (n_i of Misiakos and Tsamakis above
+  340 K is an extrapolation; the mobility of Arora et al.; tau ~ T^-1/2 is an assumption: `charge_gpu/README.md`)
+  set the size of the feedback; the plasma dispersion keeps the 300 K coefficients of Soref and Bennett.
 - The heat source has no thermoelectric terms: the full model releases about E_g per recombination and has
   Peltier heat at the junctions and the contacts (Wachutka 1990). The total stays I' V; only its distribution
   changes. Its effect on dneff_thermal is not measured; the uniform heat models above change dneff_thermal by
@@ -524,10 +612,8 @@ Limits:
   environment (the contacts, the metal, the substrate). The 50 nm
   thermal cells sample the 90 nm slab as 100 nm and the 220 nm rib as 200 nm (the heat stays in its place: the
   overlap); the grid rows above give the effect.
-- `heat_source` reads the private helper `charge_gpu.drift_diffusion._fluxes` and the private fields of its mesh
-  (the face and contact indices, the contact node potentials, the cell areas): a refactor of charge-gpu can change
-  them. The tests of the heat sum and of the recombination heat per cell find a change of the flux or the index
-  convention. A public accessor of the face currents is a later change of charge-gpu.
+- `heat_source` uses the public `DDSolution.face_currents()` of charge-gpu (the face currents of the solve, the
+  face and contact indices, the contact node potentials, the cell areas), `quasi_fermi()` and `recombination()`.
 - The plasma dispersion of Soref and Bennett at 1.55 um only (`plasma=` for other coefficients), a constant
   base index, and the 20 nm mode grid of the default (2.2 % in dneff_carrier against 10 nm, above).
 - The fundamental mode only. The workflow asks meow-gpu for one mode at its default target (just above the
