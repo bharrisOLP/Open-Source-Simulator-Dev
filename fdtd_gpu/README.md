@@ -28,10 +28,15 @@ P = sim.get_fluxes(flux)
 Supported:
 - **Cell:** `cell_size` (a size of 0 makes the cell 2-D or 1-D), `resolution` (pixels per um), centered at the
   origin.
-- **Materials:** `Medium(epsilon=...)` or `Medium(index=...)`: lossless, non-dispersive, isotropic.
+- **Materials:** `Medium(epsilon=...)` or `Medium(index=...)`, isotropic, with optional dispersion or loss in the
+  names and units of the MIT package (see "Differences"): `E_susceptibilities=[LorentzianSusceptibility(frequency,
+  gamma, sigma), DrudeSusceptibility(frequency, gamma, sigma), ...]` (then `epsilon` is eps_inf), or
+  `D_conductivity=sigma_D` (eps(f) = eps_inf (1 + i sigma_D / (2 pi f))). `Medium.permittivity(f)` gives the
+  complex eps(f) (the MIT package has `epsilon(f)`; here `epsilon` stays the float eps_inf).
 - **Geometry:** `Block` (axis-aligned), `Cylinder` and `Prism` along x, y or z, `Sphere`. Later objects replace
   earlier ones. `eps_averaging=True` (the default, as in the MIT package): subpixel averaging of the permittivity at
-  each Yee E component (see "Differences"); `eps_averaging=False`: the staircase.
+  each Yee E component (see "Differences"; next to a dispersive or conductive material: the face rule "fill");
+  `eps_averaging=False`: the staircase.
 - **Boundaries:** `PML(thickness, direction, side)` inside the cell. Other faces are metal (PEC), or periodic with
   `k_point=Vector3()` (the objects repeat across periodic faces; a PML on both sides or none).
 - **Sources:** `Source(GaussianSource or ContinuousSource, component, center, size, amplitude)`: a point, line or
@@ -49,7 +54,10 @@ Supported:
   `Harminv(c, pt, fcen, df)` with `after_sources`.
 
 Not supported (the option raises NotImplementedError, or the name is not in the package): `geometry_center`,
-`symmetries`, non-uniform grids; dispersion, conductivity, anisotropy, nonlinearity; rotated blocks (`e1`, `e2`,
+`symmetries`, non-uniform grids; anisotropy (`epsilon_diag`, `sigma_diag` with different values, `sigma_offdiag`),
+gain (negative `sigma` or `D_conductivity`), `D_conductivity` together with `E_susceptibilities`, other
+susceptibility types (noisy, gyrotropic), `mu`, `H_susceptibilities`, `B_conductivity`, nonlinearity; mode sources,
+mode monitors and near2far surfaces whose cells hold a dispersive or conductive material; rotated blocks (`e1`, `e2`,
 `e3`), tilted axes, sloped prism sidewalls, `MaterialGrid`; Bloch phases (`k_point` other than 0); complex
 amplitudes, `amp_func`, custom source times, `eig_match_freq=False`; field arrays (`get_array`), force, energy and
 LDOS monitors; `add_near2far(..., nperiods)` (the sum over periodic copies), `output_farfields`, `save_near2far` and
@@ -113,6 +121,66 @@ sources or mode monitors.
   0.02 to 0.7 s. Small problems are sampled with NumPy, larger ones on the GPU. `get_epsilon` returns
   3 / (1/eps_xx + 1/eps_yy + 1/eps_zz) of each cell (each component at its own Yee point). `setup_seconds` (NaN
   before) and `n_averaged` (the number of sampled voxels) are set by `get_epsilon()` and `run()`.
+- **Dispersion and conductivity** (`fdtd_gpu/_dispersion.py`; checks 10 to 12). fdtdx 0.6.3 has Lorentz and Drude
+  poles (`fdtdx.dispersion`) with an auxiliary-differential-equation (ADE) update in its E update: per pole,
+  P^(n+1) = c1 P^n + c2 P^(n-1) + c3 E^n (central differences at the step n), then eps_inf E + sum P changes by
+  dt curl H. Mapping (time dependence exp(-i omega t), omega = 2 pi f, c = 1):
+  - `LorentzianSusceptibility(frequency=f_n, gamma, sigma)`: chi = sigma f_n^2 / (f_n^2 - f^2 - i f gamma), fdtdx
+    `LorentzPole(resonance_frequency=2 pi f_n, damping=2 pi gamma, delta_epsilon=sigma)` (rad/s);
+    `DrudeSusceptibility`: chi = -sigma f_n^2 / (f^2 + i f gamma), fdtdx `DrudePole(plasma_frequency=2 pi f_n
+    sqrt(sigma), damping=2 pi gamma)`. These are the forms of the MIT package (its documentation, "Materials").
+  - `D_conductivity=sigma_D`: the electric conductivity sigma = eps_0 eps_inf sigma_D (S/m; in a face cell times the
+    fill fraction with the face rule "fill", eps of the component with the other rules), so the fields in the
+    medium decay as exp(-sigma_D t), as in the MIT package. fdtdx updates it semi-implicitly (factor (1 - b) /
+    (1 + b) per step, b = sigma_D dt / 2). The MIT package multiplies the whole eps(f) by (1 + i sigma_D / omega);
+    fdtdx adds i sigma / omega, which is the same only without susceptibilities, so the two together raise
+    NotImplementedError.
+  - The discrete scheme has the susceptibility chi_yee = K dt^2 / (w0^2 dt^2 - 4 sin^2(omega dt / 2) - i g dt
+    sin(omega dt)) (K = sigma w_n^2, w0 = w_n for Lorentz and 0 for Drude, g = 2 pi gamma): second order in dt
+    (`tests/references.py`, `chi_yee`; equal to the recurrence with the coefficients of fdtdx to 1e-9 in
+    `test_ade_coefficients_give_the_discrete_chi`).
+  - This package gives fdtdx only eps_inf (so fdtdx allocates no ADE arrays) and sets the ADE arrays and the
+    conductivity itself after fdtdx placed the objects. With `eps_averaging=False` each cell gets the poles and the
+    conductivity of the material of its center (a staircase). With `eps_averaging=True` the face rule
+    `fdtd_gpu._dispersion.FACE_RULE` sets them for each E component (bench option `--face-rule`):
+    - "fill" (the default): eps_inf is averaged as for any material, the pole strength K of the dispersive material
+      is multiplied by its fill fraction in the voxel of the component (c3 times the fraction; c1 and c2 stay), and
+      the conductivity by the fill fraction of each conductive material. The fill fractions come from the lattice
+      points of the average (`_averaging.averaged_permittivity(track=...)`). For E parallel to a face this is the
+      arithmetic mean of the whole eps(f), the exact average for a plane normal to an axis: on the exact Yee grid the
+      error falls at second order (check 11, a face inside a cell; the FDTD follows it to res 200, above that the
+      float32 ADE coefficients limit it). For E normal to a face the exact average is the harmonic mean of eps(f),
+      which no pole of this form gives: there the rule is first order. In a voxel with two dispersive materials only
+      the one with the larger fill fraction keeps its poles (scaled); the other one is dropped (first order there).
+      The ADE arrays then have one set of c1, c2, c3 per component (3 times the memory of one set per cell).
+    - "average": the rule of the MIT package (its documentation, "Subpixel Smoothing": only the non-dispersive part
+      is averaged, so such interfaces converge at first order): eps_inf averaged, the poles and the conductivity of
+      the cell center.
+    - "staircase": the cells within one cell (the 3 x 3 x 3 neighborhood) of a dispersive or conductive cell take
+      the staircase eps_inf too (`_dispersion.staircase_at_lossy`).
+    With faces on cell faces the three rules give the same arrays. Check 11 compares them with a face inside a cell.
+    A dispersive feature that holds no cell center is not sampled, so it is not seen. The ADE coefficients are float32
+    (`_dispersion.float32_coefficients`): c2 is rounded so that c1 + c2 keeps its value to 6e-8, because 1 - c1 - c2
+    = w0^2 dt^2 / D sets the resonance (a relative error of w0^2 of up to 6e-8 / (w0 dt)^2: 7.4e-4 for f_n = 1 / um
+    at res 400), and a Drude pole keeps c1 + c2 = 1 exactly (a float32 sum above 1 makes a constant polarization grow
+    by (c1 + c2 - 1) / (g dt) per step). The sources took 1 / eps_inf at that time, so a current source adds J to
+    dD/dt = curl H - J, as in the MIT package (fdtdx alone scales a dipole in a dispersive cell by
+    1 / Re eps(f_source)). In a conductive cell fdtdx adds the source current after the division by (1 + b): a
+    current source inside a conductive medium is 1 + b times the current of the semi-implicit form (b = 0.007 at
+    res 20 for sigma_D = 0.5; not corrected; read from `fdtdx.fdtd.update.update_E`, not measured).
+  - **Stability.** fdtdx runs at 0.99 of the 3-D Courant limit, and the ADE with E^n is explicit. For lossless
+    poles the grid is stable only if sum_p v_p / (1 - u_p) < eps - s, with u_p = (w0_p dt / 2)^2,
+    v_p = K_p dt^2 / 4, s = dims (c dt / dx)^2 = 0.327, 0.653, 0.980 in 1-D, 2-D, 3-D (`_dispersion.stability_margin`;
+    derived from the dispersion relation of the grid for a uniform medium; damping is not in the bound). `run()`
+    checks each E component of each cell with its own values: K times the weight of the face rule and the eps of the
+    component (`_dispersion.check_stability`; a face cell has a smaller K, but it can also have a smaller averaged
+    eps). For one Drude pole with the plasma frequency f_p = f_n sqrt(sigma) this is res > 1.80 f_p / sqrt(eps - s)
+    (res in 1/um): with eps_inf = 1, res > 12.7 f_p in 3-D (76 / um for f_p = 6 / um), 3.05 f_p in 2-D, 2.19 f_p
+    in 1-D. `run()` raises ValueError when a material breaks the bound (with an estimate of the factor of resolution
+    that is needed). `test_stability_bound` brackets the bound to 5 % (1-D, lossless Drude: bounded at 0.8 and 0.95
+    of the limit, growth without bound at 1.05 and 1.2).
+    The MIT package uses Courant 0.5 by default, so it has more margin; `Courant` is still ignored here.
+  - Not tested: dispersive or conductive materials inside a PML; Q of a dispersive resonator.
 - **float32 fields**, and the time step of fdtdx: dt = 0.99 dx / (c sqrt 3) in all dimensions (`Courant` is
   ignored).
 - **One-way mode sources.** `EigenModeSource` is the fdtdx TFSF mode source: the mode is solved at the center
@@ -406,10 +474,93 @@ the digits shown. "res" is the resolution in cells per um; times are the FDTD lo
      points the transform of B - A below 1e-2 and that of B above 0.9 of max abs(field of S2). A Near2FarRegion
      whose normal is an axis of size 0 (for example direction=Z in an x-y cell) raises ValueError (test).
 
-Tests: 38 (21 without FDTD runs: geometry, Prism center, 2-D parities, Harminv, the averaged permittivity against
+Checks 10 to 12 (`tests/test_dispersion.py`; the cases `film` and `uniform`) use synthetic media with round numbers
+in the textbook forms of the Lorentz and Drude models (Jackson, Classical Electrodynamics, 3rd ed., Sec. 7.5),
+written as (kind, f_n, gamma, sigma) in the units of the MIT package. Two references: the exact eps(f) (the
+transfer matrix, the roots of eps = 0, sigma_D) and the exact discrete scheme (`references.chi_yee`, the exact 1-D
+Yee grid `references.yee_rt`, the root of eps_inf + chi_yee = 0); the second leaves only the float32 arithmetic and
+the end of the DFT. The numbers are from the rows of `benchmarks/2026-11-08/fdtd-gpu-dispersion.jsonl` (the
+commands from `--case film --kind drude` on, under "Tests and bench").
+
+10. **Dispersive film: Drude** (eps_inf 1, f_n 1 / um, gamma 0.05 / um, sigma 1: the plasma edge at 1 / um; 0.3 um
+    thick, faces on cell faces, in vacuum, normal incidence; 41 frequencies from 0.6 to 1.4 / um; `--case film
+    --kind drude`). R and T as in check 1. The source has fwidth 1.6 / um, so its amplitude at the band edges is
+    0.29 of its peak. R falls from 0.738 at 0.6 / um to 0.102; the absorption is at most 0.113. Max abs error of R
+    and T over the band, against: the transfer matrix (FDTD); the exact Yee grid with float64 and with float32 ADE
+    coefficients (FDTD); and, without FDTD, the exact Yee grid against the transfer matrix ("grid only"):
+
+    | res | transfer matrix | Yee grid, float64 | Yee grid, float32 | grid only | FDTD loops |
+    |---|---|---|---|---|---|
+    | 100 | 4.25e-4 | 6.3e-6 | 4.7e-6 | 4.25e-4 | 2.1 s |
+    | 200 | 1.06e-4 | 1.4e-5 | 1.3e-5 | 1.06e-4 | 3.0 s |
+    | 400 | 3.28e-5 | 1.06e-5 | 1.19e-5 | 2.65e-5 | 5.1 s |
+
+    The error against the transfer matrix falls at second order (orders 2.00 and 1.70; the grid alone 2.00 and
+    2.00), and the FDTD agrees with the exact Yee grid to 1.4e-5. With a narrower source (fwidth 0.8 / um: the
+    amplitude at the band edges is 7e-3 of the peak) earlier runs, not in this file, had larger errors at the band
+    edges; the wider source removes them. The mechanism of that error was not identified.
+11. **Dispersive film: Lorentz slab** (eps_inf 2.25, f_n 1 / um, gamma 0.05 / um, sigma 0.5; `--case film --kind
+    lorentz`; the same band and source): absorption up to 0.813 (at 1.12 / um), T down to 1.2e-6, R up to 0.461.
+    Thickness 0.5 um (faces on cell faces), the same columns as check 10:
+
+    | res | transfer matrix | Yee grid, float64 | Yee grid, float32 | grid only | FDTD loops |
+    |---|---|---|---|---|---|
+    | 100 | 1.71e-3 | 3.7e-5 | 1.9e-5 | 1.68e-3 | 2.3 s |
+    | 200 | 5.25e-4 | 1.68e-4 | 2.6e-5 | 4.19e-4 | 3.5 s |
+    | 400 | 3.61e-4 | 3.12e-4 | 3.4e-5 | 1.05e-4 | 6.0 s |
+
+    The grid alone converges at second order (2.00 and 2.00). The FDTD error against the transfer matrix falls at
+    the order 1.71 from res 100 to 200 and only by 1.46 times from 200 to 400: there the float32 ADE coefficients
+    limit it. They move the resonance (see "Differences"): the FDTD stays within 3.4e-5 of the Yee grid with the
+    float32 coefficients, but moves to 3.1e-4 from the grid with float64 coefficients at res 400. The staircase run
+    (`--no-avg`, res 100) gives 1.71e-3, 3.5e-5 and 1.6e-5: with the faces on cell faces the arrays are the same.
+
+    Thickness 0.504 um (`--thickness 0.504 --face-rule fill,average,staircase`): the first face is on a cell face,
+    the second face fills 0.400, 0.800 and 0.600 of its cell at res 100, 200 and 400. Each entry: the FDTD against
+    the transfer matrix / the grid only (the exact Yee grid of the rule against the transfer matrix, no FDTD); in
+    every row the FDTD agrees with the Yee grid of its rule (float32 coefficients) to better than 4.5e-5:
+
+    | res | "fill" (default) | "average" (MIT package) | "staircase" |
+    |---|---|---|---|
+    | 100 | 1.71e-3 / 1.68e-3 | 7.13e-3 / 7.14e-3 | 1.16e-2 / 1.16e-2 |
+    | 200 | 5.27e-4 / 4.19e-4 | 1.99e-3 / 1.94e-3 | 3.07e-3 / 3.02e-3 |
+    | 400 | 3.43e-4 / 1.05e-4 | 1.97e-3 / 1.89e-3 | 3.07e-3 / 2.99e-3 |
+
+    With the rule "fill" the grid-only error is that of the 0.5 um slab on the grid at each resolution (second order,
+    2.00 and 2.00): the face inside the cell adds no error at these digits. The FDTD error falls at the order 1.70
+    from res 100 to 200; from 200 to 400 the float32 coefficients limit it, as for the slab on the grid. The rules
+    "average" and "staircase" are worse at each resolution (4.2 and 6.8 times at res 100, 3.8 and 5.8 at res 200,
+    5.7 and 8.9 at res 400). Their errors do not fall from res 200 to 400 (1.99e-3 to 1.97e-3, 3.07e-3 to 3.07e-3),
+    because the fill fraction of the face cell changes with the resolution (0.8, then 0.6). So these rows give no
+    order for them; a series with a constant fill fraction would be needed (not logged).
+12. **Uniform field (k = 0)** in a periodic 1-D cell (`--case uniform`): a current over the whole cell, so
+    curl H = 0. Drude (eps_inf 1, f_n 0.5, gamma 0.02, sigma 1) and Lorentz (eps_inf 2.25, f_n 0.5, gamma 0.02,
+    sigma 0.5): the free oscillation (Harminv) against the root of eps(f) = 0 (exact: f = sqrt(f_n^2 (sigma / eps_inf
+    + 1_Lorentz) - gamma^2 / 4) - i gamma / 2). Conductive (eps_inf 2.25, sigma_D 0.2): the decay rate of Ex (a fit
+    of log abs(Ex) over 25 um/c) against sigma_D, and against the semi-implicit update ((2 / dt) atanh(sigma_D dt /
+    2)).
+
+    | medium | res | f (Harminv) | error against the exact root | against the discrete root | decay: exact, discrete |
+    |---|---|---|---|---|---|
+    | Drude | 20 | 0.500068 | +3.37e-4 | +1.2e-7 | -5.8e-6, -6.9e-6 |
+    | Drude | 40 | 0.499942 | +8.33e-5 | -8.2e-7 | +3.7e-5, +3.6e-5 |
+    | Lorentz | 20 | 0.552908 | +4.12e-4 | +6.5e-7 | +1.1e-5, +9.9e-6 |
+    | Lorentz | 40 | 0.552738 | +1.03e-4 | +5.1e-7 | +1.7e-5, +1.6e-5 |
+
+    The exact roots are 0.4999 - 0.01i and 0.552680 - 0.01i (/ um). The frequency error against the exact root falls
+    at second order (orders 2.02 and 2.00); against the root of the discrete chi it is below 1e-6. "decay" is
+    the relative error of Im f; at res 40 the float32 c2, which carries the damping, limits it (6e-8 / (g dt) =
+    3.3e-5). Conductive medium, decay rate of Ex / sigma_D - 1:
+    +6.1e-6 (res 20) and +1.5e-5 (res 40); against the semi-implicit update +3.4e-6 and +1.4e-5 (the float32 factors
+    of the update); the fit residual of log abs(Ex) is below 1.9e-6, and Ex keeps its sign.
+
+Tests: 68 (39 without FDTD runs: geometry, Prism center, 2-D parities, Harminv, the averaged permittivity against
 exact fill fractions and the formula of Kottke et al. (2-D and 3-D, both diagonals), periodic faces, NumPy against
-JAX, the transfer to fdtdx, the near-to-far-field transform of exact fields, the points of get_farfields; 17 FDTD
-checks, some with more than one run).
+JAX, the transfer to fdtdx, the near-to-far-field transform of exact fields, the points of get_farfields; the units
+of the susceptibilities against the fdtdx poles, the ADE coefficients of fdtdx against chi_yee, the exact Yee
+reference against the transfer matrix, the roots of eps = 0, the float32 coefficients, the three face rules in a
+face cell, the stability check with the values of each cell, the errors of Medium; 29 FDTD checks, some with more
+than one run).
 
 ## Tests and bench (on the GPU computer)
 
@@ -443,6 +594,13 @@ bash tools/gpu_run.sh fdtd_gpu $B --case subtract --resolution 20,40
 bash tools/gpu_run.sh fdtd_gpu $B --case near2far --resolution 20 --fcen 0.75 --df 0.3   # check 9, third file
 bash tools/gpu_run.sh fdtd_gpu $B --case near2far2d --resolution 20 --fcen 0.75 --df 0.3
 bash tools/gpu_run.sh fdtd_gpu $B --case subtract --resolution 20                    # with the inner points
+bash tools/gpu_run.sh fdtd_gpu $B --case film --kind drude --resolution 100,200,400   # check 10 (dispersion file)
+bash tools/gpu_run.sh fdtd_gpu $B --case film --kind lorentz --resolution 100,200,400  # check 11
+bash tools/gpu_run.sh fdtd_gpu $B --case film --kind lorentz --resolution 100 --no-avg
+bash tools/gpu_run.sh fdtd_gpu $B --case film --kind lorentz --thickness 0.504 --resolution 100,200,400 \
+  --face-rule fill,average,staircase                                                 # check 11, a face in a cell
+for k in drude lorentz conductive; do
+  bash tools/gpu_run.sh fdtd_gpu $B --case uniform --kind $k --resolution 20,40; done
 ```
 
 If the package is not installed in `.venv-rocm`, use `PYTHONPATH=src`. It needs fdtdx 0.6.3 (with tidy3d for its mode

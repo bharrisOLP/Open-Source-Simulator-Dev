@@ -6,9 +6,9 @@ from __future__ import annotations
 import numpy as np
 
 import fdtd_gpu as fg
-from references import (dipole_fields_3d, dipole_flux_3d, disk_resonance, line_source_fields_2d,  # noqa: F401
-                        line_source_power_2d, ring_resonance, slab_bloch_frequency, slab_te_neff, slab_tm_neff,
-                        tmm_reflectance)
+from references import (chi_exact, chi_yee, dipole_fields_3d, dipole_flux_3d, disk_resonance,  # noqa: F401
+                        line_source_fields_2d, line_source_power_2d, ring_resonance, slab_bloch_frequency,
+                        slab_te_neff, slab_tm_neff, tmm_reflectance, tmm_rt, uniform_root, yee_rt)
 
 SRC_REL_MIN = 1e-3     # waveguide: report T only where the source spectrum is above this fraction of its peak
 
@@ -646,3 +646,161 @@ def near2far_subtract(resolution: int = 20, nfreq: int = 5, s2=(0.0, -1.6)):
                 inside_plain=np.abs(EB_in).max(axis=(1, 2)) / scale_in, phase=phase,
                 omega_dt_half=np.pi * freqs * simB.dt, seconds=simA.run_seconds + simB.run_seconds,
                 device=simB.device, cells=int(np.prod(simB.shape)))
+
+
+# ---------- dispersive and conductive media ----------
+# Synthetic media with round numbers, in the textbook forms of the Lorentz and Drude models (Jackson, Classical
+# Electrodynamics, 3rd ed., Sec. 7.5). A pole is (kind, f_n, gamma, sigma) in the units of the MIT package.
+FILM = {"drude": dict(eps_inf=1.0, pole=("drude", 1.0, 0.05, 1.0), d=0.3),        # plasma edge at f = 1 / um
+        "lorentz": dict(eps_inf=2.25, pole=("lorentz", 1.0, 0.05, 0.5), d=0.5)}   # resonance at f = 1 / um
+UNIFORM = {"drude": dict(eps_inf=1.0, pole=("drude", 0.5, 0.02, 1.0)),
+           "lorentz": dict(eps_inf=2.25, pole=("lorentz", 0.5, 0.02, 0.5)),
+           "conductive": dict(eps_inf=2.25, sigma_d=0.2)}
+
+
+def dispersive_medium(eps_inf: float, pole=None, sigma_d: float = 0.0):
+    """A Medium with eps_inf, one pole (kind, f_n, gamma, sigma) or none, and D_conductivity sigma_d."""
+    sus = []
+    if pole is not None:
+        kind, fn, gamma, sigma = pole
+        cls = fg.DrudeSusceptibility if kind == "drude" else fg.LorentzianSusceptibility
+        sus = [cls(frequency=fn, gamma=gamma, sigma=sigma)]
+    return fg.Medium(epsilon=eps_inf, E_susceptibilities=sus, D_conductivity=sigma_d)
+
+
+def film_nodes(zc, dx: float, zs: float, d: float, eps_averaging: bool, rule: str):
+    """The weights of the Ex nodes zc (cell centers along z) for the exact Yee reference of a film [zs, zs + d]:
+    (first, last, w_eps, w_chi): eps_j = 1 + w_eps (eps_inf - 1) + w_chi chi for the nodes first..last. f is the fill
+    fraction of the voxel of the node on the points of `_averaging.lattice(1)` (the points of the average); E is
+    parallel to the faces, so the average of eps_inf is the arithmetic mean. Staircase (or the rule "staircase"):
+    w = the center is inside; rule "average": w_eps = f, w_chi = inside; rule "fill": w_eps = w_chi = f."""
+    from fdtd_gpu._averaging import lattice
+
+    inside = ((zc > zs) & (zc < zs + d)).astype(float)
+    pts = zc[:, None] + lattice(1)[None, :, 0] * dx
+    f = ((pts > zs) & (pts < zs + d)).mean(axis=1)
+    if not eps_averaging or rule == "staircase":
+        w_eps, w_chi = inside, inside
+    elif rule == "average":
+        w_eps, w_chi = f, inside
+    else:
+        w_eps, w_chi = f, f
+    used = np.flatnonzero((w_eps > 0) | (w_chi > 0))
+    first, last = int(used[0]), int(used[-1])
+    return first, last, w_eps[first:last + 1], w_chi[first:last + 1]
+
+
+def film(kind: str = "drude", resolution: int = 100, nfreq: int = 41, eps_averaging: bool = True,
+         thickness: float | None = None, fwidth: float = 1.6):
+    """1-D film of FILM[kind] in vacuum at normal incidence (Ex; cell along z; 41 frequencies from 0.6 to 1.4 / um;
+    a Gaussian source of fwidth 1.6 / um, so the amplitude at the band edges is 0.29 of the peak). R from a flux
+    plane with the incident fields subtracted, T from a flux plane behind the film (as check 1). thickness: the film
+    thickness (default FILM[kind]["d"]); the first face is on a cell face at the resolutions 20 k, so a thickness
+    that is not a whole number of cells puts the second face inside a cell.
+    References: (a) the transfer matrix with the exact eps(f) (Born and Wolf: the Fresnel coefficients at the two
+    faces and the phase in the film); (b) the exact R and T of the 1-D Yee grid (references.yee_rt) with the
+    discrete chi of the ADE (chi_yee) and the face rule of the run (`film_nodes`; fdtd_gpu._dispersion.FACE_RULE):
+    what remains against (b) is the float32 arithmetic and the end of the DFT; (c) as (b) with the float32 ADE
+    coefficients (chi_yee(float32=True)), which removes the part of the coefficients. rule_err: (b) against (a),
+    the error of the face rule and of the grid without FDTD."""
+    from fdtd_gpu import _dispersion
+
+    p = FILM[kind]
+    d = p["d"] if thickness is None else float(thickness)
+    pml, gap = 1.0, 1.0
+    sz = 2 * pml + 2 * gap + 1.0 + np.ceil(d * 20 - 1e-9) / 20     # a whole number of cells at the resolutions 20 k
+    z0 = -sz / 2 + pml + 0.5 * gap                  # source
+    zr = z0 + 0.25 * gap                             # reflection plane
+    zs = z0 + gap                                    # first face of the film (on a cell face)
+    zt = zs + np.ceil(d * 20 - 1e-9) / 20 + 0.5      # transmission plane
+    med = dispersive_medium(p["eps_inf"], p["pole"])
+    geometry = [fg.Block(size=fg.Vector3(fg.inf, fg.inf, d), center=fg.Vector3(0, 0, zs + d / 2), material=med)]
+    fcen, df = 1.0, 0.8
+    src = [fg.Source(fg.GaussianSource(fcen, fwidth=fwidth), component=fg.Ex, center=fg.Vector3(0, 0, z0))]
+    cell = fg.Vector3(0, 0, sz)
+
+    def sim_with(geom):
+        sim = fg.Simulation(cell_size=cell, resolution=resolution, geometry=geom, sources=src,
+                            boundary_layers=[fg.PML(pml)], eps_averaging=eps_averaging)
+        refl = sim.add_flux(fcen, df, nfreq, fg.FluxRegion(center=fg.Vector3(0, 0, zr)))
+        tran = sim.add_flux(fcen, df, nfreq, fg.FluxRegion(center=fg.Vector3(0, 0, zt)))
+        return sim, refl, tran
+
+    stop = fg.stop_when_fields_decayed(20, fg.Ex, fg.Vector3(0, 0, zt), 1e-7, max_time=300.0)
+    sim0, refl0, tran0 = sim_with([])
+    sim0.run(until_after_sources=stop)
+    inc = np.array(sim0.get_fluxes(tran0))
+    data = sim0.get_flux_data(refl0)
+    sim1, refl1, tran1 = sim_with(geometry)
+    sim1.load_minus_flux_data(refl1, data)
+    sim1.run(until_after_sources=stop)
+    freqs = np.array(sim1.get_flux_freqs(refl1))
+    R = -np.array(sim1.get_fluxes(refl1)) / inc
+    T = np.array(sim1.get_fluxes(tran1)) / inc
+    R_exact, T_exact = tmm_rt(freqs, [lambda f: np.sqrt(p["eps_inf"] + chi_exact(f, p["pole"]))], [d])
+    zc = sim1._lo(2) + (np.arange(sim1.shape[2]) + 0.5) * sim1.dx           # the Ex points (cell centers in z)
+    rule = _dispersion.FACE_RULE
+    first, last, w_eps, w_chi = film_nodes(zc, sim1.dx, zs, d, eps_averaging, rule)
+
+    def yee(f32):
+        return yee_rt(freqs, lambda f: 1 + w_eps * (p["eps_inf"] - 1) + w_chi * chi_yee(f, p["pole"], sim1.dt, f32),
+                      sim1.dx, sim1.dt)
+
+    (R_yee, T_yee), (R_y32, T_y32) = yee(False), yee(True)
+    A, A_exact = 1 - R - T, 1 - R_exact - T_exact
+    mid = np.abs(freqs - fcen) <= 0.25 + 1e-9
+
+    def worst(Ra, Ta, sel=slice(None)):
+        return float(max(np.max(np.abs(R - Ra)[sel]), np.max(np.abs(T - Ta)[sel])))
+
+    return dict(kind=kind, freqs=freqs, R=R, T=T, R_exact=R_exact, T_exact=T_exact, R_yee=R_yee, T_yee=T_yee,
+                max_dR=float(np.max(np.abs(R - R_exact))), max_dT=float(np.max(np.abs(T - T_exact))),
+                max_dRT=worst(R_exact, T_exact), max_dRT_yee=worst(R_yee, T_yee), max_dRT_yee32=worst(R_y32, T_y32),
+                rule_err=float(max(np.max(np.abs(R_yee - R_exact)), np.max(np.abs(T_yee - T_exact)))),
+                max_dRT_mid=worst(R_exact, T_exact, mid), max_dRT_yee_mid=worst(R_yee, T_yee, mid),
+                max_dA=float(np.max(np.abs(A - A_exact))), max_A=float(np.max(A_exact)),
+                max_dR_yee=float(np.max(np.abs(R - R_yee))), max_dT_yee=float(np.max(np.abs(T - T_yee))),
+                nodes=last - first + 1, fills=[float(w_eps[0]), float(w_eps[-1])], d=d, face_rule=rule,
+                fwidth=fwidth, seconds=sim0.run_seconds + sim1.run_seconds, device=sim1.device, steps=sim1.n_steps,
+                resolution=resolution, cells=int(np.prod(sim1.shape)), eps_averaging=eps_averaging)
+
+
+def uniform(kind: str = "drude", resolution: int = 20, run_after: float = 100.0):
+    """A uniform field (k = 0, so curl H = 0) in a periodic 1-D cell (1 um along z) filled with UNIFORM[kind]: Ex
+    from a current over the whole cell; Harminv records Ex after the source.
+    - drude, lorentz: the free oscillation (the strongest Harminv mode) against the root of eps_inf + chi(f) = 0,
+      with the exact chi (references.uniform_root) and with the discrete chi of the ADE (chi_yee).
+    - conductive: the decay rate of Ex (a fit of log |Ex| over 25 um/c) against sigma_D (E decays as
+      exp(-sigma_D t) = exp(-sigma t / (eps0 eps)) with the SI conductivity sigma) and against the semi-implicit
+      update of fdtdx, the factor (1 - b) / (1 + b) per step with b = sigma_D dt / 2."""
+    p = UNIFORM[kind]
+    L = 1.0
+    med = dispersive_medium(p["eps_inf"], p.get("pole"), p.get("sigma_d", 0.0))
+    if kind == "conductive":
+        gs, fcen, df = fg.GaussianSource(0.1, fwidth=0.5), 1.0, 1.0      # Harminv only records the signal here
+    else:
+        f_l = uniform_root(p["pole"], p["eps_inf"]).real
+        gs, fcen, df = fg.GaussianSource(f_l, fwidth=0.2), f_l, 0.4
+    src = [fg.Source(gs, fg.Ex, center=fg.Vector3(), size=fg.Vector3(0, 0, L))]
+    sim = fg.Simulation(cell_size=fg.Vector3(0, 0, L), resolution=resolution, sources=src, k_point=fg.Vector3(),
+                        default_material=med)
+    h = fg.Harminv(fg.Ex, fg.Vector3(0, 0, 0.1), fcen, df)
+    sim.run(fg.after_sources(h), until_after_sources=run_after)
+    out = dict(kind=kind, seconds=sim.run_seconds, device=sim.device, steps=sim.n_steps, resolution=resolution,
+               dt=sim.dt, cells=int(np.prod(sim.shape)))
+    if kind == "conductive":
+        s = np.asarray(h.data, float)
+        t = np.arange(len(s)) * h.data_dt
+        keep = t <= 25.0
+        slope = np.polyfit(t[keep], np.log(np.abs(s[keep])), 1)[0]
+        sd = p["sigma_d"]
+        rate_yee = 2 / sim.dt * np.arctanh(sd * sim.dt / 2)
+        resid = np.log(np.abs(s[keep])) - np.polyval(np.polyfit(t[keep], np.log(np.abs(s[keep])), 1), t[keep])
+        return dict(out, rate=-slope, sigma_d=sd, rate_yee=rate_yee, rel_err=-slope / sd - 1,
+                    rel_err_yee=-slope / rate_yee - 1, max_log_resid=float(np.max(np.abs(resid))),
+                    sign_changes=int(np.count_nonzero(np.diff(np.sign(s[keep])))))
+    m = max(h.modes, key=lambda q: abs(q.amp))
+    exact, yee = uniform_root(p["pole"], p["eps_inf"]), uniform_root(p["pole"], p["eps_inf"], dt=sim.dt)
+    return dict(out, f=m.freq, decay=m.decay, Q=m.Q, f_exact=exact.real, decay_exact=exact.imag, f_yee=yee.real,
+                decay_yee=yee.imag, f_err=m.freq / exact.real - 1, f_err_yee=m.freq / yee.real - 1,
+                decay_err=m.decay / exact.imag - 1, decay_err_yee=m.decay / yee.imag - 1, n_modes=len(h.modes))

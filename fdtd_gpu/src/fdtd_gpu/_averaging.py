@@ -117,13 +117,14 @@ def interface_voxels(idx: np.ndarray, a: int, trivial, periodic=(False, False, F
 
 
 def _inv_eps_chunk(pos, onehot, *, xp, geometry, obj_mat, shifts, eps_tab, trivial, periods, offsets, n_lat, nrm,
-                   ball, forward):
+                   ball, forward, track=()):
     """1 / eps_aa of the voxels centered at pos (C, 3). onehot: (d,) selects the component axis among the axes of
     size > 0 (all zero for a component along an axis of size 0). offsets: (S, d) sample offsets in um (the lattice,
     then the normal grid); nrm: (N, d) the normal grid in cell units; ball: (N,) its weights (`normal_grid`).
     periods: the cell length (um) of each periodic axis, else None: there the sample coordinates go back into the
     cell, and shifts (one list per object, `geometry.periodic_shifts`) give the copies of the objects.
-    forward: keep the diagonal of the forward tensor (see DIAGONAL) in place of the inverse tensor."""
+    forward: keep the diagonal of the forward tensor (see DIAGONAL) in place of the inverse tensor.
+    track: material indices; if given, also return their fill fractions (C, len(track)) on the lattice points."""
     nt = [b for b in range(3) if not trivial[b]]
     coords = []
     for b in range(3):
@@ -151,18 +152,23 @@ def _inv_eps_chunk(pos, onehot, *, xp, geometry, obj_mat, shifts, eps_tab, trivi
     mom = xp.stack([(dev * (ball * nrm[:, k])[None, :]).sum(axis=1) for k in range(nrm.shape[1])], axis=1)
     nm2 = (mom**2).sum(axis=1)
     na2 = xp.where(nm2 > 0, (mom * onehot[None, :]).sum(axis=1) ** 2 / xp.where(nm2 > 0, nm2, 1.0), 0.0)
-    if forward:
-        return 1.0 / (na2 / m_inv + (1.0 - na2) * m_eps)
-    return na2 * m_inv + (1.0 - na2) / m_eps
+    inv = 1.0 / (na2 / m_inv + (1.0 - na2) * m_eps) if forward else na2 * m_inv + (1.0 - na2) / m_eps
+    if not track:
+        return inv
+    return inv, xp.stack([(mat[:, :n_lat] == k).mean(axis=1) for k in track], axis=1)
 
 
 def averaged_permittivity(geometry, materials, idx: np.ndarray, dx: float, trivial, periodic=(False, False, False),
-                          backend: str = "auto") -> tuple[np.ndarray, int]:
+                          backend: str = "auto", track=None):
     """The permittivity of each E component, (3, *idx.shape) float32, and the number of sampled voxels.
 
     geometry, materials, idx: the objects, the material list and the staircase index of `geometry.rasterize` (with
     the same periodic axes). periodic: True for an axis with periodic faces (the objects repeat, as in the MIT
-    package). backend: "numpy", "jax" or "auto" (NumPy up to NUMPY_MAX sampled points x objects)."""
+    package). backend: "numpy", "jax" or "auto" (NumPy up to NUMPY_MAX sampled points x objects).
+    track: a list of Medium objects (by identity). Then a third value is returned: their fill fractions in the voxel
+    of each E component, (len(track), 3, *idx.shape) float32, from the same lattice points as <eps> (exact to
+    1 / (2 n) for a plane normal to an axis); a voxel that is not sampled has the fraction 1 or 0 of its staircase
+    material."""
     from fdtd_gpu.geometry import periodic_shifts
 
     shape = idx.shape
@@ -174,16 +180,33 @@ def averaged_permittivity(geometry, materials, idx: np.ndarray, dx: float, trivi
             mats.append(o.material)
             j = len(mats) - 1
         obj_mat.append(j)
+    track_idx = []
+    for m in track or ():
+        j = next((j for j, q in enumerate(mats) if q is m), None)
+        if j is None:                      # in no object and not the background: always 0
+            mats.append(m)
+            j = len(mats) - 1
+        track_idx.append(j)
+    track_idx = tuple(track_idx)
     eps_tab = np.array([m.epsilon for m in mats], np.float64)
     out = np.broadcast_to(eps_tab[idx].astype(np.float32), (3, *shape)).copy()
+    fills = None
+    if track is not None:
+        fills = np.zeros((len(track_idx), 3, *shape), np.float32)
+        for t, k in enumerate(track_idx):
+            fills[t] = (idx == k)[None]
+
+    def ret(n):
+        return (out, n) if track is None else (out, n, fills)
+
     nt = [b for b in range(3) if not trivial[b]]
     if not nt:
-        return out, 0
+        return ret(0)
     d = len(nt)
     cells = [np.argwhere(interface_voxels(idx, a, trivial, per)) for a in range(3)]
     n_sampled = sum(len(c) for c in cells)
     if n_sampled == 0:
-        return out, 0
+        return ret(0)
     lat, (nrm, ball) = lattice(d), normal_grid(d)
     offsets = np.concatenate([lat, nrm]) * dx
     lo = np.array([-n * dx / 2 for n in shape])
@@ -193,7 +216,8 @@ def averaged_permittivity(geometry, materials, idx: np.ndarray, dx: float, trivi
     if DIAGONAL not in ("inverse", "forward"):
         raise ValueError(f"DIAGONAL must be 'inverse' or 'forward', not {DIAGONAL!r}")
     kw = dict(geometry=geometry, obj_mat=obj_mat, shifts=shifts, trivial=tuple(trivial), n_lat=len(lat),
-              periods=tuple(shape[b] * dx if per[b] else None for b in range(3)), forward=DIAGONAL == "forward")
+              periods=tuple(shape[b] * dx if per[b] else None for b in range(3)), forward=DIAGONAL == "forward",
+              track=track_idx)
     if use_jax:
         import jax
         import jax.numpy as jnp
@@ -215,15 +239,21 @@ def averaged_permittivity(geometry, materials, idx: np.ndarray, dx: float, trivi
             pos[:, a] += 0.5 * dx
         pos[:, list(trivial)] = 0.0
         onehot = np.array([1.0 if b == a else 0.0 for b in nt])
-        res = []
+        res, fres = [], []
         for c0 in range(0, len(pos), chunk):
             p = pos[c0:c0 + chunk]
+            m = len(p)
             if use_jax:
-                m = len(p)
                 if m < chunk:
                     p = np.concatenate([p, np.repeat(p[:1], chunk - m, axis=0)])
-                res.append(np.asarray(fn(jnp.asarray(p, f32), jnp.asarray(onehot, f32)))[:m])
+                r = fn(jnp.asarray(p, f32), jnp.asarray(onehot, f32))
             else:
-                res.append(fn(p, onehot))
+                r = fn(p, onehot)
+            if track_idx:
+                r, fr = r
+                fres.append(np.asarray(fr)[:m])
+            res.append(np.asarray(r)[:m])
         out[a][tuple(cells[a].T)] = 1.0 / np.concatenate(res)
-    return out, n_sampled
+        if track_idx:
+            fills[:, a][(slice(None), *cells[a].T)] = np.concatenate(fres).T
+    return ret(n_sampled)

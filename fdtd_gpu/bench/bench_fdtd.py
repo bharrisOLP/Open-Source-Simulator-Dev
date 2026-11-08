@@ -15,9 +15,14 @@
     python bench/bench_fdtd.py --case distance --resolution 20   # near2far error on shells 1 to 10 cells out
     python bench/bench_fdtd.py --case subtract --resolution 20   # near2far with subtracted incident fields (2-D)
     python bench/bench_fdtd.py --case setup --resolution 50     # time of the subpixel average only, 3-D strip
+    python bench/bench_fdtd.py --case film --kind drude --resolution 100,200,400   # dispersive film: R, T (1-D)
+    python bench/bench_fdtd.py --case film --kind lorentz --thickness 0.504 --face-rule fill,average,staircase
+    python bench/bench_fdtd.py --case uniform --kind conductive --resolution 20   # k = 0: decay or oscillation
     python bench/bench_fdtd.py --case all          # bragg, waveguide, ring, dipole, sheet at the default resolutions
     python bench/bench_fdtd.py --case ring --resolution 40,60,80 --both    # a list of resolutions; averaged and not
 Each row has the resolution and the cells. --no-avg: the staircase (eps_averaging=False); default: averaged.
+Film and uniform rows: the arrays of the 41 frequencies (film) are in the row; the references are the transfer
+matrix with the exact eps(f), the exact 1-D Yee grid with the discrete chi of the ADE, and the roots of eps = 0.
 The cases are in tests/cases.py; the references (transfer matrices, Bessel-function ring and disk resonances, the
 exact slab mode with the Yee dispersion along x and in time, the analytic dipole power, the flux of a current
 sheet, the fields of a dipole and of a line current) are in tests/references.py and tests/cases.py. "seconds" is
@@ -72,8 +77,16 @@ def setup(resolution: int = 50):
 
 ap = argparse.ArgumentParser()
 ap.add_argument("--case", choices=["bragg", "waveguide", "ring", "disk", "slab", "dipole", "sheet", "near2far",
-                                   "near2far2d", "transform", "distance", "subtract", "setup", "all"],
+                                   "near2far2d", "transform", "distance", "subtract", "setup", "film", "uniform",
+                                   "all"],
                 default="all")
+ap.add_argument("--kind", type=str, default=None,
+                help="medium of the film case (drude, lorentz) or of the uniform case (drude, lorentz, conductive)")
+ap.add_argument("--thickness", type=float, default=None,
+                help="film case: the film thickness (um; default 0.3 Drude, 0.5 Lorentz)")
+ap.add_argument("--fwidth", type=float, default=None, help="film case: the source width (1/um; default 1.6)")
+ap.add_argument("--face-rule", type=str, default=None,
+                help="film case: fill, average, staircase or a list (fdtd_gpu._dispersion.FACE_RULE; default fill)")
 ap.add_argument("--component", type=str, default=None, help="source of the near2far cases: Ez (default), Ex or Ey")
 ap.add_argument("--fcen", type=float, default=None, help="center frequency of the near2far cases (default 0.5 / um)")
 ap.add_argument("--df", type=float, default=None, help="frequency width of the near2far cases (default 0.2 / um)")
@@ -91,7 +104,8 @@ ap.add_argument("--forward-diagonal", action="store_true",
                 help="keep the diagonal of the forward tensor (fdtd_gpu._averaging.DIAGONAL = \"forward\")")
 a = ap.parse_args()
 _USED_BY = {"index": ("dipole", "sheet", "near2far", "near2far2d", "all"), "component": ("near2far", "near2far2d"),
-            "fcen": ("near2far", "near2far2d"), "df": ("near2far", "near2far2d")}
+            "fcen": ("near2far", "near2far2d"), "df": ("near2far", "near2far2d"), "kind": ("film", "uniform"),
+            "thickness": ("film",), "fwidth": ("film",), "face_rule": ("film",)}
 for opt, used_by in _USED_BY.items():          # an option that the case does not use is an error, not ignored
     if getattr(a, opt) is not None and a.case not in used_by:
         ap.error(f"--{opt} is not used by --case {a.case}")
@@ -99,6 +113,11 @@ index = 1.0 if a.index is None else a.index
 if a.forward_diagonal:
     import fdtd_gpu._averaging
     fdtd_gpu._averaging.DIAGONAL = "forward"
+import fdtd_gpu._dispersion  # noqa: E402
+
+rules = [None] if a.face_rule is None else a.face_rule.split(",")
+if any(r not in fdtd_gpu._dispersion.FACE_RULES for r in rules if r is not None):
+    ap.error(f"--face-rule: one or more of {fdtd_gpu._dispersion.FACE_RULES}")
 if a.case == "transform":
     for (dims, comp), h in itertools.product([(3, "Ez"), (3, "Ex"), (2, "Ez"), (2, "Ex")], (0.1, 0.05, 0.025)):
         print(json.dumps(_clean({"case": "transform", **cases.transform_exact(dims, comp, h, compare_backends=True)})),
@@ -107,10 +126,15 @@ if a.case == "transform":
 todo = ["bragg", "waveguide", "ring", "dipole", "sheet"] if a.case == "all" else [a.case]
 resolutions = [None] if a.resolution is None else [int(r) for r in a.resolution.split(",")]
 averaging = [True, False] if a.both else [not a.no_avg]
-for case, resolution, avg in itertools.product(todo, resolutions, averaging):
+for case, resolution, avg, rule in itertools.product(todo, resolutions, averaging, rules):
     kw = {} if resolution is None else {"resolution": resolution}
-    if case in ("bragg", "waveguide", "ring", "disk", "slab"):
+    fdtd_gpu._dispersion.FACE_RULE = rule or "fill"
+    if case in ("bragg", "waveguide", "ring", "disk", "slab", "film"):
         kw["eps_averaging"] = avg
+    if case in ("film", "uniform"):
+        kw["kind"] = a.kind or ("drude" if case == "film" else "conductive")
+    if case == "film":
+        kw.update({k: getattr(a, k) for k in ("thickness", "fwidth") if getattr(a, k) is not None})
     if case == "bragg":
         kw["lam0"] = a.lam0
     if case == "disk":

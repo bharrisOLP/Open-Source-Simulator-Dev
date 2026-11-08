@@ -6,6 +6,9 @@ size of 0 on an axis makes the simulation 2-D (or 1-D): the fields do not change
 Mapping to fdtdx (SI units inside): axes x, y, z = fdtdx axes 0, 1, 2. The geometry becomes one voxel object:
 with eps_averaging=True (the default) one diagonal permittivity per Yee E component, from the subpixel average of
 Kottke et al. (`fdtd_gpu._averaging`); with eps_averaging=False the material of each cell center (a staircase).
+Dispersion (Lorentz and Drude terms) and D_conductivity: the ADE arrays of fdtdx, set per cell by this package
+(`fdtd_gpu._dispersion`): the staircase of the cell centers, or with eps_averaging the rule FACE_RULE (default:
+the pole strength times the fill fraction of each E component).
 Boundaries: PML layers inside the cell (as in the MIT package); other faces are perfect electric conductors, or
 periodic with k_point=Vector3(); trivial axes are periodic. Fields run in float32. The DFT monitors use the
 convention of the MIT package, sum f(t) exp(i 2 pi f t) dt / sqrt(2 pi), so fluxes and mode coefficients have the
@@ -22,6 +25,7 @@ from dataclasses import dataclass, field
 
 import numpy as np
 
+import fdtd_gpu._dispersion as _disp
 from fdtd_gpu.geometry import Medium, Vector3, _v3, rasterize
 from fdtd_gpu.harminv import harminv
 from fdtd_gpu.near2far import Volume, farfield_grid, radiate
@@ -254,13 +258,20 @@ class Simulation:
         t0 = _time.perf_counter()
         per = self._periodic_axes()
         idx, mats = rasterize(self.geometry, self.default_material, self.shape, self.dx, self.trivial, per)
-        eps3, self.n_averaged = None, 0
+        eps3, self.n_averaged, self._fills = None, 0, None
         if self.eps_averaging and len(mats) > 1:
             import jax
 
             from fdtd_gpu._averaging import averaged_permittivity
+            lossy = _disp.lossy_media(self.default_material, self.geometry)
+            track = lossy if lossy and _disp.FACE_RULE == "fill" else None      # fill fractions for the face rule
             with jax.enable_x64(False), jax.default_device(_device()):
-                eps3, self.n_averaged = averaged_permittivity(self.geometry, mats, idx, self.dx, self.trivial, per)
+                res = averaged_permittivity(self.geometry, mats, idx, self.dx, self.trivial, per, track=track)
+            eps3, self.n_averaged = res[0], res[1]
+            if track is not None:
+                self._fills = res[2]
+            if lossy and _disp.FACE_RULE == "staircase":
+                eps3 = _disp.staircase_at_lossy(eps3, idx, mats, tuple(t or p for t, p in zip(self.trivial, per)))
         self.setup_seconds = _time.perf_counter() - t0
         return idx, mats, eps3
 
@@ -454,6 +465,9 @@ class Simulation:
             Js.append(J)
             Ms.append(M)
             eps.append(self.eps[tuple(slice(*q) for q in rng)].reshape(-1))
+            if not self._plain[tuple(slice(*q) for q in rng)].all():
+                raise NotImplementedError("the near2far surface crosses a dispersive or conductive material: the "
+                                          "transform needs a lossless, non-dispersive medium")
         eps = np.concatenate(eps)
         vals, counts = np.unique(eps, return_counts=True)
         n2f.eps = float(vals[np.argmax(counts)])
@@ -585,6 +599,19 @@ class Simulation:
         idx, mats, eps3 = self._permittivity()
         self.eps = np.array([m.epsilon for m in mats])[idx]
         self.eps3 = eps3
+        face, self._plain = None, np.ones(idx.shape, bool)     # _plain: cells without poles or conductivity
+        lossy = _disp.lossy_media(self.default_material, self.geometry)
+        if lossy:                                   # nothing of this for runs without dispersion or conductivity
+            face = _disp.face_assignment(idx, mats, eps3, self._fills, lossy)
+            self._plain = face.plain
+            _disp.check_stability(face, self.dt, self.dx, self.dims)
+        planes =[(s.center, s.size, "an EigenModeSource") for s in self.sources if isinstance(s, EigenModeSource)]
+        planes += [(r.center, r.size, "a mode monitor") for m in self._monitors if m.mode for r in m.regions]
+        for center, size, what in planes:
+            if not self._plain[tuple(slice(*self._range(center, size, a)) for a in range(3))].all():
+                raise NotImplementedError(f"{what} plane crosses a dispersive or conductive material (not "
+                                          f"validated: the mode solver would see eps_inf only); make the plane "
+                                          f"smaller")
         if eps3 is not None:
             place(VoxelMaterial.from_permittivity(eps3, self.default_material.epsilon), (0, 0, 0))
         elif len(mats) > 1:
@@ -663,6 +690,8 @@ class Simulation:
         objs, arrays, params, config, _ = fdtdx.place_objects(object_list=objects, config=config,
                                                              constraints=constraints, key=key)
         arrays, objs, _ = fdtdx.apply_params(arrays, objs, params, key)
+        if face is not None:              # after the sources took 1 / eps_inf: see fdtd_gpu._dispersion
+            arrays = _disp.material_arrays(arrays, config, face)
         return objs, arrays, config, key
 
     def _run(self, harminvs, cond, t_start, t_max):

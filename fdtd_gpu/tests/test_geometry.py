@@ -12,7 +12,7 @@ def test_vector3_and_medium():
     assert tuple(v) == (1, 2, 6) and abs(fg.Vector3(3, 4).norm() - 5) < 1e-15
     assert fg.Medium(index=2.0).epsilon == 4.0 and fg.Medium(epsilon=2.25).index == 1.5
     with pytest.raises(NotImplementedError):
-        fg.Medium(epsilon=2.0, E_susceptibilities=[])
+        fg.Medium(epsilon=2.0, mu=2.0)
 
 
 def test_rasterize_areas_and_order():

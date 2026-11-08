@@ -204,3 +204,97 @@ def line_source_power_2d(f, current, in_plane: bool = False):
     om = 2 * np.pi * np.asarray(f, float)
     p = om * np.abs(current) ** 2 / 4
     return p / 2 if in_plane else p
+
+
+# ---------- dispersive and conductive media ----------
+# A pole is (kind, f_n, gamma, sigma) with the names and units of the MIT package (f in 1/um, c = 1, omega = 2 pi f;
+# time dependence exp(-i omega t)): Lorentz chi = sigma w_n^2 / (w_n^2 - w^2 - i w g), Drude chi = -sigma w_n^2 /
+# (w^2 + i w g), with w_n = 2 pi f_n and g = 2 pi gamma (Jackson, Classical Electrodynamics, 3rd ed., Sec. 7.5).
+
+
+def chi_exact(f, pole) -> np.ndarray:
+    """The susceptibility of one pole at the frequencies f (complex f allowed)."""
+    kind, fn, gamma, sigma = pole
+    w, wn, g = 2 * np.pi * np.asarray(f, complex), 2 * np.pi * fn, 2 * np.pi * gamma
+    return sigma * wn**2 / ((wn**2 if kind == "lorentz" else 0.0) - w**2 - 1j * w * g)
+
+
+def chi_yee(f, pole, dt: float, float32: bool = False) -> np.ndarray:
+    """The susceptibility of the central-difference ADE at the time step dt (um/c): the polarization of the pole
+    obeys (p^(n+1) - 2 p^n + p^(n-1)) / dt^2 + g (p^(n+1) - p^(n-1)) / (2 dt) + w_n^2 p^n = K E^n with K = sigma
+    w_n^2. With p^n = p exp(-i w n dt) this gives chi = K dt^2 / (w_n^2 dt^2 - 4 sin^2(w dt / 2) - i g dt sin(w dt)),
+    the exact chi of the discrete scheme; it tends to chi_exact for dt -> 0.
+    float32: the chi of the recurrence p^(n+1) = c1 p^n + c2 p^(n-1) + c3 E^n with float32 coefficients, chi = c3 /
+    (s - c1 - c2 / s), s = exp(-i w dt); c1 = (2 - w0^2 dt^2) / D, c2 = -(1 - g dt / 2) / D, c3 = K dt^2 / D,
+    D = 1 + g dt / 2, rounded as fdtd_gpu does it: c1 to float32, c2 to the float32 nearest to (c1 + c2) - c1_32,
+    and c1_32 + c2_32 not above 1. This model of the arithmetic shows the part of an error that comes from the
+    rounding of the coefficients."""
+    kind, fn, gamma, sigma = pole
+    w, wn, g = 2 * np.pi * np.asarray(f, complex), 2 * np.pi * fn, 2 * np.pi * gamma
+    w0 = wn if kind == "lorentz" else 0.0
+    if not float32:
+        return sigma * wn**2 * dt**2 / (w0**2 * dt**2 - 4 * np.sin(w * dt / 2) ** 2 - 1j * g * dt * np.sin(w * dt))
+    d = 1 + g * dt / 2
+    c1, c2, c3 = (2 - w0**2 * dt**2) / d, -(1 - g * dt / 2) / d, sigma * wn**2 * dt**2 / d
+    c1f = float(np.float32(c1))
+    c2f = float(np.float32((c1 + c2) - c1f))
+    if c1f + c2f > 1.0:
+        c2f = float(np.float32(1.0 - c1f))
+    s = np.exp(-1j * w * dt)
+    return float(np.float32(c3)) / (s - c1f - c2f / s)
+
+
+def tmm_rt(f, n_layers, d_layers):
+    """Normal-incidence power reflectance and transmittance of a layer stack in vacuum (Born and Wolf,
+    characteristic matrices): n_layers is a list of functions n(f) (complex, Im n >= 0 for loss), d_layers the
+    thicknesses (um)."""
+    f = np.atleast_1d(np.asarray(f, float))
+    R, T = np.empty(len(f)), np.empty(len(f))
+    for i, fi in enumerate(f):
+        k0 = 2 * np.pi * fi
+        M = np.eye(2, dtype=complex)
+        for nf, d in zip(n_layers, d_layers):
+            n = complex(nf(fi))
+            delta = k0 * n * d
+            M = M @ np.array([[np.cos(delta), -1j * np.sin(delta) / n], [-1j * n * np.sin(delta), np.cos(delta)]])
+        B, C = M @ np.array([1.0, 1.0])
+        R[i] = abs((B - C) / (B + C)) ** 2
+        T[i] = abs(2 / (B + C)) ** 2
+    return R, T
+
+
+def yee_rt(f, eps_nodes, dx: float, dt: float):
+    """The exact power reflectance and transmittance of a 1-D Yee grid (E at the nodes j dx, H between them, E at the
+    times n dt, H between them) for a structure of N nodes with the relative permittivities eps_nodes(f) (N complex
+    values at f) between vacuum half-spaces. With exp(-i w t) the leapfrog gives the time factor (2 / dt) sin(w dt / 2)
+    = q / dx, and the nodes obey E_(j+1) - 2 E_j + E_(j-1) + eps_j q^2 E_j = 0. In vacuum E_j = exp(+-i theta j) with
+    2 cos(theta) = 2 - q^2. Start with the outgoing wave on the right, step to the left through the structure, and
+    split the field on the left into the incident and the reflected wave. Flux ratios are |r|^2 and |t|^2 (the same
+    discrete wave in vacuum on both sides)."""
+    f = np.atleast_1d(np.asarray(f, float))
+    R, T = np.empty(len(f)), np.empty(len(f))
+    for i, fi in enumerate(f):
+        q = 2 * dx / dt * np.sin(np.pi * fi * dt)
+        theta = np.arccos(1 - q**2 / 2)
+        eps = np.asarray(eps_nodes(fi), complex)
+        n = len(eps)
+        e_next, e_cur = np.exp(1j * theta * (n + 1)), np.exp(1j * theta * n)        # nodes n + 1 and n (vacuum)
+        for j in range(n - 1, -1, -1):          # E_(j) from E_(j+1) and E_(j+2): the equation of node j + 1
+            eps_j1 = eps[j + 1] if j + 1 < n else 1.0
+            e_next, e_cur = e_cur, (2 - eps_j1 * q**2) * e_cur - e_next
+        e_m1 = (2 - eps[0] * q**2) * e_cur - e_next                                   # node -1, from node 0
+        # nodes 0 and -1 hold a e^(i theta j) + b e^(-i theta j)
+        a, b = np.linalg.solve(np.array([[1, 1], [np.exp(-1j * theta), np.exp(1j * theta)]]), [e_cur, e_m1])
+        R[i], T[i] = abs(b / a) ** 2, abs(1 / a) ** 2
+    return R, T
+
+
+def uniform_root(pole, eps_inf: float, dt: float | None = None) -> complex:
+    """The complex frequency (1/um) of the free oscillation of a uniform field (k = 0) in a medium with one pole:
+    the root of eps_inf + chi(f) = 0 near the longitudinal frequency (D = eps_inf E + P stays constant without a
+    curl). dt: the root of the discrete chi_yee; None: of chi_exact."""
+    kind, fn, gamma, sigma = pole
+    f_l = np.sqrt(fn**2 * (sigma / eps_inf + (1.0 if kind == "lorentz" else 0.0)) - gamma**2 / 4) - 0.5j * gamma
+    if dt is None:
+        return complex(f_l)              # the exact root: w^2 + i g w - w_L^2 = 0 (both forms of the pole)
+    return complex(optimize.newton(lambda z: eps_inf + chi_yee(z, pole, dt), f_l, tol=1e-14, maxiter=100))

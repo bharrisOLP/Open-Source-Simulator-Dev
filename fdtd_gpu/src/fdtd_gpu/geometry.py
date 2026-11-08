@@ -64,25 +64,111 @@ def _v3(v) -> Vector3:
     return Vector3(*v)
 
 
-class Medium:
-    """A lossless, non-dispersive, isotropic material: Medium(epsilon=...) or Medium(index=...)."""
+class _Susceptibility:
+    """A susceptibility term with the names and units of the MIT package: frequency f_n and gamma in 1/um (c = 1,
+    omega = 2 pi f), sigma dimensionless. Isotropic only: sigma, or sigma_diag with three equal values."""
 
-    def __init__(self, epsilon: float | None = None, index: float | None = None, **unsupported):
+    def __init__(self, frequency: float = 0.0, gamma: float = 0.0, sigma: float | None = None, sigma_diag=None,
+                 sigma_offdiag=None, **unsupported):
         if unsupported:
-            raise NotImplementedError(f"fdtd_gpu.Medium supports only epsilon and index, not {sorted(unsupported)}")
+            raise NotImplementedError(f"{type(self).__name__}: unsupported arguments {sorted(unsupported)}")
+        if sigma_offdiag is not None and any(float(s) != 0 for s in _v3(sigma_offdiag)):
+            raise NotImplementedError("anisotropic susceptibilities (sigma_offdiag) are not supported")
+        if sigma_diag is not None:
+            d = tuple(float(s) for s in _v3(sigma_diag))
+            if sigma is not None or d[0] != d[1] or d[1] != d[2]:
+                raise NotImplementedError("give sigma, or sigma_diag with three equal values (isotropic only)")
+            sigma = d[0]
+        self.frequency, self.gamma = float(frequency), float(gamma)
+        self.sigma = 0.0 if sigma is None else float(sigma)
+        if not self.frequency > 0:
+            raise ValueError(f"{type(self).__name__}: frequency must be positive, got {self.frequency}")
+        if self.gamma < 0:
+            raise ValueError(f"{type(self).__name__}: gamma must not be negative, got {self.gamma}")
+        if self.sigma < 0:
+            raise NotImplementedError(f"{type(self).__name__}: a negative sigma (gain) is not supported")
+
+    def __repr__(self):
+        return f"{type(self).__name__}(frequency={self.frequency:g}, gamma={self.gamma:g}, sigma={self.sigma:g})"
+
+
+class LorentzianSusceptibility(_Susceptibility):
+    """A Lorentz oscillator: chi(f) = sigma f_n^2 / (f_n^2 - f^2 - i f gamma) (time dependence exp(-i omega t));
+    in the time domain d^2P/dt^2 + 2 pi gamma dP/dt + (2 pi f_n)^2 P = sigma (2 pi f_n)^2 E."""
+
+    def chi(self, f):
+        f = np.asarray(f, complex)
+        fn = self.frequency
+        return self.sigma * fn**2 / (fn**2 - f**2 - 1j * f * self.gamma)
+
+
+class DrudeSusceptibility(_Susceptibility):
+    """A Drude term (free carriers): chi(f) = -sigma f_n^2 / (f^2 + i f gamma); the plasma frequency is
+    f_n sqrt(sigma). In the time domain d^2P/dt^2 + 2 pi gamma dP/dt = sigma (2 pi f_n)^2 E."""
+
+    def chi(self, f):
+        f = np.asarray(f, complex)
+        return -self.sigma * self.frequency**2 / (f**2 + 1j * f * self.gamma)
+
+
+class Medium:
+    """An isotropic material: Medium(epsilon=...) or Medium(index=...), with optional dispersion and loss, in the
+    names and units of the MIT package:
+    - E_susceptibilities: a list of LorentzianSusceptibility and DrudeSusceptibility terms; epsilon (or index^2)
+      is then the high-frequency permittivity eps_inf;
+    - D_conductivity: sigma_D in 1/(um/c), the conductivity of the MIT package: eps(f) = eps_inf (1 + i sigma_D /
+      (2 pi f)); the fields in the medium decay as exp(-sigma_D t). Not together with E_susceptibilities.
+    `epsilon` stays the float eps_inf (the MIT package has the method epsilon(freq); here it is permittivity(f))."""
+
+    def __init__(self, epsilon: float | None = None, index: float | None = None, E_susceptibilities=(),
+                 D_conductivity: float = 0.0, **unsupported):
+        if unsupported:
+            raise NotImplementedError(f"fdtd_gpu.Medium supports epsilon, index, E_susceptibilities and "
+                                      f"D_conductivity, not {sorted(unsupported)}")
         if epsilon is not None and index is not None:
             raise ValueError("give epsilon or index, not both")
         eps = index**2 if index is not None else (1.0 if epsilon is None else epsilon)
         if not eps > 0:
             raise ValueError(f"epsilon must be positive, got {eps}")
         self.epsilon = float(eps)
+        self.E_susceptibilities = tuple(E_susceptibilities or ())
+        for s in self.E_susceptibilities:
+            if not isinstance(s, (LorentzianSusceptibility, DrudeSusceptibility)):
+                raise NotImplementedError(f"unsupported susceptibility {type(s).__name__} (only "
+                                          f"LorentzianSusceptibility and DrudeSusceptibility)")
+        self.D_conductivity = float(D_conductivity)
+        if self.D_conductivity < 0:
+            raise NotImplementedError("a negative D_conductivity (gain) is not supported")
+        if self.D_conductivity > 0 and self.dispersive:
+            raise NotImplementedError("D_conductivity together with E_susceptibilities is not supported: the MIT "
+                                      "package multiplies the whole eps(f) by (1 + i sigma_D / omega), fdtdx adds "
+                                      "i sigma / omega. Use a DrudeSusceptibility for the loss")
 
     @property
     def index(self) -> float:
+        """sqrt(eps_inf)."""
         return math.sqrt(self.epsilon)
 
+    @property
+    def dispersive(self) -> bool:
+        """True if a susceptibility term has sigma > 0."""
+        return any(s.sigma > 0 for s in self.E_susceptibilities)
+
+    @property
+    def conductive(self) -> bool:
+        return self.D_conductivity > 0
+
+    def permittivity(self, f):
+        """The complex relative permittivity at the frequencies f (1/um): (1 + i sigma_D / (2 pi f)) (eps_inf +
+        sum chi(f)), time dependence exp(-i omega t) (Im > 0: loss)."""
+        f = np.asarray(f, complex)
+        eps = self.epsilon + sum((s.chi(f) for s in self.E_susceptibilities), np.zeros_like(f))
+        return eps * (1 + 1j * self.D_conductivity / (2 * np.pi * f)) if self.conductive else eps
+
     def __repr__(self):
-        return f"Medium(epsilon={self.epsilon:g})"
+        extra = "".join([f", E_susceptibilities={list(self.E_susceptibilities)}" if self.E_susceptibilities else "",
+                         f", D_conductivity={self.D_conductivity:g}" if self.conductive else ""])
+        return f"Medium(epsilon={self.epsilon:g}{extra})"
 
 
 vacuum = air = Medium()
