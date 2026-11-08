@@ -8,15 +8,19 @@
     python bench/bench_fdtd.py --case dipole --resolution 20 --index 1.5 [--half 0.5]
     python bench/bench_fdtd.py --case waveguide --three-d --src-freq 0.5701613   # mode source solved at a band edge
     python bench/bench_fdtd.py --case sheet --resolution 40 [--index 1.5]
+    python bench/bench_fdtd.py --case near2far --resolution 20 [--index 1.5] [--component Ex]   # 3-D dipole
+    python bench/bench_fdtd.py --case near2far2d --resolution 20 [--index 1.5] [--component Ex]  # 2-D line source
+    python bench/bench_fdtd.py --case transform     # transform of exact fields (no FDTD), h = 0.1, 0.05, 0.025
     python bench/bench_fdtd.py --case setup --resolution 50     # time of the subpixel average only, 3-D strip
     python bench/bench_fdtd.py --case all          # bragg, waveguide, ring, dipole, sheet at the default resolutions
     python bench/bench_fdtd.py --case ring --resolution 40,60,80 --both    # a list of resolutions; averaged and not
 Each row has the resolution and the cells. --no-avg: the staircase (eps_averaging=False); default: averaged.
 The cases are in tests/cases.py; the references (transfer matrices, Bessel-function ring and disk resonances, the
 exact slab mode with the Yee dispersion along x and in time, the analytic dipole power, the flux of a current
-sheet) are in tests/references.py and tests/cases.py. "seconds" is the time of the FDTD loops (compile included);
-"setup_seconds" the time of the rasterization and the subpixel average. NaN values (T outside the source band of
-the waveguide case) are written as null.
+sheet, the fields of a dipole and of a line current) are in tests/references.py and tests/cases.py. "seconds" is
+the time of the FDTD loops (compile included); "setup_seconds" the time of the rasterization and the subpixel
+average; "farfield_seconds" the time of the far fields of one box (near2far cases). NaN values (T outside the
+source band of the waveguide case) are written as null.
 """
 import argparse
 import itertools
@@ -64,8 +68,9 @@ def setup(resolution: int = 50):
 
 
 ap = argparse.ArgumentParser()
-ap.add_argument("--case", choices=["bragg", "waveguide", "ring", "disk", "slab", "dipole", "sheet", "setup", "all"],
-                default="all")
+ap.add_argument("--case", choices=["bragg", "waveguide", "ring", "disk", "slab", "dipole", "sheet", "near2far",
+                                   "near2far2d", "transform", "setup", "all"], default="all")
+ap.add_argument("--component", type=str, default="Ez", help="source of the near2far cases: Ez, Ex or Ey")
 ap.add_argument("--resolution", type=str, default=None, help="one value, or a list: 20,40,80")
 ap.add_argument("--index", type=float, default=1.0, help="medium of the dipole and sheet cases")
 ap.add_argument("--half", type=float, default=1.0, help="half width of the flux box of the dipole case (um)")
@@ -82,6 +87,11 @@ a = ap.parse_args()
 if a.forward_diagonal:
     import fdtd_gpu._averaging
     fdtd_gpu._averaging.DIAGONAL = "forward"
+if a.case == "transform":
+    for (dims, comp), h in itertools.product([(3, "Ez"), (3, "Ex"), (2, "Ez"), (2, "Ex")], (0.1, 0.05, 0.025)):
+        print(json.dumps(_clean({"case": "transform", **cases.transform_exact(dims, comp, h, compare_backends=True)})),
+              flush=True)
+    sys.exit(0)
 todo = ["bragg", "waveguide", "ring", "dipole", "sheet"] if a.case == "all" else [a.case]
 resolutions = [None] if a.resolution is None else [int(r) for r in a.resolution.split(",")]
 averaging = [True, False] if a.both else [not a.no_avg]
@@ -100,10 +110,14 @@ for case, resolution, avg in itertools.product(todo, resolutions, averaging):
         kw["half"] = a.half
     if case == "sheet":
         kw["n"] = a.index
+    if case in ("near2far", "near2far2d"):
+        kw["n"] = a.index
+        kw["component"] = a.component
     if case == "waveguide":
         kw["three_d"] = a.three_d
         kw["src_freq"] = a.src_freq
-    res = setup(**kw) if case == "setup" else getattr(cases, case)(**kw)
+    fn = {"near2far": "near2far_dipole", "near2far2d": "near2far_line"}.get(case, case)
+    res = setup(**kw) if case == "setup" else getattr(cases, fn)(**kw)
     row = {"case": case, **{k: v for k, v in kw.items()}, **res}
     if a.forward_diagonal:
         row["diagonal"] = "forward"

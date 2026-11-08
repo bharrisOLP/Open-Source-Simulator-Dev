@@ -9,7 +9,8 @@ Kottke et al. (`fdtd_gpu._averaging`); with eps_averaging=False the material of 
 Boundaries: PML layers inside the cell (as in the MIT package); other faces are perfect electric conductors, or
 periodic with k_point=Vector3(); trivial axes are periodic. Fields run in float32. The DFT monitors use the
 convention of the MIT package, sum f(t) exp(i 2 pi f t) dt / sqrt(2 pi), so fluxes and mode coefficients have the
-same normalization for a given source current.
+same normalization for a given source current. add_near2far keeps the DFT fields of closed surfaces for the
+near-to-far-field transform (`fdtd_gpu.near2far`: surface equivalence with the exact 3-D or 2-D Green's function).
 """
 
 from __future__ import annotations
@@ -23,6 +24,7 @@ import numpy as np
 
 from fdtd_gpu.geometry import Medium, Vector3, _v3, rasterize
 from fdtd_gpu.harminv import harminv
+from fdtd_gpu.near2far import Volume, farfield_grid, radiate
 from fdtd_gpu.sources import (ALL, AUTOMATIC, EVEN_Z, NO_PARITY, ODD_Y, ODD_Z, ContinuousSource, EigenModeSource,
                               GaussianSource, Source)
 
@@ -51,6 +53,11 @@ class FluxRegion:
 
 
 ModeRegion = FluxRegion
+
+
+class Near2FarRegion(FluxRegion):
+    """A plane of a near-to-far-field surface: Near2FarRegion(center, size, direction=AUTOMATIC, weight=1). As for
+    flux: the normal is +direction; weight -1 on the faces of a closed box whose outward normal is -direction."""
 
 
 class stop_when_fields_decayed:
@@ -88,6 +95,19 @@ class _Monitor:
     axes: list = field(default_factory=list)
     minus: list | None = None
     mode: bool = False
+
+
+@dataclass
+class DftNear2Far(_Monitor):
+    """The DFT fields of the planes of add_near2far. After the run: `eps` (the medium of the far fields) and
+    `flux(direction, where, resolution)`."""
+    sim: object = None
+    eps: float = float("nan")
+
+    def flux(self, direction: int, where, resolution: float) -> list:
+        """The flux sum Re(E x conj H) . e_direction of the far fields over the points of get_farfields(self,
+        resolution, where) (trapezoidal rule), at each frequency."""
+        return self.sim._near2far_flux(self, direction, where, resolution)
 
 
 @dataclass
@@ -265,12 +285,12 @@ class Simulation:
             raise NotImplementedError("a mode monitor has exactly one region")
         return self._add_monitor(freqs, regions, mode=True)
 
-    def _add_monitor(self, freqs, regions, mode):
+    def _add_monitor(self, freqs, regions, mode, cls=_Monitor):
         if self._done:
             raise RuntimeError("add monitors before run()")
         if not regions:
             raise ValueError("no regions")
-        mon = _Monitor(freqs=np.asarray(freqs, float), regions=regions, mode=mode)
+        mon = cls(freqs=np.asarray(freqs, float), regions=regions, mode=mode)
         k = len(self._monitors)
         for j, r in enumerate(regions):
             mon.names.append(f"mon{k}_{j}")
@@ -363,6 +383,119 @@ class Simulation:
                 alpha[ib, :, 1] = (p1 - p2) / (2 * np.sqrt(N))
                 neff[ib] = np.real(np.asarray(det._mode_neff, np.complex128)).reshape(-1)[: len(mon.freqs)]
         return EigCoeffs(alpha, neff)
+
+    # ---------- near-to-far-field transform ----------
+    def add_near2far(self, *args, nperiods: int = 1, **unsupported):
+        """add_near2far(fcen, df, nfreq, Near2FarRegion, ...) or add_near2far(freqs, Near2FarRegion, ...): the DFT
+        fields on the planes of the regions (as add_flux) for get_farfield and get_farfields. 2-D and 3-D cells."""
+        if unsupported:
+            raise NotImplementedError(f"add_near2far: unsupported arguments {sorted(unsupported)}")
+        if nperiods != 1:
+            raise NotImplementedError("nperiods (the sum over periodic copies) is not supported")
+        if self.dims == 1:
+            raise NotImplementedError("the near-to-far-field transform needs a 2-D or 3-D cell")
+        freqs, regions = _freqs(args)
+        mon = self._add_monitor(freqs, regions, mode=False, cls=DftNear2Far)
+        mon.sim = self
+        return mon
+
+    def get_near2far_freqs(self, near2far) -> list:
+        return list(near2far.freqs)
+
+    def get_near2far_data(self, near2far) -> FluxData:
+        """The DFT fields of the planes (for load_minus_near2far_data in a second run)."""
+        return self.get_flux_data(near2far)
+
+    def load_minus_near2far_data(self, near2far, data: FluxData):
+        """Subtract the DFT fields of another run (for example the incident fields) before the transform."""
+        self.load_minus_flux_data(near2far, data)
+
+    def _colocated_points(self, rng) -> np.ndarray:
+        """Coordinates (P, 3) of the DFT fields of the cells in the index ranges rng ((i0, i1) per axis), in the C order
+        of the cells. fdtdx co-locates the six components on the E_z Yee point: the cell center, + dx / 2 along z. An
+        axis of size 0 has the coordinate 0."""
+        axes = [np.zeros(r[1] - r[0]) if self.trivial[a] else
+                self._lo(a) + (np.arange(r[0], r[1]) + (1.0 if a == 2 else 0.5)) * self.dx for a, r in enumerate(rng)]
+        grids = np.meshgrid(*axes, indexing="ij")
+        return np.stack([g.reshape(-1) for g in grids], axis=-1)
+
+    def _near2far_currents(self, n2f):
+        """Positions (N, 3) and current elements J = n x H, M = -n x E (nfreq, N, 3; times the area of the cell, the
+        trapezoidal weight of the plane and the region weight) of all surface cells. Sets n2f.eps: the staircase
+        material of the surface cells (a warning if they have more than one material: the far fields assume one
+        homogeneous medium)."""
+        self._need_run()
+        pos, Js, Ms, eps = [], [], [], []
+        nf = len(n2f.freqs)
+        for j, r in enumerate(n2f.regions):
+            E, H = self._phasors(n2f, j)
+            if n2f.minus is not None:
+                E, H = E - n2f.minus.E[j], H - n2f.minus.H[j]
+            a = n2f.axes[j]
+            b, c = (a + 1) % 3, (a + 2) % 3
+            rng = [self._range(r.center, r.size, ax) for ax in range(3)]
+            w = (r.weight * self._area(a) * self._trapezoid(E.shape[2:], a)).reshape(-1)
+            E, H = E.reshape(nf, 3, -1), H.reshape(nf, 3, -1)
+            J, M = np.zeros((nf, E.shape[2], 3), complex), np.zeros((nf, E.shape[2], 3), complex)
+            J[:, :, b], J[:, :, c] = -H[:, c] * w, H[:, b] * w             # e_a x H
+            M[:, :, b], M[:, :, c] = E[:, c] * w, -E[:, b] * w             # -e_a x E
+            pos.append(self._colocated_points(rng))
+            Js.append(J)
+            Ms.append(M)
+            eps.append(self.eps[tuple(slice(*q) for q in rng)].reshape(-1))
+        eps = np.concatenate(eps)
+        vals, counts = np.unique(eps, return_counts=True)
+        n2f.eps = float(vals[np.argmax(counts)])
+        if len(vals) > 1:
+            warnings.warn(f"the near2far surface crosses {len(vals)} materials (eps {vals.tolist()}); the far fields "
+                          f"use the homogeneous medium eps = {n2f.eps:g} (the material of most surface cells)")
+        return np.concatenate(pos), np.concatenate(Js, axis=1), np.concatenate(Ms, axis=1)
+
+    def get_farfields_at(self, near2far, points) -> dict:
+        """The fields at each point of `points` (P, 3), for all frequencies: {"Ex": (P, nfreq), ..., "Hz": ...}. Not
+        in the MIT package (it gives the points of get_farfields in one call). The points must be outside the
+        near2far surface (inside a closed surface the result is close to zero)."""
+        if not isinstance(near2far, DftNear2Far):
+            raise ValueError("use the object of add_near2far")
+        src, J, M = self._near2far_currents(near2far)
+        triv = next(a for a in range(3) if self.trivial[a]) if self.dims == 2 else None
+        E, H = radiate(points, src, J, M, near2far.freqs, eps=near2far.eps, mu=1.0, trivial_axis=triv,
+                       device=_device() if triv is None else None)
+        return {c: (E if k < 3 else H)[:, :, k % 3].T for k, c in enumerate(_COMPONENTS)}
+
+    def get_farfield(self, near2far, x) -> list:
+        """The fields at the point x (outside the near2far surface; it can be outside the cell): a list of 6 nfreq
+        complex numbers, Ex, Ey, Ez, Hx, Hy, Hz of the first frequency, then of the second, and so on."""
+        ff = self.get_farfields_at(near2far, np.array([tuple(_v3(x))]))
+        return list(np.stack([ff[c][0] for c in _COMPONENTS], axis=1).reshape(-1))
+
+    def _where(self, where, center, size) -> Volume:
+        if where is not None:
+            if center is not None or size is not None:
+                raise ValueError("give where or center and size, not both")
+            return where
+        return Volume(center=Vector3() if center is None else center, size=Vector3() if size is None else size)
+
+    def get_farfields(self, near2far, resolution: float, where=None, center=None, size=None) -> dict:
+        """The fields on a grid of points in the volume `where` (or center and size): {"Ex": array, ..., "Hz": array}.
+        Each axis of the cell with a size above 0 gets floor(size x resolution) points from the low end to the high end
+        of the volume (both included; one point at the center if this is below 2). The arrays have the shape
+        (points of each axis with more than one point, nfreq)."""
+        vol = self._where(where, center, size)
+        pts, shape, _ = farfield_grid(vol.center, vol.size, resolution, [a for a in range(3) if not self.trivial[a]])
+        ff = self.get_farfields_at(near2far, pts)
+        return {c: v.reshape(*shape, len(near2far.freqs)) for c, v in ff.items()}
+
+    def _near2far_flux(self, n2f, direction, where, resolution):
+        vol = self._where(where, None, None)
+        a = int(direction)
+        if a not in (0, 1, 2) or self.trivial[a]:
+            raise ValueError(f"direction must be X, Y or Z, along an axis of size > 0 (got {direction})")
+        pts, _, w = farfield_grid(vol.center, vol.size, resolution, [q for q in range(3) if not self.trivial[q]])
+        ff = self.get_farfields_at(n2f, pts)
+        b, c = "xyz"[(a + 1) % 3], "xyz"[(a + 2) % 3]
+        s = np.real(ff["E" + b] * np.conj(ff["H" + c]) - ff["E" + c] * np.conj(ff["H" + b]))
+        return list((w[:, None] * s).sum(axis=0))
 
     def _filter_pol(self, parity, normal):
         """fdtdx filter_pol ("te": E mostly along the first transverse axis, "tm": the second) for a mode plane.

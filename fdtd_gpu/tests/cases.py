@@ -6,8 +6,9 @@ from __future__ import annotations
 import numpy as np
 
 import fdtd_gpu as fg
-from references import (dipole_flux_3d, disk_resonance, ring_resonance, slab_bloch_frequency,  # noqa: F401
-                        slab_te_neff, slab_tm_neff, tmm_reflectance)
+from references import (dipole_fields_3d, dipole_flux_3d, disk_resonance, line_source_fields_2d,  # noqa: F401
+                        line_source_power_2d, ring_resonance, slab_bloch_frequency, slab_te_neff, slab_tm_neff,
+                        tmm_reflectance)
 
 SRC_REL_MIN = 1e-3     # waveguide: report T only where the source spectrum is above this fraction of its peak
 
@@ -268,3 +269,260 @@ def sheet(resolution: int = 20, n: float = 1.0):
     return dict(freqs=freqs, flux_ratio=flux / ref, phase_H_E=np.angle(hy / ex), impedance=np.abs(ex / hy) * n,
                 seconds=sim.run_seconds, device=sim.device, steps=sim.n_steps, resolution=resolution, n=n,
                 cells=int(np.prod(sim.shape)))
+
+
+# ---------- near-to-far-field transform ----------
+_YEE = {"Ex": (1, .5, .5), "Ey": (.5, 1, .5), "Ez": (.5, .5, 1), "Hx": (.5, 1, 1), "Hy": (1, .5, 1), "Hz": (1, 1, .5)}
+
+
+def yee_point(sim, component: str, center) -> np.ndarray:
+    """The position (um) of the Yee component of the cell that holds `center`: the position of a point source. fdtdx
+    keeps the layout of Taflove (E_x at (i + 1/2, j, k), ...), and the point (i, j, k) is the center of cell (i, j, k)
+    (see fdtd_gpu._averaging). An axis of size 0 has the coordinate 0."""
+    return np.array([0.0 if sim.trivial[a] else sim._lo(a) + (sim._cell(center[a], a) + _YEE[component][a]) * sim.dx
+                     for a in range(3)])
+
+
+def box_regions(cls, half: float, axes=(0, 1, 2)):
+    """The planes of a closed box of half width `half` about the origin on the given axes (weight -1 on the low
+    faces), as FluxRegion or Near2FarRegion."""
+    regions = []
+    for ax in axes:
+        for sign in (-1, 1):
+            c = [0.0, 0.0, 0.0]
+            c[ax] = sign * half
+            sz = [2 * half if a in axes else 0.0 for a in range(3)]
+            sz[ax] = 0
+            regions.append(cls(center=fg.Vector3(*c), size=fg.Vector3(*sz), weight=sign))
+    return regions
+
+
+def sphere_rule(n_theta: int, n_phi: int):
+    """Unit vectors (Q, 3) and weights (Q,) on the unit sphere: Gauss-Legendre in cos(theta), the trapezoidal rule in
+    phi. Exact for polynomials of degree 2 n_theta - 1 in cos(theta) times trigonometric polynomials of degree below
+    n_phi."""
+    ct, wt = np.polynomial.legendre.leggauss(n_theta)
+    ph = 2 * np.pi * np.arange(n_phi) / n_phi
+    st = np.sqrt(1 - ct**2)
+    u = np.stack([np.outer(st, np.cos(ph)), np.outer(st, np.sin(ph)), np.outer(ct, np.ones(n_phi))], axis=-1)
+    return u.reshape(-1, 3), np.outer(wt, np.full(n_phi, 2 * np.pi / n_phi)).reshape(-1)
+
+
+def _ff_arrays(ff):
+    """{"Ex": (P, F), ...} -> E, H (F, P, 3)."""
+    E = np.stack([ff[c].T for c in ("Ex", "Ey", "Ez")], axis=-1)
+    H = np.stack([ff[c].T for c in ("Hx", "Hy", "Hz")], axis=-1)
+    return E, H
+
+
+def _compare(E, E_ref):
+    """Per frequency: the global phase arg sum(E conj E_ref), the complex error max |E exp(-i phase) - E_ref| /
+    max |E_ref| after that phase, and the pattern error max | |E|^2 - |E_ref|^2 | / max |E_ref|^2."""
+    phase = np.angle(np.sum(E * np.conj(E_ref), axis=(1, 2)))
+    scale = np.abs(E_ref).max(axis=(1, 2))
+    err = np.abs(E * np.exp(-1j * phase)[:, None, None] - E_ref).max(axis=(1, 2)) / scale
+    i, i_ref = (np.abs(E) ** 2).sum(-1), (np.abs(E_ref) ** 2).sum(-1)
+    pattern = np.abs(i - i_ref).max(axis=1) / i_ref.max(axis=1)
+    return phase, err, pattern
+
+
+def near2far_dipole(resolution: int = 20, n: float = 1.0, nfreq: int = 5, halves=(1.0, 0.5), component: str = "Ez",
+                    r_far: float = 1000.0, r_near: float = 3.0, n_theta: int = 24, n_phi: int = 48):
+    """3-D point dipole in a homogeneous medium: the near-to-far-field transform from closed boxes of the half widths
+    `halves` (all in one run) against the analytic dipole fields (references.dipole_fields_3d) on a sphere of radius
+    r_far (pattern, complex fields after one global phase, the radiated power) and at r_near (near terms); the power
+    of the far field against the flux through the same box and the analytic power; the far fields of the boxes
+    against each other. API: get_farfield against get_farfields_at, the shape of get_farfields, and DftNear2Far.flux
+    through a cube of half width 0.1 r_far against the power on the sphere."""
+    import time
+
+    pml = 1.0
+    s = 2 * (pml + max(halves) + 0.5)
+    fcen, df = 0.5, 0.2
+    gs = fg.GaussianSource(fcen, fwidth=df)
+    sim = fg.Simulation(cell_size=fg.Vector3(s, s, s), resolution=resolution, sources=[fg.Source(gs, component)],
+                        boundary_layers=[fg.PML(pml)], default_material=fg.Medium(index=n))
+    n2fs = [sim.add_near2far(fcen, df, nfreq, *box_regions(fg.Near2FarRegion, h)) for h in halves]
+    boxes = [sim.add_flux(fcen, df, nfreq, *box_regions(fg.FluxRegion, h)) for h in halves]
+    sim.run(until_after_sources=20)
+    freqs = np.array(sim.get_near2far_freqs(n2fs[0]))
+    current = gs.fourier_transform(freqs)
+    r0 = yee_point(sim, component, fg.Vector3())
+    axis = "xyz".index(component[1])
+    u, w = sphere_rule(n_theta, n_phi)
+    p_far = r0 + r_far * u
+    E_ref, _ = dipole_fields_3d(p_far, freqs, n, current, r0, axis)
+    p_near = r0 + r_near * u[:: max(1, len(u) // 200)]
+    E_ref_near, _ = dipole_fields_3d(p_near, freqs, n, current, r0, axis)
+    P_exact = dipole_flux_3d(freqs, n, current)
+    rows = []
+    t0 = time.perf_counter()
+    for h, n2f, box in zip(halves, n2fs, boxes):
+        E, H = _ff_arrays(sim.get_farfields_at(n2f, p_far))
+        P_far = r_far**2 * (w * np.real(np.cross(E, np.conj(H)) * u).sum(-1)).sum(-1)
+        flux = np.array(sim.get_fluxes(box))
+        phase, err, pattern = _compare(E, E_ref)
+        En, _ = _ff_arrays(sim.get_farfields_at(n2f, p_near))
+        _, err_near, _ = _compare(En * np.exp(-1j * phase)[:, None, None], E_ref_near)
+        rows.append(dict(half=h, E=E, P_far=P_far, flux=flux, phase=phase, err=err, pattern=pattern,
+                         err_near=err_near))
+    ff_seconds = (time.perf_counter() - t0) / len(halves)
+    n2f = n2fs[0]
+    one = np.array(sim.get_farfield(n2f, fg.Vector3(*p_far[7]))).reshape(len(freqs), 6)
+    E7, H7 = _ff_arrays(sim.get_farfields_at(n2f, p_far[7:8]))
+    api_point = np.abs(one - np.concatenate([E7[:, 0], H7[:, 0]], axis=-1)).max() / np.abs(one).max()
+    plane = sim.get_farfields(n2f, 5, center=fg.Vector3(0, 0, 20), size=fg.Vector3(4, 2, 0))     # 20 x 10 points
+    L = 0.1 * r_far
+    flux_cube = np.zeros(len(freqs))
+    for reg in box_regions(fg.FluxRegion, L):                                     # 40 x 40 points per face
+        a = int(np.argmin(tuple(reg.size)))
+        flux_cube += reg.weight * np.array(n2f.flux(a, fg.Volume(center=reg.center, size=reg.size), 20 / L))
+    r = rows[0]
+    return dict(freqs=freqs, component=component, n=n, resolution=resolution, halves=list(halves),
+                far_over_flux=np.array([q["P_far"] / q["flux"] for q in rows]),
+                far_over_exact=np.array([q["P_far"] / P_exact for q in rows]),
+                flux_over_exact=np.array([q["flux"] / P_exact for q in rows]),
+                field_err=np.array([q["err"] for q in rows]), pattern_err=np.array([q["pattern"] for q in rows]),
+                near_err=np.array([q["err_near"] for q in rows]), phase=np.array([q["phase"] for q in rows]),
+                omega_dt_half=np.pi * freqs * sim.dt,
+                box_diff=np.abs(rows[0]["E"] - rows[1]["E"]).max(axis=(1, 2)) / np.abs(r["E"]).max(axis=(1, 2)),
+                api_point=api_point, plane_shape=list(plane["Ez"].shape),
+                cube_over_far=flux_cube / r["P_far"], r0=r0, eps=n2f.eps,
+                seconds=sim.run_seconds, farfield_seconds=ff_seconds, device=sim.device, steps=sim.n_steps,
+                cells=int(np.prod(sim.shape)))
+
+
+def near2far_line(resolution: int = 20, n: float = 1.0, nfreq: int = 5, halves=(1.0, 0.5), component: str = "Ez",
+                  r_far: float = 1000.0, r_near: float = 3.0, n_phi: int = 72, run_after: float = 40.0):
+    """2-D line source (x-y cell) in a homogeneous medium: the near-to-far-field transform (2-D Hankel form) from
+    closed squares of the half widths `halves` against the analytic line-source fields (references.
+    line_source_fields_2d) on a circle of radius r_far (pattern, complex fields after one global phase, power) and
+    at r_near; the power of the far field against the flux through the same square and the analytic power
+    (references.line_source_power_2d); the far fields of the squares against each other; DftNear2Far.flux through a
+    square of half width 0.1 r_far against the power on the circle. component: "Ez" (E normal to the plane) or
+    "Ex" (E in the plane)."""
+    import time
+
+    pml = 1.0
+    s = 2 * (pml + max(halves) + 0.5)
+    fcen, df = 0.5, 0.2
+    gs = fg.GaussianSource(fcen, fwidth=df)
+    sim = fg.Simulation(cell_size=fg.Vector3(s, s, 0), resolution=resolution, sources=[fg.Source(gs, component)],
+                        boundary_layers=[fg.PML(pml)], default_material=fg.Medium(index=n))
+    n2fs = [sim.add_near2far(fcen, df, nfreq, *box_regions(fg.Near2FarRegion, h, (0, 1))) for h in halves]
+    boxes = [sim.add_flux(fcen, df, nfreq, *box_regions(fg.FluxRegion, h, (0, 1))) for h in halves]
+    sim.run(until_after_sources=run_after)
+    freqs = np.array(sim.get_near2far_freqs(n2fs[0]))
+    current = gs.fourier_transform(freqs)
+    r0 = yee_point(sim, component, fg.Vector3())
+    phi = 2 * np.pi * np.arange(n_phi) / n_phi
+    u = np.stack([np.cos(phi), np.sin(phi), np.zeros(n_phi)], axis=-1)
+    E_ref, _ = line_source_fields_2d(r0 + r_far * u, freqs, n, current, r0, component)
+    E_ref_near, _ = line_source_fields_2d(r0 + r_near * u, freqs, n, current, r0, component)
+    P_exact = line_source_power_2d(freqs, current, in_plane=component != "Ez")
+    rows = []
+    t0 = time.perf_counter()
+    for h, n2f, box in zip(halves, n2fs, boxes):
+        E, H = _ff_arrays(sim.get_farfields_at(n2f, r0 + r_far * u))
+        P_far = r_far * 2 * np.pi / n_phi * np.real(np.cross(E, np.conj(H)) * u).sum(-1).sum(-1)
+        flux = np.array(sim.get_fluxes(box))
+        phase, err, pattern = _compare(E, E_ref)
+        En, _ = _ff_arrays(sim.get_farfields_at(n2f, r0 + r_near * u))
+        _, err_near, _ = _compare(En * np.exp(-1j * phase)[:, None, None], E_ref_near)
+        rows.append(dict(E=E, P_far=P_far, flux=flux, phase=phase, err=err, pattern=pattern, err_near=err_near))
+    ff_seconds = (time.perf_counter() - t0) / len(halves)
+    n2f = n2fs[0]
+    L = 0.1 * r_far
+    flux_sq = np.zeros(len(freqs))
+    for reg in box_regions(fg.FluxRegion, L, (0, 1)):                             # 200 points per side
+        a = int(np.argmin(tuple(reg.size)[:2]))
+        flux_sq += reg.weight * np.array(n2f.flux(a, fg.Volume(center=reg.center, size=reg.size), 100 / L))
+    r = rows[0]
+    return dict(freqs=freqs, component=component, n=n, resolution=resolution, halves=list(halves),
+                far_over_flux=np.array([q["P_far"] / q["flux"] for q in rows]),
+                far_over_exact=np.array([q["P_far"] / P_exact for q in rows]),
+                flux_over_exact=np.array([q["flux"] / P_exact for q in rows]),
+                field_err=np.array([q["err"] for q in rows]), pattern_err=np.array([q["pattern"] for q in rows]),
+                near_err=np.array([q["err_near"] for q in rows]), phase=np.array([q["phase"] for q in rows]),
+                omega_dt_half=np.pi * freqs * sim.dt,
+                box_diff=np.abs(rows[0]["E"] - rows[1]["E"]).max(axis=(1, 2)) / np.abs(r["E"]).max(axis=(1, 2)),
+                square_over_far=flux_sq / r["P_far"], r0=r0, eps=n2f.eps,
+                seconds=sim.run_seconds, farfield_seconds=ff_seconds, device=sim.device, steps=sim.n_steps,
+                cells=int(np.prod(sim.shape)))
+
+
+def closed_surface(half: float, h: float, axes):
+    """Points (N, 3), outward normals (N, 3) and trapezoidal weights (N,) of a closed box (3-D, axes (0, 1, 2)) or
+    square (2-D, axes (0, 1); the weights are lengths) of half width `half`, spacing h."""
+    m = int(round(2 * half / h)) + 1
+    t = np.linspace(-half, half, m)
+    wt = np.full(m, 2 * half / (m - 1))
+    wt[[0, -1]] *= 0.5
+    pts, nrm, wts = [], [], []
+    for a in axes:
+        tang = [q for q in axes if q != a]
+        grids = np.meshgrid(*[t] * len(tang), indexing="ij")
+        w = np.ones(1)
+        for _ in tang:
+            w = np.multiply.outer(w, wt)
+        for sign in (-1, 1):
+            p = np.zeros((grids[0].size, 3))
+            p[:, a] = sign * half
+            for q, g in zip(tang, grids):
+                p[:, q] = g.reshape(-1)
+            nv = np.zeros_like(p)
+            nv[:, a] = sign
+            pts.append(p)
+            nrm.append(nv)
+            wts.append(w.reshape(-1))
+    return np.concatenate(pts), np.concatenate(nrm), np.concatenate(wts)
+
+
+def transform_exact(dims: int = 3, component: str = "Ez", h: float = 0.05, n: float = 1.5, half: float = 1.0,
+                    freqs=(0.4, 0.6), compare_backends: bool = False):
+    """The transform of exact fields (no FDTD): the fields of a point dipole (3-D, references.dipole_fields_3d) or of
+    a line current (2-D, references.line_source_fields_2d) at r0 = (0.1, -0.05, 0.07) (z = 0 in 2-D) on a closed
+    box or square (half width `half`, spacing h, trapezoidal rule) against the exact fields at 1000 um and 3 um from
+    r0 (max |error| / max |exact|), and inside the surface at 0.4 um from r0 (max |E| / min |E_exact|: the
+    extinction theorem gives zero). compare_backends (3-D): the JAX and NumPy sums on the far points."""
+    import time
+
+    from fdtd_gpu.near2far import radiate
+
+    freqs = np.asarray(freqs, float)
+    if dims == 3:
+        r0 = np.array([0.1, -0.05, 0.07])
+        u, _ = sphere_rule(8, 16)
+        axes, triv, inside = (0, 1, 2), None, r0 + 0.4 * u[::8]
+
+        def exact(p):
+            return dipole_fields_3d(p, freqs, n, 1.0, r0, "xyz".index(component[1]))
+    else:
+        r0 = np.array([0.1, -0.05, 0.0])
+        phi = 2 * np.pi * np.arange(36) / 36
+        u = np.stack([np.cos(phi), np.sin(phi), np.zeros_like(phi)], axis=-1)
+        axes, triv, inside = (0, 1), 2, r0 + 0.4 * u[::4]
+
+        def exact(p):
+            return line_source_fields_2d(p, freqs, n, 1.0, r0, component)
+    far, near = r0 + 1000 * u, r0 + 3 * u
+    pts, nrm, w = closed_surface(half, h, axes)
+    E, H = exact(pts)
+    J, M = np.cross(nrm, H) * w[:, None], -np.cross(nrm, E) * w[:, None]
+    t0 = time.perf_counter()
+    Et, Ht = radiate(np.concatenate([far, near, inside]), pts, J, M, freqs, eps=n * n, trivial_axis=triv)
+    seconds = time.perf_counter() - t0
+    nf, nn = len(far), len(near)
+    (Ef, Hf), (En, _), (Ei, _) = exact(far), exact(near), exact(inside)
+
+    def rel(a, b):
+        return float(np.abs(a - b).max() / np.abs(b).max())
+    out = dict(dims=dims, component=component, h=h, n=n, half=half, freqs=freqs, surface_cells=len(pts),
+               far_E=rel(Et[:, :nf], Ef), far_H=rel(Ht[:, :nf], Hf), near_E=rel(Et[:, nf:nf + nn], En),
+               inside=float(np.linalg.norm(Et[:, nf + nn:], axis=-1).max() / np.linalg.norm(Ei, axis=-1).min()),
+               seconds=seconds)
+    if compare_backends and dims == 3:
+        Enp, _ = radiate(far, pts, J, M, freqs, eps=n * n, backend="numpy")
+        Ejx, _ = radiate(far, pts, J, M, freqs, eps=n * n, backend="jax")
+        out["jax_vs_numpy"] = rel(Ejx, Enp)
+    return out

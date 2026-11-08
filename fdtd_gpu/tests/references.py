@@ -121,3 +121,86 @@ def disk_resonance(m: int, f_guess: complex, n: float, radius: float, te: bool =
     with warnings.catch_warnings():     # Newton steps near a pole of J_m or H_m: NaN steps, harmless; keep stderr clean
         warnings.simplefilter("ignore", RuntimeWarning)
         return complex(optimize.newton(g, complex(f_guess), x1=complex(f_guess) * (1 + 1e-4), tol=1e-13, maxiter=200))
+
+
+def dipole_fields_3d(points, f, n: float, current, r0=(0.0, 0.0, 0.0), axis: int = 2):
+    """E and H (nfreq, P, 3) of a point current element (current moment I l = current(f), along `axis`) at r0 in a
+    homogeneous medium of index n (mu = 1), at each distance (near and far terms). Spherical components about the
+    dipole axis a (Balanis, Antenna Theory, 3rd ed., Sec. 4.2, the infinitesimal dipole, with j -> -i for the time
+    dependence exp(-i omega t)), eta = 1 / n:
+        E_r = eta I l cos(theta) / (2 pi r^2) (1 + i / (k r)) exp(i k r)
+        E_theta = -i eta k I l sin(theta) / (4 pi r) (1 + i / (k r) - 1 / (k r)^2) exp(i k r)
+        H_phi = -i k I l sin(theta) / (4 pi r) (1 + i / (k r)) exp(i k r)
+    with E_theta theta_hat = (E_theta / sin(theta)) (cos(theta) r_hat - a) and H_phi phi_hat = (H_phi / sin(theta))
+    (a x r_hat). Units c = 1, eps0 = mu0 = 1."""
+    f = np.atleast_1d(np.asarray(f, float))
+    current = np.broadcast_to(np.asarray(current, complex), f.shape)
+    d = np.atleast_2d(np.asarray(points, float)) - np.asarray(r0, float)
+    r = np.linalg.norm(d, axis=1)
+    rh = d / r[:, None]
+    a = np.zeros(3)
+    a[axis] = 1.0
+    ct = rh @ a
+    th_dir = ct[:, None] * rh - a                                  # sin(theta) theta_hat
+    ph_dir = np.cross(a, rh)                                       # sin(theta) phi_hat
+    eta = 1.0 / n
+    E = np.zeros((len(f), len(r), 3), complex)
+    H = np.zeros_like(E)
+    for i, (fi, I) in enumerate(zip(f, current)):
+        k = 2 * np.pi * fi * n
+        kr = k * r
+        ph = np.exp(1j * kr)
+        er = eta * I * ct / (2 * np.pi * r**2) * (1 + 1j / kr) * ph
+        eth = -1j * eta * k * I / (4 * np.pi * r) * (1 + 1j / kr - 1 / kr**2) * ph       # / sin(theta)
+        hph = -1j * k * I / (4 * np.pi * r) * (1 + 1j / kr) * ph                          # / sin(theta)
+        E[i] = er[:, None] * rh + eth[:, None] * th_dir
+        H[i] = hph[:, None] * ph_dir
+    return E, H
+
+
+def line_source_fields_2d(points, f, n: float, current, r0=(0.0, 0.0), component: str = "Ez"):
+    """E and H (nfreq, P, 3) of a line current I = current(f) (per unit length along z) at r0 in the x-y plane, in a
+    homogeneous medium of index n (mu = 1); x = k rho, H_m the Hankel functions of the first kind (time dependence
+    exp(-i omega t); the 2-D Green's function (i/4) H0(k rho), for example Chew, Waves and Fields in Inhomogeneous
+    Media, ch. 2). From the vector potential A = mu g I:
+    - "Ez" (current along z): E_z = -(omega mu I / 4) H0(x), H_phi = (i k I / 4) H1(x).
+    - "Ex" or "Ey" (current along a in the plane, b = z x a, phi' the angle from a): H_z = (i k I / 4) H1(x) sin(phi'),
+      and E = (i / (omega eps)) curl H: E_a = -(omega mu I / 4) [(H0 - H1/x) sin^2(phi') + (H1/x) cos^2(phi')],
+      E_b = (omega mu I / 4) sin(phi') cos(phi') (H0 - 2 H1/x)."""
+    f = np.atleast_1d(np.asarray(f, float))
+    current = np.broadcast_to(np.asarray(current, complex), f.shape)
+    p = np.atleast_2d(np.asarray(points, float))
+    d = p[:, :2] - np.asarray(r0, float)[:2]
+    rho = np.linalg.norm(d, axis=1)
+    c, s = d[:, 0] / rho, d[:, 1] / rho
+    E = np.zeros((len(f), len(rho), 3), complex)
+    H = np.zeros_like(E)
+    for i, (fi, I) in enumerate(zip(f, current)):
+        om = 2 * np.pi * fi
+        k = om * n
+        x = k * rho
+        h0, h1 = special.hankel1(0, x), special.hankel1(1, x)
+        if component == "Ez":
+            E[i, :, 2] = -om * I / 4 * h0
+            hphi = 1j * k * I / 4 * h1
+            H[i, :, 0], H[i, :, 1] = -hphi * s, hphi * c
+            continue
+        if component not in ("Ex", "Ey"):
+            raise ValueError(component)
+        a = np.array([1.0, 0.0]) if component == "Ex" else np.array([0.0, 1.0])
+        b = np.array([-a[1], a[0]])                                   # z x a
+        cp, sp = c * a[0] + s * a[1], c * b[0] + s * b[1]             # cos(phi'), sin(phi')
+        H[i, :, 2] = 1j * k * I / 4 * h1 * sp
+        ea = -om * I / 4 * ((h0 - h1 / x) * sp**2 + h1 / x * cp**2)
+        eb = om * I / 4 * sp * cp * (h0 - 2 * h1 / x)
+        E[i, :, :2] = ea[:, None] * a + eb[:, None] * b
+    return E, H
+
+
+def line_source_power_2d(f, current, in_plane: bool = False):
+    """Radiated power per unit length of a line current I in the DFT convention of the monitors (twice the time
+    average |I|^2 eta k / 8 = omega |I|^2 / 8 of a harmonic current; it does not depend on n): omega |I|^2 / 4 for a
+    current along z, half of it for a current in the plane (the pattern sin^2)."""
+    om = 2 * np.pi * np.asarray(f, float)
+    p = om * np.abs(current) ** 2 / 4
+    return p / 2 if in_plane else p
