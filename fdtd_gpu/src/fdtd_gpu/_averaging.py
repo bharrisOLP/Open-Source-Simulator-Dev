@@ -19,10 +19,16 @@ each other voxel the material is sampled (the last object that contains the poin
 - the normal n: the first moment of eps with the weight max(0, 1 - r^2 / R^2) over a regular grid (NORMAL_N points
   per axis) in the circumscribed ball of the voxel (radius R = sqrt(d) dx / 2). By the mirror symmetry of the grid,
   the moment of a plane normal to an axis is along that axis; for a slanted plane it is close to the normal.
-The component a takes the diagonal of the anisotropic average of Kottke et al.:
-    1 / eps_aa = n_a^2 <1/eps> + (1 - n_a^2) / <eps>.
+The component a takes the diagonal of the inverse of the anisotropic average of Kottke et al. (the tensor
+eps_eff^-1 = P <1/eps> + (1 - P) / <eps>, P = n n^T):
+    1 / eps_aa = (eps_eff^-1)_aa = n_a^2 <1/eps> + (1 - n_a^2) / <eps>.
 The off-diagonal terms are dropped, so fdtdx keeps its elementwise update. For a plane normal to an axis this is
-the full tensor; for a slanted or curved interface the off-diagonal terms are lost (Meep keeps them).
+the full tensor; for a slanted or curved interface the off-diagonal terms are lost (the MIT package keeps them), and
+the error with E in the plane of a curved interface is first order. DIAGONAL = "forward" keeps the diagonal of the
+forward tensor in its place, eps_aa = n_a^2 / <1/eps> + (1 - n_a^2) <eps> (as the smoothing of fdtdx itself); the
+two are equal when n is along an axis or normal to a.
+Periodic axes: the staircase index wraps, the sample coordinates go back into the cell, and the objects repeat
+across the faces (`geometry.periodic_shifts`), as in the MIT package.
 Small problems are sampled with NumPy; larger ones with one jit-compiled JAX function on the default device (the
 GPU), in chunks of about CHUNK_POINTS sample points.
 """
@@ -39,7 +45,8 @@ LATTICE_N = {1: 1024, 2: 987, 3: 1021}      # lattice points before the symmetri
 FIBONACCI = {987: 610}                       # 2-D: n = F_16, generator F_15
 NORMAL_N = {1: 16, 2: 24, 3: 12}             # points per axis of the regular grid for the normal
 CHUNK_POINTS = 1 << 22
-NUMPY_MAX = 10_000_000                       # sampled points x objects up to which NumPy is used
+NUMPY_MAX = 10_000_000                       # sampled points x object copies up to which NumPy is used
+DIAGONAL = "inverse"                         # "inverse" (Kottke et al.) or "forward" (see the module text)
 
 
 @functools.lru_cache(maxsize=None)
@@ -88,11 +95,17 @@ def normal_grid(d: int) -> tuple[np.ndarray, np.ndarray]:
     return pts, np.maximum(0.0, 1.0 - (pts**2).sum(axis=1) / rad**2)
 
 
-def interface_voxels(idx: np.ndarray, a: int, trivial) -> np.ndarray:
+def interface_voxels(idx: np.ndarray, a: int, trivial, periodic=(False, False, False)) -> np.ndarray:
     """True where the voxel of E_a may hold more than one material: the staircase index differs among the cells
-    i and i + 1 along a and i - 1, i, i + 1 along each other axis of size > 0 (edge cells repeat at the faces)."""
-    pad = [(0, 0) if trivial[b] else ((0, 1) if b == a else (1, 1)) for b in range(3)]
-    p = np.pad(idx, pad, mode="edge")
+    i and i + 1 along a and i - 1, i, i + 1 along each other axis of size > 0 (at a face the edge cell repeats; at
+    a periodic face the cell of the other side)."""
+    p = idx
+    for b in range(3):
+        if trivial[b]:
+            continue
+        width = [(0, 0)] * 3
+        width[b] = (0, 1) if b == a else (1, 1)
+        p = np.pad(p, width, mode="wrap" if periodic[b] else "edge")
     ranges = [[0] if trivial[b] else ([0, 1] if b == a else [0, 1, 2]) for b in range(3)]
     n = idx.shape
     mx = mn = None
@@ -103,15 +116,32 @@ def interface_voxels(idx: np.ndarray, a: int, trivial) -> np.ndarray:
     return mx != mn
 
 
-def _inv_eps_chunk(pos, onehot, *, xp, geometry, obj_mat, eps_tab, trivial, offsets, n_lat, nrm, ball):
+def _inv_eps_chunk(pos, onehot, *, xp, geometry, obj_mat, shifts, eps_tab, trivial, periods, offsets, n_lat, nrm,
+                   ball, forward):
     """1 / eps_aa of the voxels centered at pos (C, 3). onehot: (d,) selects the component axis among the axes of
     size > 0 (all zero for a component along an axis of size 0). offsets: (S, d) sample offsets in um (the lattice,
-    then the normal grid); nrm: (N, d) the normal grid in cell units; ball: (N,) its weights (`normal_grid`)."""
+    then the normal grid); nrm: (N, d) the normal grid in cell units; ball: (N,) its weights (`normal_grid`).
+    periods: the cell length (um) of each periodic axis, else None: there the sample coordinates go back into the
+    cell, and shifts (one list per object, `geometry.periodic_shifts`) give the copies of the objects.
+    forward: keep the diagonal of the forward tensor (see DIAGONAL) in place of the inverse tensor."""
     nt = [b for b in range(3) if not trivial[b]]
-    coords = [0.0 if trivial[b] else pos[:, b:b + 1] + offsets[None, :, nt.index(b)] for b in range(3)]
+    coords = []
+    for b in range(3):
+        if trivial[b]:
+            coords.append(0.0)
+            continue
+        c = pos[:, b:b + 1] + offsets[None, :, nt.index(b)]
+        if periods[b] is not None:
+            c = xp.mod(c + periods[b] / 2, periods[b]) - periods[b] / 2
+        coords.append(c)
     mat = xp.zeros(coords[nt[0]].shape, xp.int32)
-    for obj, k in zip(geometry, obj_mat):
-        mat = xp.where(obj.contains(*coords), k, mat)
+    for obj, k, obj_shifts in zip(geometry, obj_mat, shifts):
+        inside = None
+        for s in obj_shifts:
+            q = obj.contains(*[c if trivial[b] or s[b] == 0 else c - s[b] for b, c in enumerate(coords)])
+            inside = q if inside is None else inside | q
+        if inside is not None:
+            mat = xp.where(inside, k, mat)
     eps = eps_tab[mat]
     el, en = eps[:, :n_lat], eps[:, n_lat:]
     m_eps = el.mean(axis=1)
@@ -121,16 +151,22 @@ def _inv_eps_chunk(pos, onehot, *, xp, geometry, obj_mat, eps_tab, trivial, offs
     mom = xp.stack([(dev * (ball * nrm[:, k])[None, :]).sum(axis=1) for k in range(nrm.shape[1])], axis=1)
     nm2 = (mom**2).sum(axis=1)
     na2 = xp.where(nm2 > 0, (mom * onehot[None, :]).sum(axis=1) ** 2 / xp.where(nm2 > 0, nm2, 1.0), 0.0)
+    if forward:
+        return 1.0 / (na2 / m_inv + (1.0 - na2) * m_eps)
     return na2 * m_inv + (1.0 - na2) / m_eps
 
 
-def averaged_permittivity(geometry, materials, idx: np.ndarray, dx: float, trivial,
+def averaged_permittivity(geometry, materials, idx: np.ndarray, dx: float, trivial, periodic=(False, False, False),
                           backend: str = "auto") -> tuple[np.ndarray, int]:
     """The permittivity of each E component, (3, *idx.shape) float32, and the number of sampled voxels.
 
-    geometry, materials, idx: the objects, the material list and the staircase index of `geometry.rasterize`.
-    backend: "numpy", "jax" or "auto" (NumPy up to NUMPY_MAX sampled points x objects)."""
+    geometry, materials, idx: the objects, the material list and the staircase index of `geometry.rasterize` (with
+    the same periodic axes). periodic: True for an axis with periodic faces (the objects repeat, as in the MIT
+    package). backend: "numpy", "jax" or "auto" (NumPy up to NUMPY_MAX sampled points x objects)."""
+    from fdtd_gpu.geometry import periodic_shifts
+
     shape = idx.shape
+    per = tuple(bool(p) and not t for p, t in zip(periodic, trivial))
     mats, obj_mat = list(materials), []
     for o in geometry:                     # an object that holds no cell center is not in the list yet
         j = next((j for j, m in enumerate(mats) if m is o.material), None)
@@ -144,15 +180,20 @@ def averaged_permittivity(geometry, materials, idx: np.ndarray, dx: float, trivi
     if not nt:
         return out, 0
     d = len(nt)
-    cells = [np.argwhere(interface_voxels(idx, a, trivial)) for a in range(3)]
+    cells = [np.argwhere(interface_voxels(idx, a, trivial, per)) for a in range(3)]
     n_sampled = sum(len(c) for c in cells)
     if n_sampled == 0:
         return out, 0
     lat, (nrm, ball) = lattice(d), normal_grid(d)
     offsets = np.concatenate([lat, nrm]) * dx
     lo = np.array([-n * dx / 2 for n in shape])
-    use_jax = backend == "jax" or (backend == "auto" and n_sampled * len(offsets) * len(geometry) > NUMPY_MAX)
-    kw = dict(geometry=geometry, obj_mat=obj_mat, trivial=tuple(trivial), n_lat=len(lat))
+    shifts = [periodic_shifts(o, per, shape, dx) for o in geometry]
+    use_jax = backend == "jax" or (backend == "auto" and
+                                   n_sampled * len(offsets) * sum(len(s) for s in shifts) > NUMPY_MAX)
+    if DIAGONAL not in ("inverse", "forward"):
+        raise ValueError(f"DIAGONAL must be 'inverse' or 'forward', not {DIAGONAL!r}")
+    kw = dict(geometry=geometry, obj_mat=obj_mat, shifts=shifts, trivial=tuple(trivial), n_lat=len(lat),
+              periods=tuple(shape[b] * dx if per[b] else None for b in range(3)), forward=DIAGONAL == "forward")
     if use_jax:
         import jax
         import jax.numpy as jnp

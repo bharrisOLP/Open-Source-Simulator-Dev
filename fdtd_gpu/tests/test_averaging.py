@@ -61,9 +61,22 @@ def test_plane_normal_to_axis(three_d):
     assert np.any((f_par > 0.05) & (f_par < 0.95)) and np.any((f_nor > 0.05) & (f_nor < 0.95))
 
 
-def test_slanted_plane_kottke_diagonal():
-    """A plane at 30 degrees in a 2-D cell: each averaged component against the diagonal of the Kottke tensor,
-    1 / eps_aa = n_a^2 <1/eps> + (1 - n_a^2) / <eps>, with the exact fill fraction and the exact normal."""
+def _kottke_diag(f, n2, forward=False):
+    """The averaged eps of a component for the fill fraction f of E2 in E1 and n_a^2 = n2: the diagonal of the
+    inverse tensor of Kottke et al. (or of the forward tensor)."""
+    mean, inv_mean = f * E2 + (1 - f) * E1, f / E2 + (1 - f) / E1
+    if forward:
+        return n2 / inv_mean + (1 - n2) * mean
+    return 1 / (n2 * inv_mean + (1 - n2) / mean)
+
+
+@pytest.mark.parametrize("diagonal", ["inverse", "forward"])
+def test_slanted_plane_kottke_diagonal(diagonal, monkeypatch):
+    """A plane at 30 degrees in a 2-D cell: each averaged component against the diagonal of the inverse Kottke
+    tensor, 1 / eps_aa = n_a^2 <1/eps> + (1 - n_a^2) / <eps> (or of the forward tensor with DIAGONAL = "forward"),
+    with the exact fill fraction and the exact normal."""
+    import fdtd_gpu._averaging as av
+    monkeypatch.setattr(av, "DIAGONAL", diagonal)
     dx, th, c0 = 0.1, np.deg2rad(30.0), 0.0123
     nx, ny = np.cos(th), np.sin(th)
     big = 50.0                                     # half-plane nx x + ny y < c0 as a large triangle
@@ -81,20 +94,72 @@ def test_slanted_plane_kottke_diagonal():
         xe = (c0 - ny * y) / nx
         return np.clip((xe - (x0 - dx / 2)) / dx, 0, 1).mean()
 
-    errs, n_iface = [], 0
+    errs = []
     for a, (sx, sy) in enumerate(((dx / 2, 0), (0, dx / 2), (0, 0))):
-        n2 = (nx**2, ny**2, 0.0)[a]
         for i in range(12):
             for j in range(12):
                 f = fill(cc[i] + sx, cc[j] + sy)
-                if not 0.02 < f < 0.98:
-                    continue
-                n_iface += 1
-                inv = n2 * (f / E2 + (1 - f) / E1) + (1 - n2) / (f * E2 + (1 - f) * E1)
-                errs.append(abs(eps[a, i, j, 0] * inv - 1))
-    assert n_iface > 20
-    assert max(errs) < 2e-2, max(errs)             # the normal of the 16 x 16 grid: O(1 / 16)
-    assert np.median(errs) < 5e-3, np.median(errs)
+                if 0.02 < f < 0.98:
+                    errs.append(abs(eps[a, i, j, 0] / _kottke_diag(f, (nx**2, ny**2, 0.0)[a], diagonal == "forward")
+                                    - 1))
+    assert len(errs) > 20
+    assert max(errs) < 2e-2 and np.median(errs) < 5e-3, (max(errs), np.median(errs))     # the 24 x 24 normal grid
+
+
+def test_slanted_plane_3d():
+    """A plane with the normal (2, 3, 6) / 7 in a 3-D cell (a sphere of radius 1e4 um: its sagitta over the cell is
+    below 3e-5 um): each averaged component against the diagonal of the inverse Kottke tensor with the exact fill
+    fraction and the exact normal (the 12 x 12 x 12 normal grid)."""
+    dx, c0, rad = 0.1, 0.0123, 1.0e4
+    nv = np.array([2.0, 3.0, 6.0]) / 7.0
+    ctr = nv * (c0 - rad)
+    sph = fg.Sphere(radius=rad, center=fg.Vector3(*ctr), material=fg.Medium(epsilon=E2))
+    shape = (8, 8, 8)
+    eps = _avg([sph], shape, dx, (False, False, False))
+    cc = (np.arange(8) + 0.5) * dx - 0.4
+    g = (np.arange(300) + 0.5) / 300 - 0.5
+    gu, gv = np.meshgrid(g * dx, g * dx, indexing="ij")
+
+    def fill(q):                                   # exact: the z extent below the plane, over a 300 x 300 grid in x, y
+        zc = (c0 - nv[0] * (q[0] + gu) - nv[1] * (q[1] + gv)) / nv[2]
+        return np.clip((zc - (q[2] - dx / 2)) / dx, 0, 1).mean()
+
+    errs = []
+    for a in range(3):
+        for i, j, k in np.ndindex(*shape):
+            q = np.array([cc[i], cc[j], cc[k]])
+            q[a] += dx / 2
+            f = fill(q)
+            if 0.02 < f < 0.98:
+                errs.append(abs(eps[a, i, j, k] / _kottke_diag(f, nv[a] ** 2) - 1))
+    assert len(errs) > 50
+    assert max(errs) < 3e-2 and np.median(errs) < 1e-2, (len(errs), max(errs), np.median(errs))
+
+
+def test_periodic_faces_repeat_objects():
+    """On a periodic axis the objects repeat, as in the MIT package: a block of the length of the period gives the
+    same staircase and averaged permittivity as an infinite block, and a block across the periodic face the same as
+    that block moved by one period. A Simulation with k_point and a PML only along y has x periodic."""
+    dx, shape, trivial, per = 1 / 40, (20, 80, 3), (False, False, True), (True, False, False)
+    si = fg.Medium(index=3.45)
+
+    def run(geom):
+        idx, mats = rasterize(geom, fg.Medium(index=1.45), shape, dx, trivial, per)
+        return idx, averaged_permittivity(geom, mats, idx, dx, trivial, per, backend="numpy")[0]
+
+    a = run([fg.Block(size=fg.Vector3(fg.inf, 0.37, fg.inf), material=si)])
+    b = run([fg.Block(size=fg.Vector3(0.5, 0.37, fg.inf), material=si)])
+    c = run([fg.Block(size=fg.Vector3(0.2137, 0.37, fg.inf), center=fg.Vector3(0.25, 0.1), material=si)])
+    d = run([fg.Block(size=fg.Vector3(0.2137, 0.37, fg.inf), center=fg.Vector3(-0.25, 0.1), material=si)])
+    for u, v in ((a, b), (c, d)):
+        assert np.array_equal(u[0], v[0]) and np.allclose(u[1], v[1], rtol=1e-9, atol=0)
+    assert c[0][0, 44, 0] == 1 and c[0][-1, 44, 0] == 1               # the block is at both faces
+    assert abs(c[1][0, -1, 44, 0] - 3.45**2) < 1e-5     # E_x on the face (inside the block and its copy)
+    cell = fg.Vector3(0.5, 2.0, 0)
+    assert fg.Simulation(cell_size=cell, resolution=40, k_point=fg.Vector3(),
+                         boundary_layers=[fg.PML(0.5, direction=fg.Y)])._periodic_axes() == (True, False, False)
+    assert fg.Simulation(cell_size=cell, resolution=40, boundary_layers=[fg.PML(0.5)])._periodic_axes() == (
+        False, False, False)
 
 
 def test_numpy_and_jax_agree():
@@ -113,7 +178,8 @@ def test_numpy_and_jax_agree():
 
 
 def test_fdtdx_gets_the_components_and_get_epsilon():
-    """fdtdx receives one inverse permittivity per E component (3 components); the staircase keeps one. get_epsilon
+    """fdtdx receives one inverse permittivity per E component (3 components), also for objects below the background;
+    the staircase keeps one component. setup_seconds is NaN before the setup. get_epsilon
     removes the trivial axis."""
     core = fg.Block(size=fg.Vector3(fg.inf, 0.37, fg.inf), material=fg.Medium(index=3.45))
     for avg in (True, False):
@@ -129,6 +195,20 @@ def test_fdtdx_gets_the_components_and_get_epsilon():
             assert sim.n_averaged > 0 and not np.allclose(sim.eps3[1], sim.eps3[2])
         else:
             assert inv.shape == (1, 20, 40, 3) and np.max(np.abs(inv[0] * sim.eps - 1)) < 1e-6
+    # objects below the background (eps 11.9): the blend of fdtdx has a mask of up to (11.9 - 1) / 2 in size, which
+    # increases its float32 rounding (about 1e-5)
+    geom = [fg.Block(size=fg.Vector3(fg.inf, 0.37, fg.inf), material=fg.Medium(index=2.0)),
+            fg.Cylinder(radius=0.3, center=fg.Vector3(0.1, 0.3), material=fg.Medium(index=1.0))]
+    sim = fg.Simulation(cell_size=fg.Vector3(1.0, 2.0, 0), resolution=20, geometry=geom,
+                        boundary_layers=[fg.PML(0.5)], default_material=fg.Medium(index=3.45))
+    sim.get_epsilon()
+    assert np.isnan(fg.Simulation(cell_size=fg.Vector3(1, 1, 0), resolution=10).setup_seconds)
+    import jax
+    with jax.enable_x64(False):
+        _, arrays, _, _ = sim._build(4, [])
+    inv = np.asarray(arrays.inv_permittivities)
+    assert abs(sim.eps3.min() - 1.0) < 1e-6 and abs(sim.eps3.max() - 3.45**2) < 1e-5
+    assert np.max(np.abs(inv * sim.eps3 - 1)) < 3e-5, np.max(np.abs(inv * sim.eps3 - 1))
 
 
 
@@ -166,8 +246,8 @@ def _errs(r, ms):
 @pytest.mark.gpu
 def test_ring_tm_converges_at_second_order():
     """2-D ring, Ez (E parallel to the interfaces: the arithmetic mean): the resonance error against the exact Bessel
-    solution falls at second order from res 40 to 80 (bench, m = 18: -0.25 %, -0.11 %, -0.06 % at res 40, 60, 80;
-    staircase -0.50 %, -0.17 %, -0.11 %), and the rough staircase circle no longer limits Q (bench, res 40:
+    solution falls at second order from res 40 to 80 (bench, m = 18: -0.255 %, -0.115 %, -0.063 % at res 40, 60, 80;
+    staircase -0.496 %, -0.173 %, -0.111 %), and the rough staircase circle no longer limits Q (bench, res 40:
     1.2e5 to 1.4e7 averaged, 5.6e3 to 1.5e4 staircase)."""
     r40, r80 = cases.ring(resolution=40), cases.ring(resolution=80)
     ms = [m for m in (17, 18, 19, 20) if m in {q["m"] for q in r40["modes"]} & {q["m"] for q in r80["modes"]}]
@@ -183,7 +263,7 @@ def test_disk_te_q_and_known_first_order_limit():
     """2-D disk, Hz (in-plane E; the normal turns through all angles). The diagonal rule drops the off-diagonal
     terms of the Kottke tensor, so the frequency error stays first order, of the size of the staircase error (bench,
     m = 8 to 10 at res 80: +0.067 % to +0.092 % averaged, +0.035 % to +0.115 % staircase). The averaged circle has no
-    staircase roughness: Q of the m = 8, 9 modes at res 60 is 3.1e5 and 8.9e5 (staircase 9.3e3 and 1.6e4)."""
+    staircase roughness: Q of the m = 8, 9 modes at res 60 is 3.1e5 and 9.0e5 (staircase 9.3e3 and 1.6e4)."""
     a, s = cases.disk(resolution=60), cases.disk(resolution=60, eps_averaging=False)
     ms = [8, 9]
     ea, qa = _errs(a, ms)

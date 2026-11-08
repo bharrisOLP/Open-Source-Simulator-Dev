@@ -8,6 +8,7 @@ JAX arrays.
 
 from __future__ import annotations
 
+import itertools
 import math
 
 import numpy as np
@@ -240,38 +241,62 @@ class Prism(GeometricObject):
         return tuple(lo), tuple(hi)
 
 
-def rasterize(geometry, default_material: Medium, shape, dx: float, trivial=(False, False, False)):
+def periodic_shifts(obj, periodic, shape, dx: float) -> list[tuple[float, float, float]]:
+    """Shifts (um) of the copies of obj that touch the cell [-n dx / 2, n dx / 2] (as in the MIT package, an object
+    repeats across periodic faces). On an axis that is not periodic the shift is 0. An object that is infinite along
+    a periodic axis (size or height inf) has one copy there. Empty if no copy touches the cell."""
+    olo, ohi = obj.bounds()
+    per_axis = []
+    for a in range(3):
+        if not periodic[a] or ohi[a] - olo[a] >= 0.5 * inf:
+            per_axis.append([0.0])
+            continue
+        length = shape[a] * dx
+        k0 = math.ceil((-length / 2 - ohi[a]) / length - 1e-9)
+        k1 = math.floor((length / 2 - olo[a]) / length + 1e-9)
+        if k1 < k0:
+            return []
+        per_axis.append([k * length for k in range(k0, k1 + 1)])
+    return list(itertools.product(*per_axis))
+
+
+def rasterize(geometry, default_material: Medium, shape, dx: float, trivial=(False, False, False),
+              periodic=(False, False, False)):
     """Material index of each cell, and the list of materials (index 0 = default_material).
 
     shape: cells per axis; the cell spans [-n dx / 2, n dx / 2] on each axis. Each cell takes the material of the
     last object that contains its center. On a trivial axis (a cell size of 0: a 2-D or 1-D simulation) the
-    coordinate is 0. Returns (idx: int32 array of the shape, materials: list of Medium).
+    coordinate is 0. On a periodic axis the objects repeat with the period of the cell (`periodic_shifts`).
+    Returns (idx: int32 array of the shape, materials: list of Medium).
     """
     materials = [default_material]
     idx = np.zeros(shape, np.int32)
     centers = [np.zeros(n) if trivial[i] else (np.arange(n) + 0.5) * dx - n * dx / 2 for i, n in enumerate(shape)]
+    per = tuple(bool(p) and not t for p, t in zip(periodic, trivial))
     for obj in geometry:
-        lo, hi = obj.bounds()
-        sl = []
-        for i in range(3):
-            c = centers[i]
-            if trivial[i]:
-                sl.append(slice(0, len(c)) if lo[i] <= 0.0 <= hi[i] else slice(0, 0))
+        mask = np.zeros(shape, bool)
+        for s in periodic_shifts(obj, per, shape, dx):
+            lo, hi = obj.bounds()
+            lo, hi = [lo[i] + s[i] for i in range(3)], [hi[i] + s[i] for i in range(3)]
+            sl = []
+            for i in range(3):
+                c = centers[i]
+                if trivial[i]:
+                    sl.append(slice(0, len(c)) if lo[i] <= 0.0 <= hi[i] else slice(0, 0))
+                    continue
+                i0 = int(np.searchsorted(c, lo[i] - 1e-9 * dx, side="left"))
+                i1 = int(np.searchsorted(c, hi[i] + 1e-9 * dx, side="right"))
+                sl.append(slice(i0, i1))
+            if any(q.stop <= q.start for q in sl):
                 continue
-            i0 = int(np.searchsorted(c, lo[i] - 1e-9 * dx, side="left"))
-            i1 = int(np.searchsorted(c, hi[i] + 1e-9 * dx, side="right"))
-            sl.append(slice(i0, i1))
-        if any(s.stop <= s.start for s in sl):
-            continue
-        X, Y, Z = np.meshgrid(centers[0][sl[0]], centers[1][sl[1]], centers[2][sl[2]], indexing="ij")
-        mask = np.asarray(obj.contains(X, Y, Z), bool)
+            X, Y, Z = np.meshgrid(centers[0][sl[0]] - s[0], centers[1][sl[1]] - s[1], centers[2][sl[2]] - s[2],
+                                  indexing="ij")
+            mask[tuple(sl)] |= np.asarray(obj.contains(X, Y, Z), bool)
         if not mask.any():
             continue
         k = next((j for j, m in enumerate(materials) if m is obj.material), None)
         if k is None:
             materials.append(obj.material)
             k = len(materials) - 1
-        sub = idx[tuple(sl)]
-        sub[mask] = k
-        idx[tuple(sl)] = sub
+        idx[mask] = k
     return idx, materials

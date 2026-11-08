@@ -3,7 +3,7 @@
     python bench/bench_fdtd.py --case bragg --resolution 200 [--lam0 1.03] [--no-avg]
     python bench/bench_fdtd.py --case waveguide --resolution 20 [--three-d]
     python bench/bench_fdtd.py --case ring --resolution 40 [--no-avg]
-    python bench/bench_fdtd.py --case disk --resolution 40 [--tm] [--no-avg]
+    python bench/bench_fdtd.py --case disk --resolution 40 [--tm] [--no-avg] [--forward-diagonal]
     python bench/bench_fdtd.py --case slab --resolution 20 [--e-normal] [--no-avg]
     python bench/bench_fdtd.py --case dipole --resolution 20 --index 1.5 [--half 0.5]
     python bench/bench_fdtd.py --case waveguide --three-d --src-freq 0.5701613   # mode source solved at a band edge
@@ -76,7 +76,12 @@ ap.add_argument("--tm", action="store_true", help="disk case: Ez (default: Hz, i
 ap.add_argument("--e-normal", action="store_true", help="slab case: E normal to the faces (Hz polarization)")
 ap.add_argument("--no-avg", action="store_true", help="staircase geometry (eps_averaging=False)")
 ap.add_argument("--both", action="store_true", help="each case averaged and with the staircase")
+ap.add_argument("--forward-diagonal", action="store_true",
+                help="keep the diagonal of the forward tensor (fdtd_gpu._averaging.DIAGONAL = \"forward\")")
 a = ap.parse_args()
+if a.forward_diagonal:
+    import fdtd_gpu._averaging
+    fdtd_gpu._averaging.DIAGONAL = "forward"
 todo = ["bragg", "waveguide", "ring", "dipole", "sheet"] if a.case == "all" else [a.case]
 resolutions = [None] if a.resolution is None else [int(r) for r in a.resolution.split(",")]
 averaging = [True, False] if a.both else [not a.no_avg]
@@ -100,4 +105,6 @@ for case, resolution, avg in itertools.product(todo, resolutions, averaging):
         kw["src_freq"] = a.src_freq
     res = setup(**kw) if case == "setup" else getattr(cases, case)(**kw)
     row = {"case": case, **{k: v for k, v in kw.items()}, **res}
+    if a.forward_diagonal:
+        row["diagonal"] = "forward"
     print(json.dumps(_clean(row)), flush=True)

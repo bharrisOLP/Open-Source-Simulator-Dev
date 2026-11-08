@@ -154,6 +154,8 @@ class Simulation:
         self.dt = 0.99 * self.dx / math.sqrt(3)          # um/c
         self.meep_time = 0.0
         self.run_seconds = float("nan")
+        self.setup_seconds = float("nan")    # the rasterization and the average: set by get_epsilon() and run()
+        self.n_averaged = 0                  # the number of sampled voxels: set by get_epsilon() and run()
         self.device = None
         for s in self.sources:
             if not isinstance(s, (Source, EigenModeSource)):
@@ -213,18 +215,24 @@ class Simulation:
     def source_end_time(self) -> float:
         return max((s.src.end_time for s in self.sources), default=0.0)
 
+    def _periodic_axes(self) -> tuple[bool, bool, bool]:
+        """True for an axis of size > 0 with periodic faces (k_point given and no PML on that axis; as in _build)."""
+        return tuple(not self.trivial[a] and self.periodic
+                     and not any(p.direction in (ALL, a) for p in self.boundary_layers) for a in range(3))
+
     def _permittivity(self):
         """(staircase index, materials, eps3): eps3 is the (3, *shape) permittivity of the E components (subpixel
         averaged), or None for the staircase or a uniform cell. Sets setup_seconds and n_averaged."""
         t0 = _time.perf_counter()
-        idx, mats = rasterize(self.geometry, self.default_material, self.shape, self.dx, self.trivial)
+        per = self._periodic_axes()
+        idx, mats = rasterize(self.geometry, self.default_material, self.shape, self.dx, self.trivial, per)
         eps3, self.n_averaged = None, 0
         if self.eps_averaging and len(mats) > 1:
             import jax
 
             from fdtd_gpu._averaging import averaged_permittivity
             with jax.enable_x64(False), jax.default_device(_device()):
-                eps3, self.n_averaged = averaged_permittivity(self.geometry, mats, idx, self.dx, self.trivial)
+                eps3, self.n_averaged = averaged_permittivity(self.geometry, mats, idx, self.dx, self.trivial, per)
         self.setup_seconds = _time.perf_counter() - t0
         return idx, mats, eps3
 

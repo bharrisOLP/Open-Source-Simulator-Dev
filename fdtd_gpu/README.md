@@ -33,7 +33,7 @@ Supported:
   earlier ones. `eps_averaging=True` (the default, as in the MIT package): subpixel averaging of the permittivity at
   each Yee E component (see "Differences"); `eps_averaging=False`: the staircase.
 - **Boundaries:** `PML(thickness, direction, side)` inside the cell. Other faces are metal (PEC), or periodic with
-  `k_point=Vector3()`.
+  `k_point=Vector3()` (the objects repeat across periodic faces).
 - **Sources:** `Source(GaussianSource or ContinuousSource, component, center, size, amplitude)`: a point, line or
   plane current. `EigenModeSource(src, center, size, eig_band, eig_parity, eig_kpoint)`.
 - **Monitors:** `add_flux` (`FluxRegion` with weights; `get_flux_data`, `load_minus_flux_data`), `add_mode_monitor`
@@ -60,7 +60,7 @@ sources or mode monitors.
 - **Subpixel averaging** (`eps_averaging=True`, the default; `fdtd_gpu/_averaging.py`). Each E component of each
   cell gets its own permittivity: the average over the cube of side dx centered at the component. fdtdx keeps the
   Yee layout of Taflove; this package puts E_a at the cell center plus dx / 2 along a. The rule is the diagonal of
-  the anisotropic average of Kottke, Farjadpour and Johnson (Phys. Rev. E 77, 036611, 2008):
+  the inverse tensor of the anisotropic average of Kottke, Farjadpour and Johnson (Phys. Rev. E 77, 036611, 2008):
   1 / eps_aa = n_a^2 <1/eps> + (1 - n_a^2) / <eps>, with n the interface normal. fdtdx gets three permittivity
   components per cell and keeps its elementwise update: the FDTD loop takes the same time (ring at res 80: 8.83 s
   averaged, 8.79 s staircase). Differences from the MIT package:
@@ -69,24 +69,40 @@ sources or mode monitors.
     the plane of a curved interface (a 2-D disk or ring with Hz; in 3-D the sidewalls of rings and bends) the error
     stays first order, of the size of the staircase error, but the Q is no longer limited by the staircase (check
     8). The full tensor needs the 9-component (anisotropic) update of fdtdx (its documentation: about 3 times the
-    cost per step; not measured here);
+    cost per step; not measured here). An alternative is the diagonal of the forward tensor,
+    eps_aa = n_a^2 / <1/eps> + (1 - n_a^2) <eps> (the smoothing of fdtdx itself; `fdtd_gpu._averaging.DIAGONAL =
+    "forward"`, bench option `--forward-diagonal`). It changes only components with a slanted normal (check 8 and
+    the corners of the 3-D strip). Rows: `benchmarks/2026-11-07/fdtd-gpu-forward-diagonal.jsonl` (`--case disk
+    --resolution 40,60,80 --forward-diagonal`, rows 1 to 3; `--case waveguide --three-d --forward-diagonal`, row 4).
+    Check 8, m = 8, 9, 10: -0.052, -0.112, -0.167 % (res 40), +0.022, -0.001, -0.023 % (res 60), +0.037, +0.025,
+    +0.012 % (res 80); Q of m = 8 to 10: 7.8e4 to 6.7e5, 2.0e5 to 1.1e6, 2.8e5 to 1.5e6. The fit of check 8 gives
+    G = 0.081 to 0.091 um^-1 (inverse diagonal: 0.124 to 0.138): also first order, with a smaller first-order
+    term, but larger errors at res 40. 3-D strip (check 2, res 20): T_mode changes by at most 1.5e-6, neff by
+    +1.7e-4 to +4.0e-4. The default stays the diagonal of the inverse tensor, which follows Kottke et al.;
   - <eps> and <1/eps> come from fixed sample points (a rank-1 lattice of 1024, 1974 and 2042 points per voxel in
     1-D, 2-D and 3-D), not from an adaptive integration with a tolerance (`subpixel_tol` is not accepted). The
-    fill fraction of a plane normal to an axis is exact to 1 / (2 n) = 5e-4;
+    fill fraction of a plane normal to an axis is exact to 1 / (2 n): 4.9e-4 in 1-D and 3-D, 5.07e-4 in 2-D;
   - the normal is the weighted first moment of eps on a regular grid (24 x 24 in 2-D, 12 x 12 x 12 in 3-D) over
     the circumscribed ball of the voxel, not the analytic normal of the object. For a slanted plane the averaged
-    components are within 2 % (median 0.5 %) of the exact diagonal (`test_slanted_plane_kottke_diagonal`);
+    components are within 0.7 % (median 0.2 %) of the exact diagonal in 2-D (`test_slanted_plane_kottke_diagonal`,
+    45 voxels) and within 2.4 % (median 0.27 %) in 3-D (`test_slanted_plane_3d`, 256 voxels);
   - only voxels next to a change of the staircase material are sampled: a feature thinner than one cell that
     holds no cell center is not seen (as by the staircase);
   - the JAX path (float32) can put a sample point within about 1e-7 um of a surface on the other side: one of
     the about 2000 points of a voxel, up to 1.3e-3 of eps in 1.3 % of the voxels of the test geometry
-    (`test_numpy_and_jax_agree`).
+    (`test_numpy_and_jax_agree`);
+  - fdtdx gets the components through the linear blend of one material over the background (`_voxels.py`): the
+    float32 rounding of the blend is up to 3e-5 of eps for an object below the background
+    (`test_fdtdx_gets_the_components_and_get_epsilon`).
   `eps_averaging=False` gives the staircase (each cell takes the material of its center), which converges at
-  about first order in the cell size. Setup time (`--case setup`: a 3-D strip and ring in an 8 x 4 x 4 um cell):
-  3.48 s at res 20 (1.0 M cells, 36,688 sampled voxels; with the start of JAX and the compile), then 2.92 s at
-  res 50 (16 M cells, 247,880 voxels) in the same process. The 2-D checks take 0.02 to 0.7 s. Small problems are
-  sampled with NumPy, larger ones on the GPU. `get_epsilon` returns 3 / (1/eps_xx + 1/eps_yy + 1/eps_zz) of each
-  cell (each component at its own Yee point).
+  about first order in the cell size. On a periodic axis (`k_point=Vector3()` and no PML on that axis) the objects
+  repeat across the faces, as in the MIT package, for the staircase and for the average
+  (`test_periodic_faces_repeat_objects`). Setup time (`--case setup`: a 3-D strip and ring in an 8 x 4 x 4 um
+  cell): 3.48 s at res 20 (1.0 M cells, 36,688 sampled voxels; with the start of JAX and the compile), then 2.92 s
+  at res 50 (16 M cells, 247,880 voxels) in the same process. The 2-D checks take 0.02 to 0.7 s. Small problems
+  are sampled with NumPy, larger ones on the GPU. `get_epsilon` returns 3 / (1/eps_xx + 1/eps_yy + 1/eps_zz) of
+  each cell (each component at its own Yee point). `setup_seconds` (NaN before) and `n_averaged` (the number of
+  sampled voxels) are set by `get_epsilon()` and `run()`.
 - **float32 fields**, and the time step of fdtdx: dt = 0.99 dx / (c sqrt 3) in all dimensions (`Courant` is
   ignored).
 - **One-way mode sources.** `EigenModeSource` is the fdtdx TFSF mode source: the mode is solved at the center
@@ -123,12 +139,13 @@ and `tests/test_averaging.py` (checks 6 to 8, and the convergence of check 3) ru
 numbers of checks 1 to 3 and 6 to 8, of the res-20 rows of checks 4 and 5, and the setup times are from the 39
 rows of `benchmarks/2026-11-07/fdtd-gpu-avg.jsonl` (subpixel averaging on, unless the text says "staircase"; RX
 7900 XT, 2026-11-07: `--case all`, the two 3-D waveguide commands and the six last commands under "Tests and
-bench", in that order; other jobs can share the computer, so times can change between runs). Line 31 of that file
-(check 7, staircase, res 160) is cut by a warning message; its value is from a repeat of the same command on the
-same day (max abs(R - R_exact) 0.04655, max abs(R + T - 1) 3.4e-5). The other rows of checks 4 and 5 are from
-version 0.1 (the staircase only) in `benchmarks/2026-10-30/fdtd-gpu.jsonl`: these checks have no geometry, so the
-averaging does not change them (the res-20 rows of the two files are equal). "res" is the resolution in cells per
-um; times are the FDTD loops (with compile).
+bench", in that order; other jobs can share the computer, so times can change between runs). In the logged run, a
+scipy RuntimeWarning on stderr cut the row of check 7 (staircase, res 160); line 31 of the file is the row of a
+repeat of the same command on the same day (with a "note" key), which replaces it. (`references.disk_resonance`
+now hides these warnings.) The other rows of checks 4 and 5 are from version 0.1 (the staircase only) in
+`benchmarks/2026-10-30/fdtd-gpu.jsonl`: these checks have no geometry, so the averaging does not change them (the
+res-20 rows of the two files are equal). Rounding: Q to two significant digits, orders to three decimals, errors to
+the digits shown. "res" is the resolution in cells per um; times are the FDTD loops (with compile).
 
 1. **1-D Bragg mirror** (quarter-wave stack at 1 um, n 2.0 / 1.25, 6 pairs, in air; 41 frequencies from 0.6 to
    1.4 / um). R from a flux plane with the incident fields subtracted (`load_minus_flux_data`), T from a flux plane
@@ -163,15 +180,15 @@ um; times are the FDTD loops (with compile).
    `references.ring_resonance`), azimuthal orders m = 15 to 21. E is parallel to the interfaces, so the averaged
    rule is the arithmetic mean.
    - Frequency error of the strongest mode of each m, averaged: -0.17 to -0.34 % at res 40 (2.6 s), -0.08 to
-     -0.15 % at res 60 (4.1 s), -0.04 to -0.09 % at res 80 (8.8 s): second order (res 40 to 80: 1.97 to 2.02 for
+     -0.15 % at res 60 (4.1 s), -0.04 to -0.09 % at res 80 (8.8 s): second order (res 40 to 80: 1.957 to 2.015 for
      each m). What remains is mostly the dispersion of the Yee grid (the frequencies are low). Staircase: -0.43 to
      -0.69 %, -0.02 to -0.20 %, -0.09 to -0.14 % (no clear order: the staircase error and the dispersion change
      sign against each other).
    - Free spectral range of neighbor orders, averaged: 0.0275 to 0.0280 (res 40), 0.0277 to 0.0281 (res 60),
      0.0277 to 0.0282 (res 80); staircase 0.0266 to 0.0285, 0.0274 to 0.0287, 0.0275 to 0.0283; exact 0.0278 to
      0.0282.
-   - Q (exact: above 1e9): averaged 1.2e5 to 1.4e7 (res 40), 1.1e7 to 8.5e7 (res 60), 1.4e7 to 1.2e8 (res 80);
-     staircase 5.6e3 to 1.5e4, 4.9e4 to 6.0e5, 4.7e4 to 4.3e5 (the rough staircase circle scatters, and a mode can
+   - Q (exact: above 1e9): averaged 1.2e5 to 1.4e7 (res 40), 1.1e7 to 8.6e7 (res 60), 1.4e7 to 1.2e8 (res 80);
+     staircase 5.6e3 to 1.5e4, 5.0e4 to 6.0e5, 4.6e4 to 4.2e5 (the rough staircase circle scatters, and a mode can
      split into a pair; the check uses the strongest mode of each m). At a Q above about 1e6 the fit can give a
      small growth (Q < 0); the cases use abs(Q).
    - The test (res 60) requires errors below 0.5 % for the three strongest modes and the free spectral range within
@@ -204,10 +221,11 @@ um; times are the FDTD loops (with compile).
    | 80 | +1.7e-5 / -1.9e-3 | -8.0e-5 / -3.5e-3 |
 
    As an effective index (neff = beta / (2 pi f)) at res 40: averaged +7.2e-4 (Ez) and +5.9e-4 (Hz), staircase
-   +7.6e-3 and +1.17e-2. The staircase rounds the width to whole cells and stops converging; the averaged error is
-   10 to 100 times smaller. It is second order in its envelope only: its coefficient changes with the position of
-   the face in the cell (20 to 40 for Ez: no gain; 40 to 80: 14 times). The test (res 40) requires the averaged
-   error below 1e-3 and the staircase error at least 4 times larger, for both polarizations.
+   +7.6e-3 and +1.17e-2. The staircase rounds the width to whole cells and stops converging. The ratio of the
+   errors, staircase / averaged, is 20, 10 and 111 (Ez) and 3.4, 20 and 44 (Hz) at res 20, 40 and 80. The averaged
+   error is second order in its envelope only: its coefficient changes with the position of the face in the cell
+   (20 to 40 for Ez: no gain; 40 to 80: 14 times). The test (res 40) requires the averaged error below 1e-3 and the
+   staircase error at least 4 times larger, for both polarizations.
 7. **Subpixel averaging: Bragg mirror with faces between grid lines** (check 1 with lambda0 = 1.03 um, `--lam0
    1.03`: layers 0.12875 and 0.206 um). Max abs(R - R_exact) at res 40 / 80 / 160: averaged 0.114 / 0.0265 /
    0.0062 (order 2.1 and 2.1; what remains is the dispersion of the Yee grid, as in check 1), staircase 0.257 /
@@ -228,13 +246,13 @@ um; times are the FDTD loops (with compile).
    and the second-order dispersion of the grid; G and D from res 40 and 60 predict res 80 to 1e-4) with G = 0.12 to
    0.14 um^-1: about +0.16 % at res 80 before the dispersion, of the same size as the staircase error. This is the
    known limit of the diagonal rule (see "Differences"). The averaged circle has no staircase roughness: Q of
-   m = 8 to 10 is 7.6e4 to 2.0e5 (res 40), 1.4e5 to 8.9e5 (res 60), 2.7e5 to 1.1e6 (res 80); staircase 4.8e3 to
-   4.3e4, 9.3e3 to 1.6e4, 1.2e4 to 4.1e4. The test (res 60) requires errors below 0.2 % and the averaged Q of
+   m = 8 to 10 is 7.5e4 to 2.0e5 (res 40), 1.4e5 to 9.0e5 (res 60), 2.7e5 to 1.1e6 (res 80); staircase 4.8e3 to
+   4.2e4, 9.3e3 to 1.6e4, 1.2e4 to 4.1e4. The test (res 60) requires errors below 0.2 % and the averaged Q of
    m = 8, 9 at least 10 times the staircase Q.
 
-Tests: 24 (13 without FDTD runs: geometry, Prism center, 2-D parities, Harminv, the averaged permittivity against
-exact fill fractions and the formula of Kottke et al., NumPy against JAX, the transfer to fdtdx; 11 FDTD checks,
-some with more than one run).
+Tests: 27 (16 without FDTD runs: geometry, Prism center, 2-D parities, Harminv, the averaged permittivity against
+exact fill fractions and the formula of Kottke et al. (2-D and 3-D, both diagonals), periodic faces, NumPy against
+JAX, the transfer to fdtdx; 11 FDTD checks, some with more than one run).
 
 ## Tests and bench (on the GPU computer)
 
