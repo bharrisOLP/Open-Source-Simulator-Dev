@@ -331,13 +331,56 @@ bash tools/gpu_run.sh thermal_gpu python bench/bench_kappa_t.py --case cross2d -
 bash tools/gpu_run.sh thermal_gpu python bench/bench_kappa_t.py --case heater3d --dx 0.1e-6 0.05e-6 --power 100
 ```
 
-Transients with kappa(T) against the constant-kappa transient (`bench/bench_transient_kappa_t.py`; models constant,
-constant_new, si_T, si_T+sio2_T, all_T+cp_T; the rows go into the benchmark log):
+Transients with kappa(T) against the constant-kappa transient (`bench/bench_transient_kappa_t.py`; rows in
+`benchmarks/2026-11-07/thermal-transient-kappa.jsonl`; RX 7900 XT, 2026-11-07, with the thread and memory limits of
+the shared computer). Commands (on the GPU computer, from the repository folder):
 
 ```
 bash tools/gpu_run.sh thermal_gpu python bench/bench_transient_kappa_t.py --case cross2d --dx 0.05e-6 0.02e-6 --repeat
 bash tools/gpu_run.sh thermal_gpu python bench/bench_transient_kappa_t.py --case heater3d --dx 0.1e-6 0.05e-6 --repeat
 ```
+
+Models: constant (`solve_transient3d` / `solve_transient2d`), constant_new (`transient_kappa` with constant laws),
+si_T (Si kappa(T)), si_T+sio2_T (Si and SiO2 kappa(T)), all_T+cp_T (also Si rho c_p(T)). All runs: bdf2, V-cycle,
+200 steps in 10 geometric stages from 10 ns to 200 us, tol and tol_picard 1e-10; each converged, and no cell left
+the valid range of its law. The rise time is that of the waveguide (3-D: at mid-length) from 10 % to 90 % of the
+steady rise of the same model.
+
+| Case, grid | Cells | Model | First run (s) | Second run (s) | Second run / constant | Picard iterations (max per step) | CG iterations (/ constant) | Rise time 10-90 % (us) | Rise time / constant |
+|---|---|---|---|---|---|---|---|---|---|
+| 2-D cross-section, 50 nm | 29,200 | constant | 1.58 | 0.72 | 1.00 | - (200 linear solves) | 2583 | 17.939 | 1.00000 |
+| 2-D cross-section, 50 nm | 29,200 | constant_new | 2.13 | 0.80 | 1.11 | 200 (1) | 2584 (1.00) | 17.939 | 1.00000 |
+| 2-D cross-section, 50 nm | 29,200 | si_T | 2.25 | 1.05 | 1.47 | 540 (3) | 3921 (1.52) | 17.939 | 1.00002 |
+| 2-D cross-section, 50 nm | 29,200 | si_T+sio2_T | 1.32 | 1.31 | 1.82 | 769 (5) | 5633 (2.18) | 17.606 | 0.98145 |
+| 2-D cross-section, 50 nm | 29,200 | all_T+cp_T | 1.30 | 1.30 | 1.82 | 769 (5) | 5634 (2.18) | 17.607 | 0.98153 |
+| 2-D cross-section, 20 nm | 182,500 | constant | 2.92 | 1.85 | 1.00 | - (200 linear solves) | 3814 | 17.920 | 1.00000 |
+| 2-D cross-section, 20 nm | 182,500 | constant_new | 4.74 | 2.17 | 1.18 | 200 (1) | 3814 (1.00) | 17.920 | 1.00000 |
+| 2-D cross-section, 20 nm | 182,500 | si_T | 5.32 | 2.95 | 1.60 | 543 (3) | 5786 (1.52) | 17.921 | 1.00003 |
+| 2-D cross-section, 20 nm | 182,500 | si_T+sio2_T | 3.85 | 3.85 | 2.09 | 768 (5) | 8551 (2.24) | 17.588 | 0.98146 |
+| 2-D cross-section, 20 nm | 182,500 | all_T+cp_T | 3.82 | 3.82 | 2.07 | 768 (5) | 8547 (2.24) | 17.589 | 0.98154 |
+| 3-D heater, 100 nm | 686,200 | constant | 5.05 | 3.44 | 1.00 | - (200 linear solves) | 3605 | 17.939 | 1.00000 |
+| 3-D heater, 100 nm | 686,200 | constant_new | 7.89 | 4.40 | 1.28 | 200 (1) | 3604 (1.00) | 17.939 | 1.00000 |
+| 3-D heater, 100 nm | 686,200 | si_T | 10.34 | 7.00 | 2.04 | 643 (4) | 5653 (1.57) | 17.939 | 1.00002 |
+| 3-D heater, 100 nm | 686,200 | si_T+sio2_T | 8.78 | 8.77 | 2.55 | 768 (5) | 7509 (2.08) | 17.605 | 0.98143 |
+| 3-D heater, 100 nm | 686,200 | all_T+cp_T | 8.70 | 8.70 | 2.53 | 768 (5) | 7509 (2.08) | 17.607 | 0.98151 |
+| 3-D heater, 50 nm | 2,744,800 | constant | 21.88 | 20.12 | 1.00 | - (200 linear solves) | 5773 | 17.938 | 1.00000 |
+| 3-D heater, 50 nm | 2,744,800 | constant_new | 25.73 | 23.47 | 1.17 | 200 (1) | 5773 (1.00) | 17.938 | 1.00000 |
+| 3-D heater, 50 nm | 2,744,800 | si_T | 41.66 | 39.64 | 1.97 | 642 (4) | 9717 (1.68) | 17.939 | 1.00002 |
+| 3-D heater, 50 nm | 2,744,800 | si_T+sio2_T | 47.07 | 47.16 | 2.34 | 769 (5) | 11700 (2.03) | 17.605 | 0.98145 |
+| 3-D heater, 50 nm | 2,744,800 | all_T+cp_T | 46.98 | 47.00 | 2.34 | 769 (5) | 11699 (2.03) | 17.607 | 0.98154 |
+
+- First run: `run_s`, the first run of the model in the process of its command and grid. It includes the
+  compilation for constant, constant_new and si_T (0.86 to 3.49 s more than the second run). si_T+sio2_T and
+  all_T+cp_T run after si_T with the same shapes and use its compiled code: their first run equals the second
+  (differences -0.09 to +0.008 s). Second run: `run2_s`, the same run again (no compilation).
+- Second runs: Si and SiO2 kappa(T) cost 1.82 to 2.55 times the constant-kappa transient, Si kappa(T) alone 1.47
+  to 2.04 times. The new path with constant laws (one linear solve per step) costs 1.11 to 1.28 times.
+- Picard: 540 to 643 iterations for the 200 steps with Si kappa(T) (at most 3 or 4 per step), 768 or 769 with Si
+  and SiO2 kappa(T) (at most 5). CG iterations: 1.52 to 1.68 (Si) and 2.03 to 2.24 (Si and SiO2) times those of
+  constant kappa; constant_new has the same count (ratio 1.00).
+- Rise time: Si and SiO2 kappa(T) make the rise faster by 1.85 to 1.86 % (ratio 0.98143 to 0.98146). Si
+  kappa(T) alone makes it longer by 2.2e-5 to 2.5e-5 (relative). Si rho c_p(T) in addition makes it longer by
+  8.8e-5 to 9.0e-5 against si_T+sio2_T (ratio to constant 0.98151 to 0.98154).
 
 | Transient (BDF2, 200 steps to 200 us) | Cells | GPU | CPU | 10-90 % rise time |
 |---|---|---|---|---|
