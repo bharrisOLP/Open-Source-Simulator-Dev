@@ -82,6 +82,24 @@ The patches:
    of a stored word and a subtrahend, a float32 and an int64 subtrahend, and the whole deposit on the 84 cases for
    each of the three amplitude tables; a control shows the sign inversion of the plain device subtraction.
 
+**No patch 0005 (the `D - P` of the deposit repair; decision of 2026-11-08).** `deposit_repair._fresh_at` forms the
+float32 `D - P` at the repair cells only, with the same in-place subtraction as the whole-volume form of `update_E`
+(`Fields.displacement_minus_polarization`): the repair recomputes the field at the deposit cells as `update_E` of the
+same device would, and the add-on states that the subset is bit for bit the subset of the whole. On the GPU it keeps
+the NaN sign of the GPU, like the array path and the kernels. A patch that gave the repair the host's words would
+break that equality on the GPU, and a patch for every float32 subtraction of the array path and the kernels is a
+change of the kernels. No test of the add-on compares NaN words there: of the 409 test modules, 79 name
+`deposit_repair` or `_fresh_at`, and 31 write a NaN value (`np.nan`, `float("nan")`, a NaN word, ...); the one
+module in both names the repair in a docstring and gives a NaN coefficient to a check that must refuse it. In the
+two runs of the whole suite no failure came from the repair (`addon_gpu/README.md`). A NaN in D or P is a field
+that has already diverged; the source deposit of patch 0004
+makes a NaN from a non-finite amplitude in a finite field, and its test compares those words with the host's.
+`addon_gpu/nan_words_probe.py` part 3 measures it on the GPU (`benchmarks/2026-11-08/addon-nan-probe-repair.out`):
+for 49 pairs of planted words in D and P (finite, NaN of both signs, a NaN payload, infinities; 35 NaN results), the
+repair gives the words of the whole-volume form on the host and on the GPU (0 differing words each), and the GPU
+differs from the host in 12 words: where P is a NaN and D is not, in the sign bit only.
+`addon_gpu/tests/test_patches.py` checks these facts, so a later patch of the repair alone fails it.
+
 **Rule 2 of the add-on (certification ledgers).** The five files are pinned by the certification ledgers of the add-on,
 so the patches put entries of those ledgers in drift. On the AMD GPU no identity is certified in any case: the
 kernels run only with `MEEP_GPU_HARDWARE=any`, and each run reports `certified: False`. `addon_gpu/README.md` gives

@@ -9,6 +9,8 @@ itself through tools/gpu_run.sh, and each module has its own time limit):
     uv run --no-project --python 3.12 addon_gpu/suite_runner.py --run suite-any --resume --max-seconds 3000
     uv run --no-project --python 3.12 addon_gpu/suite_runner.py --run suite-any --not-clean   (run them again)
     uv run --no-project --python 3.12 addon_gpu/suite_runner.py --run suite-any --summary     (totals by tier)
+    uv run --no-project --python 3.12 addon_gpu/suite_runner.py --run cache --cache-or-policy (the 60 modules that
+                                                       name the CuPy cache folder or the subnormal policy)
 
 The modules are the ``test_*.py`` files under the pytest paths of the add-on (``meep_gpu`` and
 ``parity/meep_gpu``, without the folders that its ``norecursedirs`` excludes), in the clone
@@ -23,7 +25,10 @@ order:
    line runs its certification tests too (AGENTS.md of the add-on), so these modules come last.
 
 Each module runs alone, as ``timeout -k 30 <--timeout> python -m pytest -q <module> --junitxml=<file>`` in the clone
-(default 300 s; SIGTERM at the limit, SIGKILL 30 s later). The modules run in chunks: one call of
+(default 300 s; SIGTERM at the limit, SIGKILL 30 s later). The time limit uses GNU timeout: ``gnutimeout`` when it is
+on the PATH (as tools/gpu_run.sh does), else ``timeout``. GNU timeout sends both signals to the process group of the
+module, so a process that the module started also stops; the uutils ``timeout`` of the GPU computer sends them only
+to its direct child. The modules run in chunks: one call of
 ``bash tools/gpu_run.sh .local/upstream/erised-fork`` (one hold of the GPU lock) runs at most ``--chunk`` modules, one
 after the other, and starts no new module after ``--chunk-seconds`` (default 240 s); then the next chunk waits for
 the lock again, so other runs of this repository get the GPU between chunks. The runner prints the uptime and the
@@ -35,7 +40,22 @@ counts (passed, failed, skipped, errors; ``null`` after a time-out), the seconds
 whole call, the exit code, the failed tests with the first line of their messages, how many of them the add-on lists
 as pending certification, the uptime and load of the computer before the module (a low uptime shows a restart), and
 the ``CUPY_GPU_MEMORY_LIMIT`` and ``CUPY_CACHE_DIR`` of the pytest call (a folder in this repository relative to
-it).
+it), the cache policy of the module and the name of the timeout program.
+
+The CuPy cache folder follows the rule of the add-on (``meep_gpu/subnormal_policy.py``: ``cupy_cache_reasons``,
+``keep_policy_cache_dir``). An install of the float32 subnormal policy ``keep`` needs a ``CUPY_CACHE_DIR`` whose path
+carries the token ``ftz_stripped``, and an install of ``flush`` needs one without it. The dispatch of the add-on
+installs ``keep`` itself and points CuPy at ``<CUPY_CACHE_DIR>-ftz_stripped``, a folder that it mints (a marker file
+``<folder>.meep_gpu_keep_policy`` beside it); it refuses a keep folder that holds files and has no marker. A module
+that installs ``keep`` by hand, and sets no cache folder of its own, gets the refusal at its first test. So, with
+``--cache-policy module`` (the default), a module whose source installs ``keep`` by hand, names no ``CUPY_CACHE_DIR``
+and installs no ``flush`` (``KEEP_BY_HAND``; at the pinned commit two modules) runs with
+``CUPY_CACHE_DIR=<CUPY_CACHE_DIR>-ftz_stripped`` (the keep folder that the dispatch derives), and every other module
+with the ``CUPY_CACHE_DIR`` of the environment (``.local/cupy-cache``, from tools/env/addon_gpu_activate.sh). When
+the marker of the keep folder is missing, the runner first lets the add-on mint the folder
+(``point_cupy_cache_at_keep_policy`` in a short process); if the add-on refuses the folder, the module runs with the
+folder of the environment, and its row gives the reason. ``--cache-policy plain`` gives every module the folder of
+the environment (the rows of 2026-11-08); ``--cupy-cache-dir`` gives every module one folder.
 
 The counts come from the JUnit file, one outcome for each test case: a case with a failure counts as failed, else a
 case with an error counts as an error, else skipped or passed. pytest's own summary can differ when a test also has
@@ -50,6 +70,7 @@ import datetime as dt
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -80,8 +101,26 @@ GPU_WORDS = re.compile(r"\b(cupy|triton|torch|RawKernel|MEEP_GPU_DISPATCH|MEEP_G
 TIERS = ("host", "gpu", "certification")
 MESSAGE_CHARS = 300
 KILL_AFTER_S = 30            # timeout -k: SIGKILL this many seconds after the SIGTERM at the time limit
-TIMEOUT_EXITS = (124, 137)   # the exit codes of timeout(1) at the limit: SIGTERM ended the call, or SIGKILL did
+# The return codes of the timeout call at the limit: 124, SIGTERM ended the command; 137, SIGKILL ended it (the
+# uutils timeout, which survives); -9, GNU timeout sent SIGKILL to the process group, itself included
+TIMEOUT_EXITS = (124, 137, -9)
 MAX_FAILURES = 40
+# The CuPy cache rule of the add-on (meep_gpu/subnormal_policy.py): CUPY_CACHE_POLICY_TOKEN, KEEP_POLICY_MARKER_SUFFIX
+KEEP_TOKEN = "ftz_stripped"
+KEEP_MARKER_SUFFIX = ".meep_gpu_keep_policy"
+_POLICY_CALL = r"(?:install_subnormal_policy|set_subnormal_policy|install_cupy_policy)\(\s*[\"']{}[\"']"
+KEEP_BY_HAND = re.compile(_POLICY_CALL.format("keep"))
+FLUSH_BY_HAND = re.compile(_POLICY_CALL.format("flush")
+                           + r"|MEEP_GPU_SUBNORMAL_POLICY[\"']?\s*[,\]=]\s*[\"']flush[\"']")
+CACHE_POLICIES = ("module", "plain")
+# --cache-or-policy: the modules whose source names the CuPy cache folder or the float32 subnormal policy
+POLICY_WORDS = re.compile(r"install_subnormal_policy|set_subnormal_policy|install_cupy_policy|CUPY_CACHE_DIR|"
+                          r"MEEP_GPU_SUBNORMAL_POLICY|keep_policy_cache_dir|point_cupy_cache_at_keep_policy|"
+                          r"cupy_cache_reasons")
+# Run by the runner with CUPY_CACHE_DIR=<the folder of the environment>: the add-on mints its keep folder (or refuses
+# it) and prints the record of point_cupy_cache_at_keep_policy.
+MINT_KEEP_FOLDER = ("import json; from meep_gpu.subnormal_policy import point_cupy_cache_at_keep_policy as p; "
+                    "print('MINT_JSON ' + json.dumps(p(), default=str))")
 
 
 def modules(clone: Path = CLONE) -> list[str]:
@@ -116,6 +155,74 @@ def tier(module: str, pending: set[str], clone: Path = CLONE) -> str:
         return "certification"
     text = (clone / module).read_text(errors="replace")
     return "gpu" if GPU_WORDS.search(text) else "host"
+
+
+def keeps_by_hand(text: str) -> bool:
+    """The source installs the policy ``keep`` by hand, names no ``CUPY_CACHE_DIR`` and installs no ``flush``."""
+    return bool(KEEP_BY_HAND.search(text)) and "CUPY_CACHE_DIR" not in text and not FLUSH_BY_HAND.search(text)
+
+
+def cache_policy(module: str, clone: Path = CLONE) -> str:
+    """``keep`` for a module of ``keeps_by_hand``, else ``plain`` (the folder of the environment)."""
+    return "keep" if keeps_by_hand((clone / module).read_text(errors="replace")) else "plain"
+
+
+def names_cache_or_policy(module: str, clone: Path = CLONE) -> bool:
+    """The source of the module names the CuPy cache folder or the subnormal policy (``POLICY_WORDS``)."""
+    return bool(POLICY_WORDS.search((clone / module).read_text(errors="replace")))
+
+
+def keep_cache_dir(base: str) -> str:
+    """The keep folder that the add-on derives from ``base`` (``keep_policy_cache_dir``): ``base`` itself when it
+    carries the token, else ``<base>-ftz_stripped``."""
+    base = base.rstrip(os.sep)
+    return base if KEEP_TOKEN in base else f"{base}-{KEEP_TOKEN}"
+
+
+def keep_folder_minted(folder: str) -> bool:
+    """The add-on wrote its marker beside the folder (``keep_policy_cache_marker``)."""
+    return os.path.exists(folder.rstrip(os.sep) + KEEP_MARKER_SUFFIX)
+
+
+def mint_keep_folder(base: str) -> dict:
+    """Let the add-on mint the keep folder of ``base`` (its marker), in a short process in the clone. Returns the
+    folder and the reasons of a refusal (a folder with files and without a marker; an unwritable folder)."""
+    env = dict(os.environ, CUPY_CACHE_DIR=base, PYTHONDONTWRITEBYTECODE="1")
+    proc = subprocess.run([sys.executable, "-c", MINT_KEEP_FOLDER], cwd=CLONE, env=env, capture_output=True,
+                          text=True, timeout=120)
+    for line in proc.stdout.splitlines():
+        if line.startswith("MINT_JSON "):
+            record = json.loads(line[len("MINT_JSON "):])
+            reasons = list((record.get("provenance") or {}).get("reasons") or [])
+            if not record.get("writable", False):
+                reasons.append(f"not writable: {record.get('error', '?')}")
+            return {"folder": record.get("after"), "reasons": reasons}
+    tail = (proc.stdout + proc.stderr).strip().splitlines()[-2:]
+    return {"folder": None, "reasons": [f"the mint call exited {proc.returncode}: {' | '.join(tail)}"[:MESSAGE_CHARS]]}
+
+
+def module_cache_dir(policy: str, args, base: str | None) -> tuple[str | None, str, str | None]:
+    """The ``CUPY_CACHE_DIR`` of one module: (folder or None for the environment's, cache policy label, note)."""
+    if args.cupy_cache_dir:
+        return args.cupy_cache_dir, "given", None
+    if args.cache_policy == "plain" or policy != "keep":
+        return None, "plain", None
+    if not base:
+        return None, "plain", "no CUPY_CACHE_DIR in the environment to derive the keep folder from"
+    folder = keep_cache_dir(base)
+    if keep_folder_minted(folder):
+        return folder, "keep", None
+    minted = mint_keep_folder(base)
+    if minted["reasons"] or minted["folder"] != folder:
+        return None, "plain", ("the add-on refused the keep folder: " + "; ".join(minted["reasons"])
+                               + ("" if minted["folder"] == folder else f" (it chose {minted['folder']})")
+                               )[:MESSAGE_CHARS]
+    return folder, "keep", "minted by the add-on before this module"
+
+
+def timeout_program() -> str:
+    """GNU timeout: ``gnutimeout`` when it exists (the GPU computer), else ``timeout`` (as tools/gpu_run.sh)."""
+    return shutil.which("gnutimeout") or shutil.which("timeout") or "timeout"
 
 
 def ordered(clone: Path = CLONE) -> list[tuple[str, str]]:
@@ -191,8 +298,11 @@ def run_module(module: str, tier_name: str, run: str, args, pending: set[str]) -
     log_path = folder / f"{slug}.log"
     basetemp = Path(tempfile.gettempdir()) / "addon-suite" / run / slug
     basetemp.parent.mkdir(parents=True, exist_ok=True)   # pytest makes --basetemp, but not its parent folders
-    env = hardware_env(args.hardware, args.cupy_cache_dir)
-    cmd = ["timeout", "-k", str(KILL_AFTER_S), str(args.timeout), sys.executable, "-m", "pytest", "-q", module,
+    cache_dir, cache_label, cache_note = module_cache_dir(cache_policy(module), args,
+                                                          os.environ.get("CUPY_CACHE_DIR"))
+    env = hardware_env(args.hardware, cache_dir)
+    program = timeout_program()
+    cmd = [program, "-k", str(KILL_AFTER_S), str(args.timeout), sys.executable, "-m", "pytest", "-q", module,
            f"--junitxml={xml_path}", f"--basetemp={basetemp}"]
     state = machine_state()
     started = dt.datetime.now().isoformat(timespec="seconds")
@@ -201,8 +311,10 @@ def run_module(module: str, tier_name: str, run: str, args, pending: set[str]) -
         proc = subprocess.run(cmd, cwd=CLONE, env=env, stdout=log, stderr=subprocess.STDOUT)
     wall_s = time.perf_counter() - t0
     row = {"module": module, "tier": tier_name, "hardware": args.hardware, "started": started, **state,
-           **row_environment(env),
+           **row_environment(env), "cache_policy": cache_label, "timeout_program": Path(program).name,
            "exit": proc.returncode, "timed_out": proc.returncode in TIMEOUT_EXITS}
+    if cache_note:
+        row["cache_note"] = cache_note
     if xml_path.exists():
         counts = junit_counts(xml_path, pending)
         row.update({k: counts[k] for k in ("passed", "failed", "skipped", "errors")})
@@ -293,6 +405,8 @@ def parse(argv=None):
     p.add_argument("--run", default="suite", help="name of the run: .local/addon-runs/suite/<run>.jsonl")
     p.add_argument("--tier", choices=TIERS, action="append", help="only modules of this tier (repeatable)")
     p.add_argument("--modules", nargs="*", help="these modules (paths in the clone), in this order")
+    p.add_argument("--cache-or-policy", action="store_true",
+                   help="only the modules whose source names the CuPy cache folder or the subnormal policy")
     p.add_argument("--start", type=int, default=0, help="index of the first module in the selected order")
     p.add_argument("--count", type=int, default=None, help="at most this many modules")
     p.add_argument("--resume", action="store_true", help="skip the modules that the run already logged")
@@ -313,8 +427,11 @@ def parse(argv=None):
     p.add_argument("--stop-after-timeouts", type=int, default=2,
                    help="stop after this many modules in a row that reach the time limit")
     p.add_argument("--cupy-cache-dir", default=None,
-                   help="CUPY_CACHE_DIR for the modules (the add-on refuses a 'keep' install by hand unless the "
+                   help="CUPY_CACHE_DIR for all modules (the add-on refuses a 'keep' install by hand unless the "
                         "folder name carries 'ftz_stripped', and a 'flush' install if it does)")
+    p.add_argument("--cache-policy", choices=CACHE_POLICIES, default="module",
+                   help="module: the keep folder for the modules that install 'keep' by hand, the folder of the "
+                        "environment for the others; plain: the folder of the environment for all")
     p.add_argument("--stop-file", default=str(OUT / "STOP"),
                    help="touch this file to stop the run after the current module (only a write after the start "
                         "of the run counts)")
@@ -329,10 +446,13 @@ def main(argv=None) -> int:
         return 2
     rows = ordered()
     if args.list:
+        keep = []
         for i, (t, m) in enumerate(rows):
-            print(f"{i:4d} {t:13s} {m}")
+            if cache_policy(m) == "keep":
+                keep.append(m)
+            print(f"{i:4d} {t:13s} {m}" + ("   (keep cache folder)" if m in keep else ""))
         counts = {t: sum(1 for r in rows if r[0] == t) for t in TIERS}
-        print("modules:", len(rows), counts)
+        print("modules:", len(rows), counts, "| keep cache folder:", len(keep))
         return 0
     tiers = dict((m, t) for t, m in rows)
     if args.modules:
@@ -343,6 +463,8 @@ def main(argv=None) -> int:
         selected = list(args.modules)
     else:
         selected = [m for t, m in rows if not args.tier or t in args.tier]
+    if args.cache_or_policy:
+        selected = [m for m in selected if names_cache_or_policy(m)]
     selected = selected[args.start:]
     jsonl = OUT / f"{args.run}.jsonl"
     logged = last_rows(jsonl, args.hardware)
@@ -415,7 +537,7 @@ def outer(selected: list[str], jsonl: Path, args) -> int:
         cmd = ["bash", "tools/gpu_run.sh", CLONE_REL, "python", str(PACKAGE / "suite_runner.py"), "--inner",
                "--run", args.run, "--hardware", args.hardware, "--timeout", str(args.timeout),
                "--chunk-seconds", str(args.chunk_seconds), "--stop-after-timeouts", str(args.stop_after_timeouts),
-               "--stop-file", args.stop_file, "--started", repr(started),
+               "--stop-file", args.stop_file, "--started", repr(started), "--cache-policy", args.cache_policy,
                *(["--cupy-cache-dir", args.cupy_cache_dir] if args.cupy_cache_dir else []), "--modules", *chunk]
         proc = subprocess.run(cmd, cwd=REPO, env=env)
         lines = jsonl.read_text().splitlines()[before:] if jsonl.exists() else []

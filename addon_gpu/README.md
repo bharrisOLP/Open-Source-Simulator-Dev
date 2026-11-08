@@ -10,14 +10,15 @@ compiles the hand-written kernels) and the AMD backend of Triton.
 **Status (2026-11-08): version 0.1 works.** Both kernel tables of the add-on run on the AMD GPU, with four small
 patches (`tools/env/addon_patches/`). All 409 test modules of the add-on ran on this GPU, one at a time: with the
 four patches 379 are clean, and each failure of the other 30 is sorted ("The whole test suite of the add-on"); none
-needs a change of a kernel. On three cases the kernels give the same float32 words as the array path of
-the add-on, and they agree with the CPU solver to 8.3e-6 or better (relative L2). On a 3-D case of 2,097,152 cells
-the time loop is 16 times (Triton) to 27 times (hand-written kernels) as fast as the serial CPU solver (float32 on
-the GPU, float64 on the CPU). Patch 0003 lets the lift read the permittivity in bulk on this solver build, so a whole
-run (setup and time loop) is now faster on the GPU route in both bench cases: 2.19 to 2.34 times in 2-D (1,536,000
-cells, 2,400 steps) and 3.12 to 3.37 times in 3-D (2,097,152 cells, 1,280 steps), with the kernel tables. Before
-patch 0003 the setup dominated, and the whole 2-D run was 3.4 to 3.7 times slower than on the CPU solver. Small runs
-are still slower on the GPU ("Timings"; measured with patches 0001 to 0003).
+needs a change of a kernel (two of them pass since the runner sets the CuPy cache folder per module). On three cases
+the kernels give the same float32 words as the array path of the add-on, and they agree with the CPU solver to
+8.3e-6 or better (relative L2). On a 3-D case of 2,097,152 cells the time loop is 16 times (Triton) to 27 times
+(hand-written kernels) as fast as the serial CPU solver (float32 on the GPU, float64 on the CPU). Patch 0003 lets
+the lift read the permittivity in bulk on this solver build, so a whole run (setup and time loop) is now faster on
+the GPU route in both bench cases: 2.19 to 2.34 times in 2-D (1,536,000 cells, 2,400 steps) and 3.12 to 3.37 times
+in 3-D (2,097,152 cells, 1,280 steps), with the kernel tables. Before patch 0003 the setup dominated, and the whole
+2-D run was 3.4 to 3.7 times slower than on the CPU solver. Small runs are still slower on the GPU ("Timings";
+measured with patches 0001 to 0003).
 
 ## What runs on the AMD GPU
 
@@ -107,8 +108,8 @@ for bit; "relative" is the relative L2 difference.
     bench case, 2,400 steps; fluxes equal), 0 of 2,097,152 (3-D bench case, 320 steps; flux equal), and 0 on the slab
     and the sphere of `tests/test_parity.py`.
 
-The tests of this folder: 41 of 41 pass (`tests/test_patches.py`, `tests/test_parity.py`,
-`tests/test_suite_runner.py`; 78 s, 2026-11-08, on the pinned clone with the four patches, without
+The tests of this folder: 51 of 51 pass (`tests/test_patches.py`, `tests/test_parity.py`,
+`tests/test_suite_runner.py`; 83 s, 2026-11-08 14:45 EST, on the pinned clone with the four patches, without
 `ADDON_GPU_CLONE`).
 
 The test modules of the add-on, run one at a time (2026-11-07, pinned clone, then the work copy with both patches):
@@ -211,7 +212,9 @@ class 9 has 1.
 5. A module fixture installs `keep` by hand. The add-on then asks for a `CUPY_CACHE_DIR` whose path carries
    `ftz_stripped` (its `docs/guides/kernel-dispatch.md`), and `tools/env/addon_gpu_activate.sh` sets
    `.local/cupy-cache`. With `suite_runner.py --cupy-cache-dir <a folder named ...ftz_stripped>` both modules pass
-   (83 and 14 passed, patches 0001 to 0003; `benchmarks/2026-11-08/addon-suite-keepcache.jsonl`).
+   (83 and 14 passed, patches 0001 to 0003; `benchmarks/2026-11-08/addon-suite-keepcache.jsonl`). Since these rows,
+   the runner gives these two modules the keep folder by default ("The CuPy cache folder of each module"), and both
+   pass in the normal run.
 6. The two tests expect the refusal of an uncertified Triton version and of an unsupported device; the switch of
    this run admits both. Without the switch both pass (`benchmarks/2026-11-08/addon-suite-default.jsonl`, 08:16 EST,
    patches 0001 to 0003 and the first form of patch 0004: 204 passed; the 2 failures are those of notes 1 and 2).
@@ -244,6 +247,50 @@ patches, Metal 9 of 410 and 9 of 318, Triton 96 of 577, 38 of 432 and 1 of 80, C
 of `meep_gpu/host_writes.py`, only `bit_identity_gate` of the Triton ledger is a raw-tier digest; the
 `driver_dispatch` entries pin it in a provenance map (`array_path_oracle.provenance_code_sha256`) that the add-on
 reports and does not judge. `meep_gpu/sources.py` is pinned by more entries of the Triton and Metal ledgers.
+
+### The CuPy cache folder of each module (2026-11-08)
+
+The add-on keeps one CuPy cache folder for each float32 subnormal policy (`meep_gpu/subnormal_policy.py`,
+`cupy_cache_reasons`): an install of `keep` refuses a `CUPY_CACHE_DIR` whose path does not carry `ftz_stripped`, and
+an install of `flush` refuses one that does. Its dispatch installs `keep` itself, derives the keep folder
+`<CUPY_CACHE_DIR>-ftz_stripped` (`keep_policy_cache_dir`), and mints it with a marker file beside it; it refuses a
+keep folder that holds files and has no marker. The two modules of note 5 install `keep` by hand and set no folder.
+
+`suite_runner.py` now sets the folder per module (`--cache-policy module`, the default): the keep folder that the
+dispatch derives (`.local/cupy-cache-ftz_stripped`) for a module whose source installs `keep` by hand, names no
+`CUPY_CACHE_DIR` and installs no `flush` (the two modules of note 5, and no other module at the pinned commit), and
+the folder of `tools/env/addon_gpu_activate.sh` (`.local/cupy-cache`) for all other modules. If the marker is
+missing, the add-on mints the folder first; if the add-on refuses the folder, the module runs with
+`.local/cupy-cache`, and its row gives the reason. The alternative, one keep folder for every module (set by the
+activate script), was measured too. Both runs cover the 60 modules whose source names the cache folder or the
+policy (`--cache-or-policy`), with the four patches, one at a time. Each row is compared with the row of the same
+module in `addon-suite-any-0004m.jsonl` ("same": the same counts, exit code and failed tests):
+
+| Cache folders | File (`benchmarks/2026-11-08/`) | Same rows | The two modules of note 5 | Other changes |
+|---|---|---|---|---|
+| per module (the default) | `addon-suite-cache-module.jsonl` | 58 of 60 | 83 and 14 passed | none |
+| the keep folder for all | `addon-suite-cache-keep-all.jsonl` | 57 of 60 | 83 and 14 passed | 3 failed |
+
+With the keep folder for all modules, `meep_gpu/test_triton_no_pml_constitutive.py` gives 169 passed and 3 failed
+(was 172 passed): in one test the add-on refuses an install of `flush` ("CUPY_CACHE_DIR ... carries the keep-policy
+token 'ftz_stripped' but 'flush' was requested"), and two more tests of the module fail an assertion. So the folder is
+set per module, and the activate script keeps `.local/cupy-cache`. Commands (on the GPU computer, from the
+repository folder; the rows started 14:36:44 to 14:38:50 and 14:41:35 to 14:43:39 EST, uptime increasing in each
+file, no time-out):
+
+```bash
+export OMP_NUM_THREADS=4 OPENBLAS_NUM_THREADS=4 MKL_NUM_THREADS=4 CUPY_GPU_MEMORY_LIMIT=8589934592
+uv run --no-project --python 3.12 addon_gpu/suite_runner.py --run cache-module-w10b --cache-or-policy \
+  --chunk 60 --chunk-seconds 280
+uv run --no-project --python 3.12 addon_gpu/suite_runner.py --run cache-keep-all-w10b --cache-or-policy \
+  --chunk 60 --chunk-seconds 280 --cupy-cache-dir $PWD/.local/cupy-cache-ftz_stripped
+```
+
+The time limit of each module now uses GNU timeout (`gnutimeout` on the GPU computer, as `tools/gpu_run.sh`): at
+the limit it sends SIGTERM, and 30 s later SIGKILL, to the process group of the module, so a process that the module
+started also ends. GNU timeout is in that group, so the SIGKILL also ends it: the runner counts the return code -9
+as a time-out, with 124 and 137. `tests/test_suite_runner.py` checks this with a command and a second process that
+both ignore SIGTERM (both end, return code -9). Each row of the two files names `gnutimeout`.
 
 ## Timings
 
@@ -336,6 +383,9 @@ With patch 0003, the setup on the GPU route is the `init_sim` of the solver and 
   of the rows increases from 32,048 s to 50,416 s.
 - 2026-11-08, 09:05:53 to 09:29:32 EST: all 409 modules again, with the four patches
   (`benchmarks/2026-11-08/addon-suite-any-0004m.jsonl`); the uptime of the rows increases from 54,333 s to 55,752 s.
+- 2026-11-08, 14:36:44 to 14:43:39 EST: the 60 modules that name the CuPy cache folder or the subnormal policy, twice
+  ("The CuPy cache folder of each module"), one at a time, GNU timeout; the uptime of the rows increases from
+  74,183 s to 74,598 s. The whole suite did not run again.
 
 ## Open items
 
@@ -345,14 +395,11 @@ With patch 0003, the setup on the GPU route is the `init_sim` of the solver and 
   checks have not run again on it.
 - Patch 0004 makes the words of the source deposit equal those of the host for the three amplitude tables of its
   tests. The other subtractions on the GPU (the array path, the kernels, the `D - P` update of `deposit_repair.py` at
-  its repair cells) keep the NaN sign of the GPU; no test of the add-on compares NaN words there, and a NaN field is
-  a diverged run in any case.
-- `tools/gpu_run.sh` ends a hold with GNU `timeout -k 30` (`gnutimeout` on the GPU computer; SIGKILL to the
-  process group 30 s after SIGTERM; `GPU_RUN_KILL_AFTER`). `suite_runner.py` gives each module `timeout -k 30`
-  (the `timeout` on the PATH: on the GPU computer the uutils one, which sends SIGKILL only to the direct child).
-- `tools/env/addon_gpu_activate.sh` sets `CUPY_CACHE_DIR=.local/cupy-cache`. A module that installs `keep` by hand
-  needs a folder whose path carries `ftz_stripped`, and one that installs `flush` by hand needs a folder without it;
-  `suite_runner.py --cupy-cache-dir` sets the folder for one run.
+  its repair cells) keep the NaN sign of the GPU. There is no patch 0005 for `deposit_repair.py`: the repair must
+  give the words of `update_E` on the same device, and it does, NaN words included (`nan_words_probe.py` part 3;
+  `tools/env/addon_patches/README.md`, "No patch 0005").
+- The CuPy cache folder is set per module by `suite_runner.py` ("The CuPy cache folder of each module"). A script
+  that installs `keep` by hand outside the runner must set a `CUPY_CACHE_DIR` that carries `ftz_stripped` itself.
 - `subnormal_policy._clear_triton_jit_caches` of the add-on reads `JITFunction.cache`, which Triton 3.8 does not
   have, so on this GPU a policy install drops no compiled Triton kernel of the process. No test of the suite
   failed by it.
@@ -406,11 +453,11 @@ environment (and `MEEP_GPU_KERNEL_TABLE=cuda` or `triton` to select one table). 
 - `triton_subnormal_probe.py`: keep or flush, bit for bit, for the Triton op classes of the kernels.
 - `keep_key_probe.py`: is the keep token of patch 0002 in the CuPy cache key, before and after the keep install.
 - `profile_setup.py`: where the setup before the first step goes (the lift under the Python profiler).
-- `suite_runner.py`: runs the test modules of the add-on one at a time, each with its own time limit, in chunks of
-  one hold of the GPU lock, and logs one JSON line per module (`--summary`: the totals by tier; a stop file stops a
-  run after the current module).
+- `suite_runner.py`: runs the test modules of the add-on one at a time, each with its own time limit (GNU timeout)
+  and its own CuPy cache folder, in chunks of one hold of the GPU lock, and logs one JSON line per module
+  (`--summary`: the totals by tier; a stop file stops a run after the current module).
 - `nan_words_probe.py`: the NaN words of the GPU against those of the host (the failure of
-  `meep_gpu/test_source_deposit.py`).
+  `meep_gpu/test_source_deposit.py`; part 3: the `D - P` of the deposit repair).
 - `preimport_triton_kernels.py`: a pytest plugin that imports the Triton kernel modules of the add-on before the
   tests (the order dependence of `meep_gpu/test_dispatch_chunk_division.py`).
 - `tests/`: the pytest tests (GPU computer only).

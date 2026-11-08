@@ -227,3 +227,43 @@ def test_the_door_widens_a_subtrahend_of_another_dtype_on_the_amd_gpu(dtype):
     host = door(stored.copy(), subtrahends, None)
     device = cupy.asnumpy(door(cupy.asarray(stored), cupy.asarray(subtrahends), None))
     np.testing.assert_array_equal(device.view(np.uint32), host.view(np.uint32))
+
+
+def test_the_repair_forms_d_minus_p_as_update_e_on_the_same_device():
+    """No patch 0005 (tools/env/addon_patches/README.md). ``deposit_repair._fresh_at`` forms the float32 ``D - P`` at
+    the repair cells with the words of the whole-volume form of ``update_E`` on the same device, NaN words included
+    (49 pairs of planted words: finite, NaN of both signs, a NaN payload, infinities). The GPU differs from the host
+    only where P is a NaN and D is not, and there only in the sign bit. A patch of the repair alone (host words) would
+    break the first equality on the GPU; the array path and the kernels form ``D - P`` with the GPU's sign."""
+    import cupy
+
+    import nan_words_probe
+
+    rep = nan_words_probe.repair(cupy)
+    assert rep["cells"] == 49 and rep["nan_results"] > 0
+    assert rep["device_repair_vs_device_whole"] == 0
+    assert rep["host_repair_vs_host_whole"] == 0
+    assert rep["device_vs_host"] > 0, "the control: the planted NaN words must reach the sign of the GPU"
+    assert rep["device_vs_host_sign_only"] and rep["differ_where_p_nan_d_not"], rep["pairs_host_device"]
+
+
+def test_no_test_module_of_the_repair_compares_nan_words():
+    """The static count of the decision "no patch 0005": of the 409 test modules of the add-on, 79 name the repair and
+    31 write a NaN value; the one module in both (``meep_gpu/test_triton_kernels.py``) names the repair in a docstring
+    and gives a NaN coefficient to a check that must refuse it."""
+    import re
+
+    import suite_runner
+
+    repair = re.compile(r"deposit_repair|_fresh_at")
+    nan = re.compile(r"numpy\.nan\b|np\.nan\b|float\([\"']-?nan[\"']\)|math\.nan\b|cupy\.nan\b|cp\.nan\b|"
+                     r"0x7fc00000|0xffc00000|0x7f800001", re.IGNORECASE)
+    texts = {m: (PINNED_CLONE / m).read_text(errors="replace") for m in suite_runner.modules(PINNED_CLONE)}
+    names = {m for m, text in texts.items() if repair.search(text)}
+    plants = {m for m, text in texts.items() if nan.search(text)}
+    assert (len(texts), len(names), len(plants)) == (409, 79, 31)
+    assert names & plants == {"meep_gpu/test_triton_kernels.py"}
+    text = texts["meep_gpu/test_triton_kernels.py"]
+    assert [line for line in text.splitlines() if repair.search(line)] == [
+        "    ``deposit_repair`` cannot save and restore, so it stays refused under the shipped"]
+    assert len(nan.findall(text)) == 1 and 'float("nan"),) + tuple(c[1:]), "two_minus_od=nan is not finite"' in text

@@ -1,0 +1,27 @@
+1.5 - b            +qnan           host 7ff8000000000000 device fff8000000000000 DIFFERENT
+1.5 + b            +qnan           host 7ff8000000000000 device 7ff8000000000000 equal
+1.5 * b            +qnan           host 7ff8000000000000 device 7ff8000000000000 equal
+b - 1.5            +qnan           host 7ff8000000000000 device 7ff8000000000000 equal
+float32(1.5 - b)   +qnan           host 7fc00000 device ffc00000 DIFFERENT
+float32(b)         +qnan           host 7fc00000 device 7fc00000 equal
+1.5 - b            -qnan           host fff8000000000000 device 7ff8000000000000 DIFFERENT
+1.5 + b            -qnan           host fff8000000000000 device fff8000000000000 equal
+1.5 * b            -qnan           host fff8000000000000 device fff8000000000000 equal
+b - 1.5            -qnan           host fff8000000000000 device fff8000000000000 equal
+float32(1.5 - b)   -qnan           host ffc00000 device 7fc00000 DIFFERENT
+float32(b)         -qnan           host ffc00000 device ffc00000 equal
+1.5 - b            +qnan payload   host 7ff8000000000123 device fff8000000000123 DIFFERENT
+1.5 + b            +qnan payload   host 7ff8000000000123 device 7ff8000000000123 equal
+1.5 * b            +qnan payload   host 7ff8000000000123 device 7ff8000000000123 equal
+b - 1.5            +qnan payload   host 7ff8000000000123 device 7ff8000000000123 equal
+float32(1.5 - b)   +qnan payload   host 7fc00000 device ffc00000 DIFFERENT
+float32(b)         +qnan payload   host 7fc00000 device 7fc00000 equal
+1.5 - b            -qnan payload   host fff8000000000123 device 7ff8000000000123 DIFFERENT
+1.5 + b            -qnan payload   host fff8000000000123 device fff8000000000123 equal
+1.5 * b            -qnan payload   host fff8000000000123 device fff8000000000123 equal
+b - 1.5            -qnan payload   host fff8000000000123 device fff8000000000123 equal
+float32(1.5 - b)   -qnan payload   host ffc00000 device 7fc00000 DIFFERENT
+float32(b)         -qnan payload   host ffc00000 device ffc00000 equal
+inf * 0            inf, 0          host fff8000000000000 device fff8000000000000 equal
+repair D - P: 49 cells, 35 NaN results; repair against the whole-volume form: host 0, device 0 differing words; device against host 12 (sign only: True; where P is a NaN and D is not: True); host/device [('7fc00000', 'ffc00000'), ('7fc00123', 'ffc00123'), ('ffc00000', '7fc00000')]
+NAN_JSON {"device": "AMD Radeon RX 7900 XT", "deposit": {"inf + 0j": {"cases": 84, "cases_differ": 0, "words_differ": 0, "differ_all_nan": true}, "1 + inf j": {"cases": 84, "cases_differ": 0, "words_differ": 0, "differ_all_nan": true}, "1 + nan j": {"cases": 84, "cases_differ": 0, "words_differ": 0, "differ_all_nan": true}}, "repair": {"cells": 49, "nan_results": 35, "device_repair_vs_device_whole": 0, "host_repair_vs_host_whole": 0, "device_vs_host": 12, "device_vs_host_sign_only": true, "differ_where_p_nan_d_not": true, "pairs_host_device": [["7fc00000", "ffc00000"], ["7fc00123", "ffc00123"], ["ffc00000", "7fc00000"]]}}
