@@ -1,6 +1,6 @@
 # Status
 
-Updated: 2026-10-30.
+Updated: 2026-11-07.
 
 ## In work
 
@@ -9,8 +9,26 @@ Updated: 2026-10-30.
   a follow-up of its review (f937f57); optics_gpu, all focus planes in one pass (0bbad9f; 3.1x per plane in
   complex128, about 27x in complex64); meow_gpu, the profile of the batched path (88d5158; the taper in mixed
   precision 7.9 s instead of 11.7 s per cell, single 1.86x faster at B = 4).
-- In work: fdtd_gpu, subpixel averaging of the permittivity (the logged bench, then the review); the add-on route
-  of item 2 (installed; the AMD port is in work).
+- Done on 2026-11-07: fdtd_gpu, subpixel averaging of the permittivity, now the default (46da80a; ring and
+  Bragg converge at second order); charge_gpu, the SuperLU fallback catches only real device failures (0bb5179);
+  meow_gpu, a cold start of "mixed" searches to 2e-5 in complex64 (18f2178; before, the SiN tip could give wrong
+  modes 3 and 4 with converged=True, decided by the BLAS thread count); optics_gpu, a symmetric core and an
+  explicit x-polarized source in the scans example (e15c847; the core had a one-column staircase error, so the
+  two lowest modes were diagonal and rounding chose the source component; eta 0.8866 instead of 0.8888), and the
+  same fix in the top-level example `examples/chip_to_fiber_coupling.py` (the documents commit of 2026-11-07);
+  fdtd_gpu, objects repeat across periodic faces (eade281).
+- In work: the add-on route of item 2 (installed; two ROCm patches in `tools/env/addon_patches/`: hipRTC options
+  and subnormals; both kernel tables ran on the RX 7900 XT; parity tests and timings in work, one module at a time).
+- 2026-11-07, the GPU computer stopped at 16:49:44 EST: the kernel (7.0.0-38-generic) stopped with an Oops in the
+  amdgpu/TTM memory manager ("list_del corruption" and "list_add corruption", then a NULL pointer dereference in
+  `ttm_resource_move_to_lru_tail`) during a GPU memory allocation (KFD ioctl) of a `python` process of the user,
+  about 80 s after the RX 7900 XT resumed from runtime suspend. `panic_on_oops` is 1, so kdump saved a crash dump
+  (`/var/crash/202611071650` on that computer). The OOM kills and the "Fatal error during GPU init" of the next
+  boot came from the kdump capture kernel (small memory, one CPU; the GPU error is for the integrated GPU), not from
+  the crash. The computer stayed down until the user restarted it (18:00; now kernel 7.0.0-42-generic). Not known:
+  which process (the add-on tests had just started), and if the trigger is a driver bug or the program. Found by
+  the review of the documents commit (the record has the log details). Until more is known: run the add-on tests
+  in small parts, one module at a time, and one GPU job at a time on the shared computer.
 
 **1. meow-gpu (EME): version 0.1 works.** Folder: `meow_gpu/` (`meow_gpu/README.md` has the results).
 
@@ -100,7 +118,9 @@ Open (later, in this order): profile the batched path (the work per member is it
 - Checks: 4f imaging and analytic Gaussian coupling (1e-3), power conservation (1 %), and an aberrated singlet
   against Optiland's independent Huygens PSF (correlation 0.998).
 - Example `examples/chip_to_fiber_coupling.py`: SiN tip mode (meow-gpu) through a 2.5x lens pair into SMF-28:
-  eta 0.889 at focus, with a focus scan (14 um mode window; an 8 um window cut the mode tails).
+  eta 0.8866 at focus and 0.6665 at +-60 um (2026-11-07: a symmetric core and an x-polarized source;
+  `benchmarks/2026-11-07/chip-to-fiber.jsonl`; 0.889 before, with a core that had a one-column staircase error),
+  with a focus scan (14 um mode window; an 8 um window cut the mode tails).
 - Optiland's ray trace on the GPU (PyTorch backend, float64; `tools/env/optics_rocm.sh`): equal to the NumPy trace
   (difference 0); at 1e7 rays 7.3x faster than one-thread NumPy (4.5x with the copy to the host); not faster below about 1e5 rays.
 - The whole pipeline on the GPU (trace, weights, image sum; focus and lateral scans from one trace): 1.4x to 1.85x
@@ -217,3 +237,9 @@ Decided (2026-10-30):
   MIT-licensed mode-solver folder of tidy3d: the notices are now in `THIRD_PARTY_NOTICES.md` and the file headers.
 - 2026-11-07: a usage limit stopped the work for some days; it continues with fdtd_gpu (subpixel averaging) and
   the add-on port.
+- 2026-11-07: the GPU computer stopped with a kernel Oops in the amdgpu/TTM memory manager (see "In work"); it
+  ran again from 18:00, shared with another session (4 CPU threads, about 8 GB of VRAM for this repository).
+  Commits: fdtd-gpu subpixel averaging (46da80a) and periodic faces (eade281); charge-gpu device-error fallback
+  (0bb5179); meow-gpu cold-start stop (18f2178; a review-follow-up test found wrong converged modes on the SiN tip
+  with 1 BLAS thread); optics-gpu symmetric core and explicit source (e15c847; its review found the staircase
+  error). The reviews also found the cause of the crash and the asymmetric core.

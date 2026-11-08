@@ -54,3 +54,12 @@ line, then delete it yourself or reject it.
 | 2026-10-30 | GPU computer | `/tmp/rv_gmres_layout_check.py` | a scratch script of an agent or a reviewer (tests and checks) | not needed: no result depends on it |
 | 2026-10-30 | GPU computer | `/tmp/rv_omp_order_check.py` | a scratch script of an agent or a reviewer (tests and checks) | not needed: no result depends on it |
 | 2026-10-30 | GPU computer | `/tmp/rev7f37/` (the folder, with `rev7f37_plugin.py` and `rev7f37_probe.py`) and `/tmp/rev7f37_full.log` | scratch files of a reviewer (tests and checks) | not needed: no result depends on them |
+| 2026-11-07 | GPU computer | `/tmp/meowhead-f8c16ec/` (a folder: the f8c16ec source of meow_gpu, from git archive) | a scratch copy of an agent (an A/B test) | not needed |
+| 2026-11-07 | GPU computer | `/tmp/rv_cd200_edges.py` | a scratch script of a reviewer (tests and checks) | not needed: no result depends on it |
+| 2026-11-07 | GPU computer | `/tmp/rv_cd200_modes.py` | a scratch script of a reviewer (tests and checks) | not needed: no result depends on it |
+| 2026-11-07 | GPU computer | `os-simulator-dev/.local/review-fdtd5/` (a folder in the repository folder there, git-ignored) | the scratch script of a reviewer | not needed |
+| 2026-11-07 | GPU computer | `/tmp/rv_meow5_warm.py` | a scratch script of a reviewer (tests and checks) | not needed: no result depends on it |
+| 2026-11-07 | GPU computer | `/tmp/rv_meow5_limit.py` | a scratch script of a reviewer (tests and checks) | not needed: no result depends on it |
+| 2026-11-07 | GPU computer | `/tmp/rev_fdtd6_a.py` | a scratch script of a reviewer (tests and checks) | not needed: no result depends on it |
+| 2026-11-07 | GPU computer | `/tmp/rev_fdtd6_b.py` | a scratch script of a reviewer (tests and checks) | not needed: no result depends on it |
+| 2026-11-07 | GPU computer | `/dev/shm/rv_docs5_dm.txt`; `os-simulator-dev/results/chip_to_fiber/rv_docs5_x.npz` and `rv_docs5_y.npz` (in the git-ignored results folder there) | scratch files of a reviewer (the decoded crash dmesg; two mode files) | not needed: no result depends on them |

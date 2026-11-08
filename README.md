@@ -15,7 +15,8 @@ RX 7900 XT (gfx1100) with ROCm 10.1 pip wheels and JAX 0.11.1.
 | Meep on AMD (`addon_gpu/`, GPL) | FDTD | ROCm port of a GPU add-on (GPL-2.0-or-later) | approved and installed on the GPU computer; the port is in work (STATUS.md) |
 
 Examples (`examples/`): a thermo-optic phase shifter (P_pi), a depletion modulator (V_pi L), and chip-to-fiber
-coupling through a lens pair (coupling efficiency and focus scan).
+coupling through a lens pair (coupling efficiency and focus scan; two runs: the mode solve in `.venv-rocm`, then the
+optics in `.venv-optics`, as its docstring shows).
 
 - `STATUS.md`: the tool in work, the queue, the decisions and the log.
 - `benchmarks/`: the raw JSON rows of the timing runs, with an index of the claims that cite them.
