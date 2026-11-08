@@ -347,8 +347,9 @@ With patch 0003, the setup on the GPU route is the `init_sim` of the solver and 
   tests. The other subtractions on the GPU (the array path, the kernels, the `D - P` update of `deposit_repair.py` at
   its repair cells) keep the NaN sign of the GPU; no test of the add-on compares NaN words there, and a NaN field is
   a diverged run in any case.
-- `tools/gpu_run.sh` ends a hold with `timeout` and no `-k` (SIGTERM only); `suite_runner.py` gives each module
-  `timeout -k 30`.
+- `tools/gpu_run.sh` ends a hold with GNU `timeout -k 30` (`gnutimeout` on the GPU computer; SIGKILL to the
+  process group 30 s after SIGTERM; `GPU_RUN_KILL_AFTER`). `suite_runner.py` gives each module `timeout -k 30`
+  (the `timeout` on the PATH: on the GPU computer the uutils one, which sends SIGKILL only to the direct child).
 - `tools/env/addon_gpu_activate.sh` sets `CUPY_CACHE_DIR=.local/cupy-cache`. A module that installs `keep` by hand
   needs a folder whose path carries `ftz_stripped`, and one that installs `flush` by hand needs a folder without it;
   `suite_runner.py --cupy-cache-dir` sets the folder for one run.

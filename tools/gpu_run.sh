@@ -9,7 +9,13 @@
 # the add-on clone (.local/upstream/erised-fork) it uses .local/envs/addon-gpu with the run-time variables of
 # tools/env/addon_gpu_activate.sh (tools/env/addon_gpu.sh makes that environment). Variables for the
 # command go before the script (THERMAL_GPU_DEVICE=cpu bash tools/gpu_run.sh ...). GPU_RUN_TIMEOUT (seconds,
-# default 1800) limits the run time, GPU_LOCK_WAIT (seconds, default 7200) the wait for the lock.
+# default 1800) limits the run time, GPU_LOCK_WAIT (seconds, default 7200) the wait for the lock. At the time limit
+# the process group of the command gets SIGTERM (exit 124); if the command still runs GPU_RUN_KILL_AFTER seconds
+# later (default 30), the group gets SIGKILL (exit 137). This needs GNU timeout: the uutils timeout of the GPU
+# computer (/usr/bin/timeout) sends SIGKILL only to the direct child, so the script uses gnutimeout when it exists.
+# A descendant still keeps the lock (flock runs without -o) when it is in its own process group (setsid, a nested
+# timeout), when it ignores SIGTERM and the direct child ends at SIGTERM (no SIGKILL then), or when it is stuck in
+# the GPU driver.
 set -euo pipefail
 usage="usage: bash tools/gpu_run.sh <folder> <command...>"
 [[ $# -ge 2 ]] || { echo "$usage" >&2; exit 2; }
@@ -32,4 +38,6 @@ export ROCR_VISIBLE_DEVICES=${ROCR_VISIBLE_DEVICES:-0} PYTHONDONTWRITEBYTECODE=1
 export XLA_PYTHON_CLIENT_MEM_FRACTION=${XLA_PYTHON_CLIENT_MEM_FRACTION:-0.8} PATH=$venv/bin:$PATH
 export PYTEST_ADDOPTS="${PYTEST_ADDOPTS:-} -p no:cacheprovider"
 cd "$root/$folder"
-exec flock -w "${GPU_LOCK_WAIT:-7200}" "$root/.local/gpu.lock" timeout "${GPU_RUN_TIMEOUT:-1800}" "$@"
+tmo=$(command -v gnutimeout || command -v timeout)
+exec flock -w "${GPU_LOCK_WAIT:-7200}" "$root/.local/gpu.lock" \
+  "$tmo" -k "${GPU_RUN_KILL_AFTER:-30}" "${GPU_RUN_TIMEOUT:-1800}" "$@"
