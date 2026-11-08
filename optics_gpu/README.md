@@ -17,6 +17,13 @@ E = image_sum(bundle, x_img_um, y_img_um, dz=20.0)       # the field 20 um after
 stack = image_planes(bundle, x_img_um, y_img_um, np.linspace(-60, 60, 25))      # 25 planes in one pass (Z, Nx, Ny)
 eta_z = overlap_efficiency_device(stack, fiber_mode, power=p0)                  # one eta per plane
 stack = image_planes(bundle, x_img_um, y_img_um, dzs, method="nufft")  # uniform grid: non-uniform FFT, tol 1e-12
+
+from optics_gpu.analysis import fft_mtf, fft_psf, huygens_psf, pupil_wavefront, zernike_fit
+wf = pupil_wavefront(optic, field=(0.0, 0.0), n_pupil=256, device="cuda")   # OPD map (waves), 256 x 256 pupil grid
+fit = zernike_fit(wf, 36, "fringe")      # or "noll"; fit.coeffs in waves
+psf = fft_psf(wf, grid_size=1024)        # psf.psf: peak 1 for a perfect pupil (Strehl units); psf.dx in um
+mtf = fft_mtf(wf, psf)                   # mtf.tangential, mtf.sagittal against mtf.freq_tan, mtf.freq_sag (cycles/mm)
+I = huygens_psf(optic, 1.55, x_img_um, y_img_um, device="cuda")   # the second PSF method: the image sum
 ```
 
 ## Method (`src/optics_gpu/pop.py`)
@@ -259,7 +266,141 @@ complex128 by at most 2.2e-14.
 **The default stays `method="direct"`.** A non-uniform FFT default needs a rule for `dtype=torch.complex64`
 (see Next).
 
+## Image quality: OPD, Zernike, PSF and MTF (`src/optics_gpu/analysis.py`)
+
+The analyses of lens-design tools for one field point and one wavelength, on one PyTorch device in float64
+(`device="cuda"` or `"cpu"`: the same code). Optiland's PyTorch backend traces a checked copy of the optic (as in
+"Ray trace on the GPU"; 6 check rays against the original), with Optiland's ray aiming: one ray per pupil point.
+
+1. Pupil grid: N x N points `np.linspace(-1, 1, N)` of the normalized entrance-pupil coordinates (Px, Py); the
+   points with Px^2 + Py^2 <= 1 are traced (51040 rays for N = 256), in blocks of `trace_chunk` rays. The arrays
+   are indexed [ix, iy], as the image fields of this package (Optiland: [iy, ix]).
+2. OPD map (`pupil_wavefront`): the reference sphere has its center at the image point of the chief ray and the
+   radius R from that point to the paraxial exit-pupil point. Each ray goes back from the image surface along its
+   direction to the sphere. W = (P_chief - P_ray) / lambda in waves, with P the optical path from the object to
+   the sphere (W > 0: a shorter path than the chief ray). For an object at infinity with an angle field, the phase
+   of the incident plane wave across the launch plane is added. Each sample also gives its point on the reference
+   sphere (`xp`, `yp`, `zp` in mm).
+3. Zernike fit (`zernike_fit`): unweighted least squares over the traced points with an intensity above 0, in
+   rho and phi of (Px, Py) (phi = atan2(Py, Px); m >= 0: cos(m phi), m < 0: sin(|m| phi)). The coefficients are in
+   waves.
+   - `"fringe"` (the default; 36 terms by default): the Fringe (University of Arizona) numbering
+     j = (1 + (n + |m|)/2)^2 - 2|m| + floor((1 - sgn m)/2), not normalized (Z4 = 2 rho^2 - 1,
+     Z9 = 6 rho^4 - 6 rho^2 + 1). For j <= 36 this is the 37-term Fringe set of lens-design tools. Term 37 is
+     (n, m) = (6, 6) here (as Optiland) and (12, 0) in that set.
+   - `"noll"`: the numbering of Noll (J. Opt. Soc. Am. 66, 207 (1976)), normalized to unit RMS over the unit disk
+     (sqrt(n + 1) for m = 0, sqrt(2 (n + 1)) else; Z4 = sqrt(3) (2 rho^2 - 1)).
+
+   The normal matrix A^T A and A^T W (points x terms: the large part) are made on the device. The terms x terms
+   system is solved on the host (NumPy `lstsq`, the columns scaled to unit norm; `fit.cond` is its condition
+   number: 2.33 for the singlet with 37 Fringe terms).
+4. FFT PSF (`fft_psf`): the N x N pupil function P = sqrt(I) exp(-i 2 pi W) (I: the ray intensity, 0 for a clipped
+   ray) in the middle of an M x M grid of zeros (default M = 2 N; (M - N) // 2 zeros before), and
+   PSF = |fftshift(fft2(P))|^2 / K^2, K = the number of samples with |P| > 0. Thus a uniform pupil without
+   aberration has the peak 1, and the peak of an aberrated PSF is its Strehl ratio. The image sampling is
+   dx = lambda F (N - 1) / M, with the working F-number F = 1 / (2 sqrt(<(n sin a)^2>)) of the four marginal rays
+   (a: the angle to the chief ray; the rays that are not clipped). The window M dx = lambda F (N - 1) is set by N;
+   the padding M / N sets the sampling (M = 2 N: about 2 samples per lambda F). The sample M // 2 is the image
+   point of the chief ray.
+5. MTF (`fft_mtf`): |fftshift(fft2(PSF))| normalized at zero frequency; tangential along y (Py), sagittal along x
+   (Px), M // 2 values each. A lag of one pupil sample is the frequency n |D(+1) - D(-1)| / ((N - 1) lambda)
+   (D: the direction of the marginal ray at the pupil coordinate +1 or -1, on a flat image surface normal to z),
+   so the cutoff 2 NA / lambda is at the lag N - 1. M >= 2 N - 1 keeps the autocorrelation of the pupil from
+   wrapping. `diffraction_limited_mtf` gives the MTF of a uniform circular pupil without aberration,
+   (2 / pi) (acos s - s sqrt(1 - s^2)), s = nu / (2 NA / lambda) (Goodman, Introduction to Fourier Optics, 3rd
+   ed., eq. 6-32), and `airy` the Airy pattern (2 J1(v) / v)^2, v = 2 pi NA r / lambda (Born and Wolf, Principles
+   of Optics, section 8.5.2).
+6. Huygens PSF (`huygens_psf`), the second method: the image sum of the device pipeline for a point source on the
+   axis (one sample of a 64 x 64 source of 1 um pitch, padded 16 times: a flat angular spectrum), normalized as
+   |E|^2 / (sum_r |a_r|)^2 (the peak for all rays in phase), on any grid of image points. It sums plane waves in
+   the image-side ray directions with the power weights sqrt(J). It does not use the pupil grid or the reference
+   sphere of items 1 to 5. It needs an object at a finite distance on the axis and a physical stop.
+
+Items 2 to 5 follow the conventions of Optiland 0.6.3 (its `Wavefront` "chief_ray" strategy, `ZernikeFit`,
+`ScalarFFTPSF` and `ScalarFFTMTF`), so that the results compare one to one; the code is written from the
+equations. The PSF here has the peak 1 for a perfect pupil (Optiland: 100).
+
+`systems.ideal_relay` is the perfect lens of the checks: two equal ideal thin lenses (f 20 mm) in a 4f
+arrangement, the stop on lens 1 with a physical aperture of radius 2 mm, the image surface at the back focus or
+moved by dz. Optiland's thin lens adds the optical path f - sqrt(h^2 + f^2) at the height h, so all rays of the
+axis point meet in one point with equal optical paths. The ray at the pupil radius rho has tan u = rho r / f on
+both sides (not the sine condition), and the image-side NA is sin u = r / sqrt(r^2 + f^2) = 0.0995.
+
+**Pure defocus.** For the image surface dz after the focus, a spherical wave on the reference sphere (radius R)
+has the exact OPD W(u) = dz (1 - cos u) + sqrt(R^2 - dz^2 sin^2 u) - R; the exit pupil of `ideal_relay` is 2 f
+after lens 2, so R = f - dz. With tan u = t rho, W = dz t^2 rho^2 / 2 - 3 dz t^4 rho^4 / 8 - dz^2 t^2 rho^2 / (2 R)
++ ... The Fringe coefficient c4 is half the sum of the rho^2 and rho^4 coefficients (rho^4 = Z9 / 6 + Z4 / 2 +
+Z1 / 3), and NA^2 = t^2 / (1 + t^2). Against the small-NA form W020 = NA^2 dz / 2 (c4 = W020 / 2; Noll:
+W020 / (2 sqrt(3))) this gives c4 / (W020 / 2) - 1 = t^2 / 4 - dz / R to first order.
+
+| Case | Reference | Agreement (observed; test tolerance) |
+|---|---|---|
+| perfect lens: `ideal_relay`, on the axis, pupil 256, grid 1024 (CPU, GPU) | OPD 0; R = f; F = 1 / (2 NA); the Airy pattern at r < 3.11 lambda / NA (5 dark rings); the diffraction-limited MTF | max \|W\| 0 (1e-9 waves); R, F and the frequency step (1e-12 relative); peak 1 (1e-12); PSF 3.0e-4 of the peak (1e-3); MTF tangential and sagittal 3.5e-4 (1e-3) |
+| Huygens PSF (image sum) of the same lens on 49 x 49 samples of the FFT PSF (dx 1.94 um), directions up to 0.15 (CPU, GPU) | the Airy pattern; the FFT PSF | peak 1 (1e-9); 8.1e-4 (2e-3); 6.6e-4 (2e-3) |
+| pure defocus: `ideal_relay` with dz = +20 and -20 um (r 2 mm, t 0.1) and +20 um (r 1 mm, t 0.05), pupil 128, Fringe and Noll, 36 terms (CPU, GPU) | the exact W(u) above and its Zernike fit on the same points; W020 = NA^2 dz / 2 = 0.0639, -0.0639, 0.0161 waves | map 1.4e-11 waves (1e-9); all 36 coefficients (1e-9 waves); c4 / (W020 / 2) - 1 = 1.48e-3, 3.48e-3, -3.77e-4 (Fringe and Noll), against t^2 / 4 - dz / R = 1.50e-3, 3.50e-3, -3.75e-4 (1e-4) |
+| `zernike_basis`, 45 terms, 500 random points of the unit disk | Optiland's `ZernikeFringe` and `ZernikeNoll` | the same (n, m); values within the tolerance 1e-11 (the observed value is not printed) |
+| 28 terms, midpoint rule on 2000 x 2000 points of the unit disk | Noll: <Z_i Z_j> = delta_ij; Fringe: diagonal 1 / (n + 1) (m = 0), 1 / (2 (n + 1)) (m != 0) | 2.5e-4 (Noll), 2.7e-5 (Fringe) (1e-3) |
+| the singlet on the axis, the singlet with an object height of 1 mm, and the singlet with the object at infinity and a 2-degree field (OPD peak to valley 4.07, 5.23, 2.61 waves; Strehl 0.028, 0.033, 0.046), pupil 128, grid 256 (CPU, GPU) | Optiland (NumPy): `Wavefront` (uniform, 128); `ZernikeFit` on its points (Fringe and Noll, 37 terms); `ScalarFFTPSF`; `ScalarFFTMTF` | OPD GPU 8.9e-16, 4.6e-12, 2.3e-12 waves, CPU 9.2e-12, 3.2e-11, 6.9e-12 (1e-10); the same intensities; R (1e-12 relative); the points on the sphere (1e-9 mm); Zernike 8.0e-13 waves or less (1e-11); PSF 5.1e-14 or less (1e-11); MTF 5.2e-13 or less (1e-11); frequency axes (1e-12 relative) |
+| the singlet, Fringe, 37 terms on the uniform pupil of 128 | Optiland's `ZernikeOPD` (15 hexapolar rings) | 9.9e-7 waves (1e-5); c4 2.02, c9 0.71, c16 0.019 waves; RMS residual of the fit 1.6e-7 waves |
+| the singlet, Huygens PSF (image sum) on 80 x 80 points of 1 um, and on 41 x 41 samples of the FFT PSF (pupil 256, grid 1024, dx 2.28 um) (CPU, GPU) | Optiland's `HuygensPSF` (pupil 128); the FFT PSF | correlation 0.999 and 0.997 (0.995); peak 0.0245 against 0.0269 (Optiland) and 0.0245 against 0.0280 (FFT PSF) (ratio 0.85 to 1) |
+| the singlet, pupil 200 in blocks of 7000 rays, grid 512 (GPU) | the same code on the CPU | OPD 1.8e-11 waves, Zernike 1.2e-13 waves, PSF 2.3e-14, MTF 2.1e-13 (1e-10) |
+| pupil 64 in blocks of 500 rays (CPU) | one block | bit for bit |
+| bad inputs: device "mps", `n_pupil` 1, `trace_chunk` 0, grid below N, kind "standard", fewer points than terms | | ValueError |
+
+The three PSFs of the singlet have the same shape (correlation 0.997 to 0.999) but different peaks. The methods
+place and weight the pupil samples differently: the FFT method puts a uniform amplitude on a uniform grid of the
+entrance-pupil coordinates and takes that grid as linear in the image-side direction cosines; Optiland's Huygens
+PSF puts the same uniform amplitude at the points of those rays on the reference sphere; the image sum uses the
+image-side ray directions with the power weights sqrt(J). For the perfect lens the methods agree to 8.1e-4 of the
+peak. For the singlet (4.07 waves peak to valley) no test isolates the cause of the differences.
+
+**Timings** (`bench/bench_analysis.py`). Optiland 0.6.3 on its NumPy backend on the CPU of the GPU computer
+(`OMP_NUM_THREADS`, `OPENBLAS_NUM_THREADS` and `MKL_NUM_THREADS` 4) against this code on the GPU (RX 7900 XT;
+`.venv-optics`, PyTorch 2.14.1 for ROCm 7.2), on the axis, pupil N x N, grid M = 2 N, best of 2 runs after one
+untimed run. Rows in `benchmarks/2026-11-08/optics-analysis.jsonl`, from the repository folder on the GPU computer:
+
+    bash tools/gpu_run.sh optics_gpu python bench/bench_analysis.py --pupil 64 128 256 512 1024 2048 --huygens
+    bash tools/gpu_run.sh optics_gpu python bench/bench_analysis.py --system relay --pupil 256 1024
+
+Each Optiland call is timed alone: `ScalarFFTPSF` and `ScalarFFTMTF` trace their own wavefront (and
+`ScalarFFTMTF` its own PSF). The last two columns are `speedup_psf` (`ScalarFFTPSF` over `pupil_wavefront` +
+`fft_psf`) and `speedup_mtf` (`ScalarFFTMTF` over `pupil_wavefront` + `fft_psf` + `fft_mtf`).
+
+| System | N (rays) | Optiland: Wavefront / ZernikeFit / ScalarFFTPSF / ScalarFFTMTF | GPU: `pupil_wavefront` / `zernike_fit` / `fft_psf` / `fft_mtf` | Faster: PSF / MTF |
+|---|---|---|---|---|
+| singlet | 64 (3096) | 3.74 / 3.68 / 4.22 / 8.43 ms | 42.6 / 4.57 / 0.284 / 0.159 ms | 0.10x / 0.20x |
+| singlet | 128 (12644) | 6.09 / 11.1 / 6.58 / 11.6 ms | 41.8 / 4.38 / 0.277 / 0.130 ms | 0.16x / 0.28x |
+| singlet | 256 (51040) | 14.0 / 37.2 / 16.9 / 22.5 ms | 42.6 / 9.79 / 0.414 / 0.235 ms | 0.39x / 0.52x |
+| singlet | 512 (205012) | 41.2 / 173 / 60.4 / 75.7 ms | 47.4 / 34.0 / 1.88 / 1.02 ms | 1.23x / 1.51x |
+| singlet | 1024 (821904) | 198 / 830 / 275 / 336 ms | 51.3 / 135 / 6.25 / 3.93 ms | 4.78x / 5.46x |
+| singlet | 2048 (3290904) | 797 / 4483 / 1368 / 1696 ms | 102 / 503 / 11.6 / 8.98 ms | 12.0x / 13.8x |
+| relay | 256 (51040) | 11.9 / 44.3 / 15.3 / 22.9 ms | 42.1 / 10.1 / 0.433 / 0.268 ms | 0.36x / 0.54x |
+| relay | 1024 (821904) | 186 / 849 / 255 / 345 ms | 47.5 / 128 / 4.02 / 2.74 ms | 4.95x / 6.35x |
+
+- **Slower up to N = 256.** `pupil_wavefront` has a fixed cost: 41.8 to 42.6 ms for 3096 to 51040 rays (N 64 to
+  256), and 102 ms for 3.29e6 rays. Up to N = 256 this cost is larger than Optiland's whole FFT PSF or FFT MTF,
+  so the GPU path is slower (0.10x to 0.39x for the PSF, 0.20x to 0.54x for the MTF). The cost is in the trace
+  step; the rows do not split it into its parts (the copy of the optic and its check rays, the small traces, the
+  launches of Optiland's PyTorch trace).
+- **Faster from N = 512.** The PSF and the MTF are faster on the GPU from N = 512 on: 1.23x and 1.51x at N = 512,
+  12.0x and 13.8x at N = 2048. In these rows the crossover is between N = 256 and N = 512. The trace step alone
+  is still slower at N = 512 (47.4 ms against 41.2 ms) and faster from N = 1024 (3.85x at 1024, 7.78x at 2048).
+- The FFT steps after the trace take 0.28 to 11.6 ms (`fft_psf`) and 0.13 to 8.98 ms (`fft_mtf`) on the GPU.
+  `zernike_fit` (37 Fringe terms) is slower than Optiland's `ZernikeFit` at N = 64 (4.57 ms against 3.68 ms) and
+  faster from N = 128 (2.5x) to N = 2048 (8.9x).
+- Differences from Optiland in all 8 rows: OPD at most 8.9e-16 waves, Zernike coefficients 2.8e-13 waves, PSF
+  3.3e-16 (Strehl units), MTF 7.8e-16 (0 for the OPD and the coefficients of the perfect lens, Strehl 1.0).
+
+Huygens PSF (rows 7 to 9, singlet, 80 x 80 points of 1 um): Optiland's `HuygensPSF` takes 92.1, 322 and 1074 ms
+with pupil 64, 128 and 256; `huygens_psf` takes 13.9, 13.8 and 13.5 ms (6.7x, 23x and 79x). These are two methods
+with different sampling: the image sum uses its own direction grid (a 64 x 64 source padded 16 times), not the
+pupil N, so its time is the same in the three rows. Correlation 0.9984 to 0.9985; peak 0.0245 against 0.0271 to
+0.0269. Optiland's `HuygensPSF` runs numba kernels; these rows log `threads` 16 (PyTorch, after that call), and
+the thread count of numba is not logged.
+
 ## Checks (`tests/test_*.py`: `pop`, `trace_backends`, `device_pipeline`, `image_planes`, `nufft`, `sources`)
+
+The checks of `tests/test_analysis.py` are in the section "Image quality" above.
 
 | Case | Reference | Agreement (observed; test tolerance) |
 |---|---|---|
@@ -308,10 +449,10 @@ complex128 by at most 2.2e-14.
 | bad inputs of the non-uniform FFT: tol 0, 1e-13, 0.1, NaN; method "fft"; complex64; `ray_chunk` 0 | | ValueError |
 
 All tests ran on the GPU computer (RX 7900 XT; `.venv-optics` from `tools/env/optics_rocm.sh`, PyTorch 2.14.1 for
-ROCm 7.2): 127 passed (`tests/test_device_pipeline.py`: 18, `tests/test_image_planes.py`: 30,
-`tests/test_nufft.py`: 48, `tests/test_sources.py`: 14). The observed values of the rows from "PyTorch-backend
-trace" down come from the same computer. The NumPy pipeline gives the same values as before the device pipeline:
-eta 0.99998, 0.95324, 0.93319 in the 4f check.
+ROCm 7.2): 152 passed (`tests/test_analysis.py`: 25, `tests/test_device_pipeline.py`: 18,
+`tests/test_image_planes.py`: 30, `tests/test_nufft.py`: 48, `tests/test_sources.py`: 14). The observed values of
+the rows from "PyTorch-backend trace" down, and of the image-quality checks, come from the same computer. The
+NumPy pipeline gives the same values as before the device pipeline: eta 0.99998, 0.95324, 0.93319 in the 4f check.
 
 The Gaussian-beam formulas are textbook results for two Gaussian beams of equal radius (for example Saleh and
 Teich, Fundamentals of Photonics, chapter 3). The focus check differs by 1.4e-3 because the image of the
@@ -514,8 +655,17 @@ log). The optics runs with the two mode files gave the same efficiencies.
 - The device pipeline keeps 40 bytes per kept ray (the bundle) and the box of the spectrum (17 bytes per traced
   ray); the trace temporaries are bounded by one block. The spectrum itself (complex128) is on the device during
   step 1.
+- The image-quality analyses (`analysis.py`) take one field point and one wavelength per call (no polychromatic
+  PSF or MTF), scalar fields (no polarization). The FFT PSF needs a sampled pupil phase (W changes by well below
+  0.5 waves between neighboring pupil samples) and a geometric spot inside the window lambda F (N - 1). The MTF
+  frequency step assumes a flat image surface normal to z (Optiland projects on the tangent plane at the chief
+  ray). The orientation of an off-axis FFT PSF follows Optiland (checked against Optiland, not against the image
+  sum). `huygens_psf` takes only an object point on the axis at a finite distance.
 
 ## Next
+
+- Through-focus, multi-field and polychromatic PSF and MTF in one batch on the GPU (one trace per field and
+  wavelength, the FFTs of all planes in one call).
 
 - The non-uniform FFT as the default for uniform grids in complex128 (a method "auto"). The logged rows
   (`benchmarks/2026-11-07/optics-nufft.jsonl`) show it faster than the direct complex128 sum in all bench rows and

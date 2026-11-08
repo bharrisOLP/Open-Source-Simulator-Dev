@@ -4,6 +4,9 @@
   2.5x lens pair of examples/chip_to_fiber_coupling.py with the default values).
 - aberrated_singlet: a plano-convex singlet (R = 10 mm, n = 1.5, 3 mm thick) at 2f-2f with strong spherical
   aberration, and a physical stop of 6 mm diameter (RadialAperture) on its first surface.
+- ideal_relay: two equal ideal thin lenses (f) in a 4f arrangement with a physical stop of radius r_stop on lens 1:
+  a perfect imager of the axis point (magnification -1), image-side NA r / sqrt(r^2 + f^2); the image surface
+  can be moved by dz after the back focus (a pure defocus).
 """
 
 from __future__ import annotations
@@ -40,4 +43,25 @@ def aberrated_singlet(wl: float = 1.55) -> Optic:
     o.add_field(y=0.0)
     o.add_wavelength(value=wl, is_primary=True)
     o.image_solve()
+    return o
+
+
+def ideal_relay(f: float = 20.0, r_stop: float = 2.0, dz: float = 0.0, wl: float = 1.55) -> Optic:
+    """Object point at the front focus of lens 1, image surface dz mm after the back focus of lens 2 (equal ideal
+    thin lenses of focal length f). Lens 1 is the stop, with a physical aperture (RadialAperture) of radius r_stop
+    and EPD 2 r_stop. Optiland's thin lens adds the optical path f - sqrt(h^2 + f^2) at the height h, so the rays
+    of the axis point meet in one point with equal optical paths; with equal lenses the image-side direction of a
+    ray equals its object-side direction (tan u = h / f on both sides)."""
+    from optiland.physical_apertures import RadialAperture
+
+    o = Optic()
+    o.add_surface(index=0, thickness=f)
+    o.add_surface(index=1, surface_type="paraxial", f=f, thickness=2 * f, is_stop=True,
+                  aperture=RadialAperture(r_max=r_stop))
+    o.add_surface(index=2, surface_type="paraxial", f=f, thickness=f + dz)
+    o.add_surface(index=3)
+    o.set_aperture(aperture_type="EPD", value=2 * r_stop)
+    o.set_field_type(field_type="object_height")
+    o.add_field(y=0.0)
+    o.add_wavelength(value=wl, is_primary=True)
     return o
