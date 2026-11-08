@@ -57,6 +57,7 @@ import numpy as np
 from bands_gpu.geometry import Cell
 from bands_gpu.lobpcg import _gram, lobpcg
 from bands_gpu.operator import Operator, _cross, apply, make_operator, precondition
+from bands_gpu.sampling import eps_inverse
 from bands_gpu.solver import solver_device
 
 
@@ -171,7 +172,7 @@ class BandEvaluator:
     def __init__(self, cell: Cell, num_bands: int, polarization: str | None = None, parity: str | None = None,
                  mirror_axis: int = 1, extra: int = 4, tol: float | None = None, max_iter: int = 300,
                  dtype=jnp.complex128, sub: int = 8, seed: int = 0, warm_start: bool = True,
-                 degeneracy: float | None = None):
+                 degeneracy: float | None = None, sampling: str = "auto"):
         if dtype == jnp.complex128 and not jax.config.jax_enable_x64:
             warnings.warn("bands_gpu: complex128 needs jax.config.update('jax_enable_x64', True); using complex64",
                           stacklevel=2)
@@ -188,7 +189,7 @@ class BandEvaluator:
         self.degeneracy = (1e-5 if single else 1e-9) if degeneracy is None else degeneracy
         self.max_iter = max_iter
         self.device = solver_device()
-        self.eps_inv = cell.eps_inverse(sub)
+        self.eps_inv = eps_inverse(cell, sub, sampling=sampling, device=self.device)
         flat = self.eps_inv.reshape(self.eps_inv.shape[:-3] + (-1,))
         self.warm_start = warm_start and not np.all(flat == flat[..., :1])   # see solve_bands
         self.mirror_asymmetry = 0.0
@@ -306,7 +307,7 @@ def find_k(cell: Cell, omega: float, band_min: int, band_max: int, kdir, polariz
     omega (n_min + n_max) / 2 from the permittivities of the cell. kmag_max: default 1.01 omega n_max + |korig|
     (Cartesian; |k| >= kmag - |korig|, and no band reaches omega at |k| > 1.01 omega n_max along an axis without
     lattice periodicity); along a periodic axis, give the edge of the Brillouin zone. ``kw``: the options of
-    BandEvaluator (extra, tol of the eigensolver as ``band_tol``, dtype, sub, seed, warm_start)."""
+    BandEvaluator (extra, tol of the eigensolver as ``band_tol``, dtype, sub, seed, warm_start, sampling)."""
     if not 1 <= band_min <= band_max:
         raise ValueError("bands: 1 <= band_min <= band_max")
     band_tol = kw.pop("band_tol", None)

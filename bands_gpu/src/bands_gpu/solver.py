@@ -21,6 +21,7 @@ import numpy as np
 from bands_gpu.geometry import Cell
 from bands_gpu.lobpcg import lobpcg
 from bands_gpu.operator import apply, make_operator, precondition
+from bands_gpu.sampling import eps_inverse
 
 
 # High-symmetry points of the triangular lattice with the basis geometry.TRIANGULAR (a1 = (1, 0),
@@ -68,13 +69,16 @@ class BandResult:
 
 def solve_bands(cell: Cell, kpoints, num_bands: int, polarization: str | None = None, extra: int = 4,
                 tol: float = 1e-6, max_iter: int = 300, dtype=jnp.complex128, sub: int = 8,
-                seed: int = 0, warm_start: bool = True) -> BandResult:
+                seed: int = 0, warm_start: bool = True, sampling: str = "auto") -> BandResult:
+    """The lowest ``num_bands`` bands at each k point. ``sampling``: the eps sampling and averaging, "auto" (JAX on the
+    solver device from ``sampling.AUTO_MIN_WORK`` inside tests up, else NumPy), "jax" or "numpy"
+    (the reference); see ``bands_gpu.sampling``."""
     if dtype == jnp.complex128 and not jax.config.jax_enable_x64:
         warnings.warn("bands_gpu: complex128 needs jax.config.update('jax_enable_x64', True); using complex64",
                       stacklevel=2)
         dtype = jnp.complex64
     device = solver_device()
-    eps_inv = cell.eps_inverse(sub)
+    eps_inv = eps_inverse(cell, sub, sampling=sampling, device=device)
     # the same eps_inv in all voxels (a homogeneous cell): the operator and the preconditioner are diagonal in G, so
     # a warm block (plane waves of the last k point) never gains other plane waves and can converge at once to
     # wrong bands. Each k point then starts from new random vectors.

@@ -25,6 +25,9 @@ that fits the first moments m_i = <eps o_i> (o_i: the offsets in voxel fractions
 m_i = (grad eps . d_i) / 12, so grad eps = 12 sum_i m_i n_i b_i (b_i: the reciprocal vectors, b_i . a_j = delta_ij).
 The fit is exact only for a linear eps: at a curved step it has a bias in a sheared voxel (TE of a sheared square
 lattice, n = 64 to 128: the error fell 2.5x with the fit alone, 4.8x with the analytic normal; tests/test_oblique.py).
+
+This NumPy path is the reference of the JAX path in ``bands_gpu.sampling`` (the same samples and decisions on the
+GPU; tests/test_sampling.py).
 """
 
 from __future__ import annotations
@@ -266,10 +269,33 @@ class Cell:
             eps = np.where(hit, obj.eps, eps)
         return eps, count, normal
 
+    def moment_bound(self, sub: int) -> float:
+        """The rounding bound of a first moment m_i = <eps o_i> of a voxel: N 2^-52 max|eps| (N: samples per voxel).
+        A moment at or below it counts as zero (in this path and in the JAX path).
+
+        Why: a moment that is zero in exact arithmetic (a voxel symmetric along a_i, for example between two rods
+        or at the center of a small sphere) is a rounding residue. Its value depends on the order of the sum, and a
+        normal from it is noise: NumPy and JAX gave tensors 7.8e-2 apart there (eps 3.48^2 in 1.444^2). The mean of N
+        products e o (|e o| <= max|eps| / 2), each rounded, summed in any order, has an error below
+        (N + 1) 2^-54 max|eps|, at most half of the bound. A true nonzero moment of a voxel with two materials is
+        (eps_1 - eps_2) k / (2 s N) with an integer k (the o_i are multiples of 1 / (2 s)), so it is above the
+        bound when |eps_1 - eps_2| / max|eps| > 2^-51 s N^2 (9e-10 at sub 8 in 3-D). With three or more materials
+        in a voxel, a smaller true moment also counts as zero."""
+        n = math.prod(sub if k > 1 else 1 for k in self.shape)
+        eps_max = max([abs(float(self.eps_background))] + [abs(float(o.eps)) for o in self.objects])
+        return n * 2.0**-52 * eps_max
+
     def eps_inverse(self, sub: int = 8, normal: str = "object") -> np.ndarray:
         """The averaged inverse permittivity tensor (Cartesian components), shape (3, 3, nx, ny, nz). ``normal``:
         "object" (the analytic normal where one object boundary crosses the voxel, else the fit) or "fit" (the fitted
-        gradient in all voxels; for comparisons)."""
+        gradient in all voxels; for comparisons). This NumPy path is the reference of the JAX path
+        (``bands_gpu.sampling``)."""
+        return self.voxel_averages(sub, normal)["eps_inv"]
+
+    def voxel_averages(self, sub: int = 8, normal: str = "object") -> dict[str, np.ndarray]:
+        """The averages of each voxel: "eps_inv" (``eps_inverse``), "mean_eps" (<eps>, the fill fractions), "count"
+        and "analytic" (as ``_sample``), "normal" (3, nx, ny, nz) (the unit normal of the averaging; 0 outside
+        interfaces)."""
         if normal not in ("object", "fit"):
             raise ValueError("normal: 'object' or 'fit'")
         s = [sub if n > 1 else 1 for n in self.shape]
@@ -285,6 +311,7 @@ class Cell:
             (e * offs[1][None, None, None, :, None, None]).mean(axis=(1, 3, 5)),
             (e * offs[2][None, None, None, None, None, :]).mean(axis=(1, 3, 5)),
         ])
+        mom = np.where(np.abs(mom) <= self.moment_bound(sub), 0.0, mom)      # rounding residues (moment_bound)
         # the gradient of eps (Cartesian, to the high-eps side): sum_i m_i n_i b_i (see the module docstring)
         w = [n / a if n > 1 else 0.0 for a, n in zip(self.size, self.shape)]
         f = self.unit_reciprocal
@@ -300,4 +327,5 @@ class Cell:
         nn = nvec[:, None] * nvec[None, :]
         tensor = mean_inv[None, None] * nn + (1.0 / mean_eps)[None, None] * (eye - nn)
         iso = (1.0 / mean_eps)[None, None] * eye
-        return np.where(interface[None, None], tensor, iso)
+        return {"eps_inv": np.where(interface[None, None], tensor, iso), "mean_eps": mean_eps, "count": count,
+                "analytic": analytic, "normal": nvec}

@@ -68,6 +68,26 @@ freqs, vg = group_velocity(cell, [0.3, 0.1, 0], num_bands=4, direction=(1, 0, 0)
   voxel the same direction as the fit). Changes on the rectangular path: TM bands, 1-D stacks and homogeneous cells
   are the same bit for bit (the normal of a rod is in the plane and TM uses only eps_inv_zz; the normal of a slab is
   exactly x). TE and 3-D bands with curved objects change, and are more accurate (same table).
+- **eps sampling on the GPU** (`bands_gpu/sampling.py`). The same samples, normals and tensors in JAX on the solver
+  device; the NumPy path (`Cell.eps_inverse`, `Cell.voxel_averages`) is the reference. The voxels are processed in slabs
+  along the first used axis (at most 2^24 samples per slab, or one voxel plane when a plane has more; a plane is not
+  split). The consecutive objects of one kind (a run) are a `lax.scan`, with an inner `lax.scan` over their periodic
+  images: one compile per run, not per object. The decision inside or outside an object must be the same as in the
+  reference at each sample (one sample changes a fill fraction by much more than rounding): the device adds the products
+  t_i e_ic of the lattice coordinates that NumPy makes on the host, in the order of `Cell.points`, and rounds each
+  square before the sum (`lax.optimization_barrier`): XLA on the CPU fuses x * x + y * y into a fused multiply-add,
+  which changed the rounding of the sum and decisions inside or outside at points on a cylinder surface (ROCm does not
+  fuse them; `tests/test_sampling.py` failed on the CPU device without the barrier). A first moment of a voxel at or
+  below the rounding bound N 2^-52 max|eps| (N samples per voxel; `Cell.moment_bound`) counts as zero in both paths: a
+  moment that is zero in exact arithmetic (a voxel symmetric along a lattice vector) is a rounding residue whose value
+  depends on the order of the sum, and before the bound the two paths gave tensors 7.8e-2 apart and TE bands 7.77e-4
+  apart for two rods 0.01 apart (eps 3.48^2 in 1.444^2; `reviews/2026-11-07-b0dccdd4c3c5.md`). The mean of N rounded
+  products has an error of at most half the bound; a true nonzero moment of two materials is at least |eps_1 - eps_2| /
+  (2 s N), above the bound for a contrast |eps_1 - eps_2| / max|eps| above 2^-51 s N^2 (9e-10 at sub 8 in 3-D).
+  `sampling="auto"` (the default of `solve_bands`, `BandEvaluator`, `find_k`) uses JAX from 1e8 inside tests (samples
+  times periodic images) per run of objects up: the NumPy path costs 3.8 to 6.8 ns per test, and the first JAX call of a
+  cell shape (with the compile) 0.386 to 0.574 s for one run of objects, about 0.53 s more for each further run (the
+  sampling table in "GPU timings"). `sampling="jax"` or `"numpy"` selects the path.
 - **Eigensolver.** Block LOBPCG (Knyazev 2001) with the preconditioner 1/(|k+G|^2 <eps_inv>), two-pass SVQB
   orthogonalization of [X, W, P], P kept orthogonal to X, and A X and A P computed as products in each iteration.
   Two lessons: combined products drift until the solve diverges near convergence; and A P must be a product,
@@ -255,6 +275,30 @@ Larger cases (`benchmarks/2026-10-30/bands-findk.jsonl`; time of the second call
 
 The strip value moves from n_eff 2.4315 at n 16 to 2.4443 at n 64 (grid convergence, no reference).
 
+## Checks of the eps sampling on the GPU (`tests/test_sampling.py`, 8 tests)
+
+| Case | Reference | Agreement |
+|---|---|---|
+| 26 cells: square rods, triangular air holes, sheared, rotated and non-cubic rod cells, two rods 0.01 apart, a slab in the triangular cell, slabs with their faces on samples (8 thicknesses), the 1-D slab of find_k (1025 points), the 3-D strip, simple cubic spheres, fcc sphere, fcc block and cylinder, diamond (fcc, two spheres), the 3-D hole slab, and 4 cells with symmetric voxels and eps 3.48^2 in 1.444^2 (not exact in binary: two rods 0.01 apart, a small sphere, a thin slab, a thin rod, each centered on a grid point); normal "object" and "fit"; on the GPU (rocm:0) and on the CPU device of JAX | the NumPy path (`Cell.voxel_averages`) | boundary counts and analytic normals the same; eps_inv 1.0e-15 (GPU), 1.1e-15 (CPU); <eps> / max eps 1.5e-15; unit normal 2.5e-14 (GPU and CPU) |
+| moment bound: the 4 symmetric cells; in each, voxels with first moments that are rounding residues (nonzero in one of three orders of the sums, at most `Cell.moment_bound`), and no moment between the bound and 1e3 times the bound | the NumPy path; the bands with the NumPy path (two rods TE at X and M, sphere 3-D, slab TE, rod TE at M) | eps_inv below 1e-12; the residue voxels isotropic in both paths; bands 0 to 1.3e-15 |
+| 100 rods in a 10 x 10 supercell (one run of objects); block, cylinder, block (three runs) in slabs of 12 voxel planes and a last of 4 | the NumPy path | below 1e-12 |
+| fcc sphere in slabs of 3 voxel planes (and a last slab of 1); 1-D slab in slabs of 125 voxels | the NumPy path | below 1e-12 |
+| 200 000 points on a cylinder surface and on a sphere surface (x^2 + y^2 (+ z^2) within a few units in the last place of r^2) | `inside` of NumPy | the same decision at each point (GPU and CPU) |
+| bands of the diamond lattice (10^3, 4 bands at L and X) and the triangular air holes (32 x 32, TE, M and K) with each path | the bands with the NumPy path | below 1e-12 |
+
+## 3-D slab checks (`tests/test_slab3d.py`)
+
+| Case | Reference | Agreement |
+|---|---|---|
+| uniform slab (n 3.5, thickness 0.5 a, in n 1.45, period 5 a along z), 3-D cell with a triangular in-plane lattice of 0.25 a, 4 x 4 x 1025 points, omega 0.5, find_k with the z parity: TE0 and TM1 (even), TM0 and TE1 (odd) | the exact supercell (transfer matrix, `tests/slab_reference.py`) | kmag 1.17e-5, 1.34e-5, 2.72e-5, 4.38e-5 (relative; the errors of the 2-D slab check); v_g 1.0e-5, 1.0e-4, 1.1e-5, 6.0e-5 |
+| the same | the 2-D cell of the same grid along the normal (TE and TM; the in-plane G = 0 block of the 3-D operator) | kmag 9.7e-16 to 2.0e-15 |
+| hole slab of the MPB example hole-slab (after Johnson et al., Phys. Rev. B 60, 5751 (1999)): air holes r 0.3 a in a slab of eps 12 and thickness 0.5 a, supercell height 4 a; z-even (TE-like) bands at Gamma, M and K, triangular cell 16 x 16 x 65 | the same crystal in the rectangular supercell (1 x sqrt(3) x 4, two holes, 16 x 28 x 65; folded k points) | 6 bands: 2.8e-4; gap from band 1 at K to band 2 at M: 0.264781 to 0.344200 (supercell 0.264824 to 0.344142) |
+
+The even gap of the hole slab is guided: both edges are below the light line of air (2/3 at K, 1/sqrt(3) at M).
+No published value of this gap was available for a comparison (the MPB example and the paper give the structure;
+this work had no access to their numbers). The values at 16 points per a move by up to 2.71e-4 at 24 and 32 points
+per a (`benchmarks/2026-11-07/bands-hole-slab.jsonl`; the table in "GPU timings").
+
 ## GPU timings (RX 7900 XT against the same algorithm on the 16 CPU threads of the same PC)
 
 Single precision, full k paths (`bench/bench_bands.py`; the JSON rows are in `benchmarks/2026-10-30/`). After the
@@ -280,11 +324,64 @@ compares unequal work; per iteration the GPU is 13x faster (6.5 ms against 85 ms
 edges 0.207036 and 0.274389 on both devices (the double-precision values at 128 of the check table). A first GPU
 run (32.5 s) shared the GPU with another test run and is not used.
 
+Eps sampling and averaging (`benchmarks/2026-11-07/bands-sampling.jsonl`, 12 rows, logged 2026-11-08 00:23 to 00:25
+EST with the shared limits of the computer). Command, from the repository folder:
+`bash tools/gpu_run.sh bands_gpu sh -c 'for n in 128 256; do python bench/bench_sampling.py --case rods --n $n;
+python bench/bench_sampling.py --case tri-holes --n $n; done; for n in 32 64; do python bench/bench_sampling.py
+--case spheres --n $n; done; python bench/bench_sampling.py --case diamond --n 32; python bench/bench_sampling.py
+--case diamond --n 64 --no-numpy; python bench/bench_sampling.py --case rods-supercell --n 80 --m 10; python
+bench/bench_sampling.py --case rods-supercell --n 144 --m 6; python bench/bench_sampling.py --case mixed --n 256
+--m 1; python bench/bench_sampling.py --case mixed --n 256 --m 4'`. Sub 8, double precision; the JAX path on the
+RX 7900 XT, with the transfer of the result to the host, against the NumPy path on the CPU of the same PC. "First":
+the first JAX call of the cell shape, with the compile; "JAX": the median of 5 further calls. "auto": the choice of
+`sampling="auto"`. The bench logs the images of the first 4 objects only.
+
+| Case | Objects (runs) | Samples | Images | NumPy | JAX (first) | JAX | Speed-up | auto | Largest difference of eps_inv |
+|---|---|---|---|---|---|---|---|---|---|
+| rods, 128^2 | 1 (1) | 1.0e6 | 9 | 0.048 s | 0.435 s | 0.0029 s | 16.5x | NumPy | 1.1e-16 |
+| triangular air holes, 128^2 | 1 (1) | 1.0e6 | 9 | 0.064 s | 0.393 s | 0.0032 s | 20.3x | NumPy | 2.2e-16 |
+| rods, 256^2 | 1 (1) | 4.2e6 | 9 | 0.198 s | 0.530 s | 0.0043 s | 45.6x | NumPy | 2.2e-16 |
+| triangular air holes, 256^2 | 1 (1) | 4.2e6 | 9 | 0.250 s | 0.477 s | 0.0049 s | 51.2x | NumPy | 2.2e-16 |
+| simple cubic spheres, 32^3 | 1 (1) | 1.7e7 | 27 | 1.760 s | 0.549 s | 0.0085 s | 207.7x | JAX | 7.8e-16 |
+| simple cubic spheres, 64^3 | 1 (1) | 1.3e8 | 27 | 13.919 s | 0.574 s | 0.0522 s | 266.9x | JAX | 1.0e-15 |
+| diamond (fcc, 2 spheres), 32^3 | 2 (1) | 1.7e7 | 64, 64 | 8.967 s | 0.432 s | 0.0222 s | 404.2x | JAX | 1.3e-15 |
+| diamond (fcc, 2 spheres), 64^3 (`--no-numpy`) | 2 (1) | 1.3e8 | 64, 64 | not run | 0.574 s | 0.1697 s | - | - | - |
+| rods supercell (10 x 10), 80^2 | 100 (1) | 4.1e5 | 9, 9, 9, 9, ... (first 4 logged) | 1.342 s | 0.386 s | 0.0355 s | 37.9x | JAX | 0 |
+| rods supercell (6 x 6), 144^2 | 36 (1) | 1.3e6 | 9, 9, 9, 9, ... (first 4 logged) | 1.586 s | 0.443 s | 0.0178 s | 89.3x | JAX | 2.2e-16 |
+| blocks and cylinders, alternating, 256^2 | 2 (2) | 4.2e6 | 9, 9 | 0.314 s | 0.849 s | 0.0051 s | 61.8x | NumPy | 2.2e-16 |
+| blocks and cylinders, alternating, 256^2 | 8 (8) | 4.2e6 | 9, 9, 9, 9, ... (first 4 logged) | 1.075 s | 4.048 s | 0.0088 s | 122.0x | NumPy | 2.2e-16 |
+
+In all rows with the NumPy reference, the boundary counts and the analytic normals are the same as NumPy. The NumPy
+path costs 3.8 to 6.8 ns per inside test (numpy_s / (samples x images), in the 8 rows with the images of all
+objects), so 1e8 inside tests take 0.38 to 0.68 s. The first JAX call of a cell with one run of objects costs 0.386
+to 0.574 s (also with 100 rods in one run: 0.386 s). Each further run adds a compile: 2 runs 0.849 s, 8 runs 4.048 s
+(about 0.53 s per run). The 2-D cells with one object are fast on the CPU too (0.048 to 0.250 s); there the compile
+of the JAX path costs more than it saves for one band solve, so "auto" keeps NumPy below 1e8 inside tests per run
+(the alternating cells: NumPy 0.314 s and 1.075 s against a first JAX call of 0.849 s and 4.048 s).
+
+Hole slab (`benchmarks/2026-11-07/bands-hole-slab.jsonl`, 3 rows, logged 2026-11-07 23:50 to 23:51 EST). Command:
+`bash tools/gpu_run.sh bands_gpu sh -c 'for n in 16 24 32; do python bench/bench_hole_slab.py --n $n; done'`. Grid
+N x N x (4 N + 1), sub 8, double precision, tol 1e-8, on the GPU: the even gap from band 1 at K to band 2 at M.
+"Setup": the BandEvaluator (the eps sampling and the parity check); "time": the setup and the solves at K and M.
+
+| N | band 1 at K | band 2 at M | setup | time | eigensolver iterations |
+|---|---|---|---|---|---|
+| 16 | 0.264781 | 0.344200 | 0.903 s | 2.918 s | 93 |
+| 24 | 0.264872 | 0.343930 | 1.546 s | 6.204 s | 98 |
+| 32 | 0.264978 | 0.344103 | 2.369 s | 12.127 s | 96 |
+
+Band 1 at K rises by 9.1e-5 and 1.06e-4 per step; band 2 at M moves by -2.71e-4 and +1.73e-4 (not monotonic). At
+32 points per a, the gap is 0.2650 to 0.3441 (26.0 % of the mid-gap frequency); the steps of the last resolution
+are of the order of 2e-4.
+
 ## Known limits
 
 - The normal of the averaging: where several object boundaries cross a voxel (objects that touch or nearly
-  touch), the fitted gradient is the normal; in a sheared voxel it has the bias of the fit there. A thin feature
-  exactly centered in a voxel gets no normal (scalar averaging there).
+  touch), the fitted gradient is the normal; in a sheared voxel it has the bias of the fit there. Where the fit is
+  used and the voxel is symmetric along each lattice vector (all first moments at or below `Cell.moment_bound`), the
+  voxel gets no normal (scalar averaging there): a thin feature centered in a voxel, the voxel midway between two
+  objects that nearly touch, a small sphere at a voxel center. With three or more materials in a voxel, a true
+  moment below the bound also counts as zero.
 - Above n = 128 the TE error of the sheared square lattice falls slowly with both normals (object normal: 2.98e-4 at
   128, 2.04e-4 at 192; `bench/normal_order.py`). The sheared TM bands, which do not use the normal, also converge
   irregularly at these grids (seen in the review). The cause is not known.
@@ -292,8 +389,15 @@ run (32.5 s) shared the GPU with another test run and is not used.
   that is infinite along b_i (for example a cylinder of infinite height when b_i has a z component) must not change
   along a_i: rods along z with a3 = z are correct; in an fcc cell, give the cylinder a finite height (else a
   ValueError).
-- The eps sampling runs on the CPU. A strongly sheared cell needs more images: a sphere of r = 0.3 in the fcc
-  primitive cell is tested at 125 lattice translations (27 in a cubic cell).
+- A strongly sheared cell needs more images: a sphere of r = 0.3 in the fcc primitive cell is tested at 125 lattice
+  translations (27 in a cubic cell).
+- The JAX path of the eps sampling knows Cylinder, Sphere and Block (not subclasses), and needs jax_enable_x64; else
+  "auto" uses NumPy; also for a subclass of Cell that overrides a member of the sampling (`sampling._SAMPLING`).
+  The decisions of the two paths can differ at an exact tie only: a voxel center at the same distance from the side
+  and the cap of a cylinder (`hypot` of JAX and NumPy can differ in the last bit), and a first moment within
+  rounding of `Cell.moment_bound`. Objects of alternating kinds (block, cylinder, block, ...) make one run each, so
+  one compile each; "auto" asks for 1e8 inside tests per run. The symmetry check of the parity (`find_k`) still
+  samples eps on the CPU (twice the full sample grid).
 - In a 2-D cell, the lattice vector of the unused axis must be orthogonal to the other two; TE/TM need the lattice
   vectors 1 and 2 in the xy plane and k_z = 0 (else a ValueError).
 - Warm start: in a homogeneous cell (the same eps_inv in all voxels) the operator and the preconditioner are
