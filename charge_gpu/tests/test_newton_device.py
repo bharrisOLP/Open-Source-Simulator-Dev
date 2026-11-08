@@ -257,23 +257,26 @@ def test_a_device_solve_that_fails_is_not_used(monkeypatch):
     assert np.max(np.abs(g.psi - ref.psi)) < 1e-12
 
 
+def _device_oom(*args, **kw):
+    """A device error as jax gives it at a device out of memory (jax.errors.JaxRuntimeError, a RuntimeError)."""
+    raise jax.errors.JaxRuntimeError("RESOURCE_EXHAUSTED: out of memory (test)")
+
+
 @pytest.mark.parametrize("where", ["solve", "setup"])
 def test_a_device_error_falls_back_to_superlu(monkeypatch, where):
-    """A device solve that raises (here a RuntimeError, as jax's XlaRuntimeError at a device out of memory), in the
-    solve or in the setup of the solver: that Newton step uses SuperLU, the error is counted by type in
-    linear_errors and given as a RuntimeWarning, and the solution is the SuperLU solution. sweep() reaches the bias
-    with no step halving (before this change the error went to sweep, which halved the step down to min_step and
-    then reported "did not converge")."""
+    """A device solve that raises jax.errors.JaxRuntimeError (as at a device out of memory), in the solve or in the
+    setup of the solver: that Newton step uses SuperLU, the error is counted by type in linear_errors and given as a
+    RuntimeWarning that points to the caller (this file), and the solution is the SuperLU solution. sweep() reaches
+    the bias with no step halving (before, the error went to sweep, which halved the step down to min_step and then
+    reported "did not converge")."""
     dev, _ = junction(n=200)
     ref = dd.solve(dev, 0.0, 0.6)
-
-    def fail(*args, **kw):
-        raise RuntimeError("RESOURCE_EXHAUSTED: out of memory (test)")
-
-    monkeypatch.setattr(coupled.Solver, "solve" if where == "solve" else "__init__", fail)
-    with pytest.warns(RuntimeWarning, match="device linear solve failed.*RuntimeError.*out of memory"):
+    monkeypatch.setattr(coupled.Solver, "solve" if where == "solve" else "__init__", _device_oom)
+    with pytest.warns(RuntimeWarning, match="device linear solve failed.*JaxRuntimeError.*out of memory") as rec:
         g = dd.solve(dev, 0.0, 0.6, linear="device")
-    assert g.converged and g.linear_fallbacks == g.iterations and g.linear_errors == {"RuntimeError": g.iterations}
+    assert all(w.filename == __file__ for w in rec if "device linear solve" in str(w.message))
+    assert g.converged and g.linear_fallbacks == g.iterations
+    assert g.linear_errors == {"JaxRuntimeError": g.iterations}
     assert g.krylov_iterations == 0 and g.linear_error is None
     assert np.max(np.abs(g.psi - ref.psi)) < 1e-12
     calls = []
@@ -287,7 +290,28 @@ def test_a_device_error_falls_back_to_superlu(monkeypatch, where):
     with pytest.warns(RuntimeWarning, match="device linear solve failed"):
         s = dd.sweep(dev, [0.1], step=0.05, linear="device")[0]
     assert s.converged and s.bias == pytest.approx(0.1) and calls == [0.0, 0.05, 0.1]
-    assert s.linear_errors == {"RuntimeError": s.iterations}
+    assert s.linear_errors == {"JaxRuntimeError": s.iterations}
+
+
+@pytest.mark.parametrize("error", [TypeError("a programming error (test)"),
+                                   ValueError("operands could not be broadcast together (test)"),
+                                   RuntimeError("a plain RuntimeError (test)"),
+                                   NotImplementedError("not implemented (test)")])
+def test_other_errors_of_the_device_solve_propagate(monkeypatch, error):
+    """Only continuity.SpanError, jax.errors.JaxRuntimeError and MemoryError fall back to SuperLU. Other errors of
+    the device solve (programming errors: a TypeError, a numpy broadcast ValueError, a plain RuntimeError, a
+    NotImplementedError) leave dd.solve unchanged, with no fallback and no warning."""
+    dev, _ = junction(n=200)
+
+    def fail(*args, **kw):
+        raise error
+
+    monkeypatch.setattr(coupled.Solver, "solve", fail)
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        with pytest.raises(type(error), match="test"):
+            dd.solve(dev, 0.0, 0.6, linear="device")
+    assert not [w for w in caught if "device linear solve failed" in str(w.message)]
 
 
 def test_solution_info():

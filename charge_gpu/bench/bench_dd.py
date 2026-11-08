@@ -87,7 +87,7 @@ def _gummel_row(dev, case, bias, start, ref, linear, cpu=False):
             "poisson_s": round(g.timings["poisson_s"], 3), "continuity_s": round(g.timings["continuity_s"], 3),
             "iterations": g.iterations, "krylov_iterations": g.krylov_iterations, "converged": g.converged,
             "linear_converged": g.linear_converged, "linear_backward_error": g.linear_error,
-            "linear_fallbacks": g.linear_fallbacks, **_diff(g, ref)}
+            "linear_fallbacks": g.linear_fallbacks, "linear_errors": g.linear_errors, **_diff(g, ref)}
 
 
 def _newton_device_row(dev, bias, start, ref):
@@ -104,7 +104,7 @@ def _newton_device_row(dev, bias, start, ref):
             "jax_device": str(solver_device()), "time_s": round(t, 3), "warmup_1_iteration_s": round(t_warm, 3),
             **{k: round(v, 3) for k, v in s.timings.items()}, "iterations": s.iterations,
             "krylov_iterations": s.krylov_iterations, "converged": s.converged, "linear_residual": s.linear_error,
-            "linear_fallbacks": s.linear_fallbacks, **_diff(s, ref)}
+            "linear_fallbacks": s.linear_fallbacks, "linear_errors": s.linear_errors, **_diff(s, ref)}
 
 
 def pin_cases(dx, biases, sweep=True, cpu=True, gummel_superlu=True):

@@ -2,6 +2,8 @@
 the Slotboom operator against the SG matrix of the SuperLU path, the linear solves against SuperLU, and the whole
 solution against the coupled Newton method with SuperLU (the reference) at 0 V, reverse bias and forward bias up to
 high injection; the Shockley diode and the current continuity with the device path."""
+import warnings
+
 import jax
 import numpy as np
 import pytest
@@ -153,28 +155,40 @@ def test_a_device_solve_that_fails_is_not_used(monkeypatch):
     m = ref.mesh
     with pytest.raises(continuity.SpanError, match="SPAN_MAX"):
         continuity.Solver(m).operator(ref.psi.ravel(), "n", ref.p.ravel()[m.sflat], np.ones(m.n_semi))
-    g = dd.solve(dev, 1.0, 0.0, method="gummel", linear="device")
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        g = dd.solve(dev, 1.0, 0.0, method="gummel", linear="device")
     assert g.converged and g.linear_fallbacks == 2 * g.iterations and g.krylov_iterations == 0
     assert g.linear_errors == {"SpanError": 2 * g.iterations}
+    assert not [w for w in caught if "device linear solve failed" in str(w.message)]     # expected: no warning
     assert np.max(np.abs(g.psi - ref.psi)) < 1e-12
 
 
-def test_a_device_error_falls_back_to_superlu(monkeypatch):
-    """A device continuity solve that raises (a RuntimeError, as jax's XlaRuntimeError at a device out of memory):
-    that step uses SuperLU, the error is counted by type in linear_errors and given as a RuntimeWarning; the
-    solution is the Newton solution. (Before, the error went to the caller; sweep() then halved its step.)"""
+@pytest.mark.parametrize("where", ["solve", "setup"])
+def test_a_device_error_falls_back_to_superlu(monkeypatch, where):
+    """A device continuity solve, or the setup of the device continuity solver, that raises
+    jax.errors.JaxRuntimeError (as at a device out of memory): that step uses SuperLU, the error is counted by type
+    in linear_errors and given as a RuntimeWarning; the solution is the Newton solution. (Before, the error went to
+    the caller; sweep() then halved its step.) A TypeError (a programming error) propagates."""
     dev, _ = junction(n=200)
     ref = dd.solve(dev, 1.0, 0.0)
 
     def fail(*args, **kw):
-        raise RuntimeError("RESOURCE_EXHAUSTED: out of memory (test)")
+        raise jax.errors.JaxRuntimeError("RESOURCE_EXHAUSTED: out of memory (test)")
 
-    monkeypatch.setattr(continuity.Solver, "solve", fail)
-    with pytest.warns(RuntimeWarning, match="device linear solve failed.*out of memory"):
+    monkeypatch.setattr(continuity.Solver, "solve" if where == "solve" else "__init__", fail)
+    with pytest.warns(RuntimeWarning, match="device linear solve failed.*JaxRuntimeError.*out of memory"):
         g = dd.solve(dev, 1.0, 0.0, method="gummel", linear="device")
     assert g.converged and g.linear_fallbacks == 2 * g.iterations and g.krylov_iterations == 0
-    assert g.linear_errors == {"RuntimeError": 2 * g.iterations}
+    assert g.linear_errors == {"JaxRuntimeError": 2 * g.iterations}
     assert np.max(np.abs(g.psi - ref.psi)) < 1e-12
+
+    def bug(*args, **kw):
+        raise TypeError("a programming error (test)")
+
+    monkeypatch.setattr(continuity.Solver, "solve" if where == "solve" else "__init__", bug)
+    with pytest.raises(TypeError, match="programming error"):
+        dd.solve(dev, 1.0, 0.0, method="gummel", linear="device")
 
 
 def test_backward_error_of_both_linear_solvers():

@@ -46,9 +46,10 @@ Numer. Anal. 19, 400 (1982)): with ||F + J s|| <= eta ||F|| (here in the row-sca
 iteration still converges, at least linearly with a rate of about eta, and the residual F of every Newton step is
 computed exactly on the host. Why not RTOL as the limit: in some Newton steps far from the solution the true
 residual stagnates above RTOL (the 1-D junction at 3 V reverse, started from poisson.solve, in
-tests/test_newton_device.py: a solve at 8.5e-9; probably a round-off floor, as the preconditioned vectors span many
-decades); with RTOL as the limit such a step would use SuperLU. drift_diffusion._newton does not use a solve that is
-not converged: it solves that Newton step with SuperLU and counts it (DDSolution.linear_fallbacks).
+tests/test_newton_device.py: a solve at about 8e-9: 8.1e-9 and 8.5e-9 in two runs; probably a round-off floor, as
+the preconditioned vectors span many decades); with RTOL as the limit such a step would use SuperLU.
+drift_diffusion._newton does not use a solve that is not converged: it solves that Newton step with SuperLU and
+counts it (DDSolution.linear_fallbacks).
 
 Cost: the Jacobian is assembled on the host (as for SuperLU) and copied to the device per Newton step; the three
 hierarchies are built on the host (the coarsening of thermal_gpu.multigrid and a 256-cell LU inverse).
@@ -178,8 +179,8 @@ def fgmres(o: _Ops, b, rtol: float = RTOL, restart: int = RESTART, max_iter: int
     """FGMRES for J_s y = b from y = 0 (o: the device operators). Returns y (device), the steps and the relative
     true residual. A cycle ends when the Givens estimate of the residual reaches rtol, after ``restart`` steps or at
     max_iter; then the true residual is computed. The solve stops when it is at most rtol, or when a cycle did not
-    halve it (stagnation of the true residual, for example at 8.5e-9 of ||b|| in a Newton step of the 3 V far-start
-    test, module docstring)."""
+    halve it (stagnation of the true residual, for example at about 8e-9 of ||b|| in a Newton step of the 3 V
+    far-start test, module docstring)."""
     size = b.shape[0]
     y = jnp.zeros_like(b)
     bnorm = float(jnp.linalg.norm(b))
