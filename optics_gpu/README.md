@@ -126,7 +126,8 @@ GPU (`test_complex64_error_of_one_plane_wave_is_within_the_bound`).
 For the tested focused fields, the coupling efficiency with complex64 differs from complex128 by at most 3.3e-7
 (a uniform pupil of NA 0.6 at a grid phase of 243 rad, with one power for all planes, as in a focus scan), and by
 8.3e-8 or less in the other checks. The bench differs by 6.4e-9 at 1e7 rays, and the focus scan of the example by
-8.8e-8. These values hold only for these fields. The default stays complex128.
+9.1e-8 (row 2 of `benchmarks/2026-11-07/optics-sym-x.jsonl`). These values hold only for these fields. The default
+stays complex128.
 
 The default chunk keeps the temporaries of one chunk (the weights, the factors and the products) at most
 `SUM_ELEMENTS` complex128 values (512 MB). `_planes_memory` gives the model: per ray, the largest of the three
@@ -136,7 +137,7 @@ of the groups (Z Nx Ny complex128 values) or, for complex64 without batched grou
 budget. Exception: for complex64 with E above 1 GB, the product of one group alone is above the budget; then the
 chunk is `GROUP_RAYS` rays, and the peak is above the budget.
 
-## Checks (`tests/`: `test_pop.py`, `test_trace_backends.py`, `test_device_pipeline.py`, `test_image_planes.py`)
+## Checks (`tests/test_*.py`: `pop`, `trace_backends`, `device_pipeline`, `image_planes`, `sources`)
 
 | Case | Reference | Agreement (observed; test tolerance) |
 |---|---|---|
@@ -169,12 +170,15 @@ chunk is `GROUP_RAYS` rays, and the peak is above the budget.
 | complex64, one plane wave: 2e4 equal rays (L' 0.5, M' 0.3), grid +-120 um (grid phase 243 rad) (CPU, GPU) | the bound (`GROUP_RAYS` + 6 `PHASE32_MAX`) 2^-24 sum \|a\| = 1.5e-4 sum \|a\| | GPU 3.3e-5, CPU 2.1e-5 of sum \|a\| |
 | complex64 with a grid phase of 316 rad (above `PHASE32_MAX`) | | ValueError; complex128 gives a finite field |
 | peak GPU memory of `image_planes` minus E, default chunk, several chunks (GPU): 41 planes 128 x 128 (budget 2^22 values; complex128, complex64), 21 planes 128 x 128 (2^25; both), 9 planes 512 x 256 (2^22; both), 41 planes 512 x 512 complex64, 101 planes 512 x 512 complex128, 1000 planes on a 1 x 1 grid complex64 (2^25) | the budget, `SUM_ELEMENTS` complex128 values | 0.67, 0.63; 0.97, 0.95; 0.91, 0.74; 0.82; 0.99; 0.96 of the budget (0.5 to 1, no tolerance). Before the one review: 1.13 (41 x 512 x 512 complex64), 1.45 (101 x 512 x 512), 1.28 (1000 x 1 x 1), in the review record |
+| `polarized_mode` (the source of the coupling example): two synthetic pure polarizations of different shapes, mixed by a unitary, a 45-degree and a non-unitary 2 x 2 matrix, dneff 1e-7 and 2.1e-4; two orthogonal diagonal modes | the pure fields; for orthogonal parts the power split 0.5 / 0.5 and the mean neff | field and fraction: 9.6e-17 (1e-12) for x and y; part powers and neff (1e-12) |
+| `polarized_mode`, inputs that have no defined source: a pair with dneff above the tolerance (not mixed); equal fractions without degeneracy; two x-polarized supermodes (dneff 1e-4); the same mode twice, also with 1e-9 EY added (near-singular power matrix); a source below `min_fraction` | | not mixed; ValueError in the other cases |
 | bad inputs of `image_planes` (`dtype` float64, `ray_chunk` 0, a 2-D `x_img`, `y_img` or `dz`, for example a meshgrid array) | | ValueError; an empty list of planes gives a (0, Nx, Ny) result |
 
 All tests ran on the GPU computer (RX 7900 XT; `.venv-optics` from `tools/env/optics_rocm.sh`, PyTorch 2.14.1 for
-ROCm 7.2): 65 passed (`tests/test_device_pipeline.py`: 18, `tests/test_image_planes.py`: 30). The observed values
-of the rows from "PyTorch-backend trace" down come from the same computer. The NumPy pipeline gives the same values
-as before the device pipeline: eta 0.99998, 0.95324, 0.93319 in the 4f check.
+ROCm 7.2): 79 passed (`tests/test_device_pipeline.py`: 18, `tests/test_image_planes.py`: 30,
+`tests/test_sources.py`: 14). The observed values of the rows from "PyTorch-backend trace" down come from the same
+computer. The NumPy pipeline gives the same values as before the device pipeline: eta 0.99998, 0.95324, 0.93319 in
+the 4f check.
 
 The Gaussian-beam formulas are textbook results for two Gaussian beams of equal radius (for example Saleh and
 Teich, Fundamentals of Photonics, chapter 3). The focus check differs by 1.4e-3 because the image of the
@@ -275,48 +279,99 @@ all planes (the 1e7 rows only): 6.4e-9.
 ## Example: focus and lateral scans on the GPU (`examples/coupling_scans_on_device.py`)
 
 The synthetic system of `examples/chip_to_fiber_coupling.py` (a SiN tip mode from meow-gpu, the 2.5x lens pair,
-SMF-28). The rays are traced one time; then a focus scan of 25 planes (dz -60 to 60 um, `image_sum`) and a
+SMF-28). The rays are traced one time; then a focus scan of 25 planes (dz -60 to 60 um, `image_planes`) and a
 lateral scan of 25 x 25 offsets (-3 to 3 um, `lateral_scan`) at the best plane run on the GPU. Two runs, because
 meow-gpu (JAX) and Optiland with PyTorch are in two environments (`.venv-rocm` and `.venv-optics`); from the
-repository folder on the GPU computer:
+repository folder on the GPU computer (the logged runs of 2026-11-07, with `OMP_NUM_THREADS`,
+`OPENBLAS_NUM_THREADS` and `MKL_NUM_THREADS` 4 and `XLA_PYTHON_CLIENT_MEM_FRACTION` 0.4, because another session
+used the computer):
 
-    bash tools/gpu_run.sh optics_gpu ../.venv-rocm/bin/python examples/coupling_scans_on_device.py --save-mode
-    bash tools/gpu_run.sh optics_gpu python examples/coupling_scans_on_device.py
+    bash tools/gpu_run.sh optics_gpu ../.venv-rocm/bin/python examples/coupling_scans_on_device.py --save-mode --pol x --mode-file ../results/optics_gpu/sin_tip_mode_sym_x.npz
+    bash tools/gpu_run.sh optics_gpu python examples/coupling_scans_on_device.py --mode-file ../results/optics_gpu/sin_tip_mode_sym_x.npz
 
-Output of one run (GPU computer, 2026-10-30): neff 1.4473, mode radius 2.71 um, 13689 rays traced and 10877 kept;
-eta 0.8888 at the image surface (the earlier example: 0.889), the best plane at dz = 0, eta 0.6667 at
-dz = +-60 um; the 1 dB full width of the lateral scan 5.30 um (linear interpolation between the scan points; 5.25 um
-is the span of the 0.25 um scan points within 1 dB). Against the host reference (the NumPy pipeline, the FFT focus
-scan and NumPy overlaps): 5.9e-11 (focus), 1.4e-15 (lateral). Time per scan point (the last row of
-`optics-pipeline.jsonl`): 5.0 ms per focus plane on the GPU against 8.9 ms for the NumPy FFT focus scan; 0.57 us per
-lateral point.
+`--pol x` (the default, the usual TE source) or `y` sets the polarization of the source. The first run uses the
+default polish of meow-gpu; `--polish davidson` gives the earlier polish (see below). Without `--mode-file`, the
+mode file is `results/optics_gpu/sin_tip_mode.npz`. Rows in `benchmarks/2026-11-07/optics-sym-x.jsonl` (row 1:
+the mode solve, row 2: the optics run).
 
-With `image_planes` (the last row of `optics-image-sum.jsonl`, a run of the example on 2026-10-30): 1.6 ms per
-focus plane in complex128 and 0.18 ms in complex64, against 5.0 ms with one sum per plane (the earlier method, in
-the same run); 0.55 us per lateral point. The efficiencies are the same as above (eta 0.8888 at the image
-surface, 0.6667 at dz = +-60 um). The focus scan in one pass differs from one sum per plane by 6.7e-16, complex64
-from complex128 by 8.8e-8; against the host reference 5.9e-11 (focus) and 1.3e-15 (lateral).
+**The core.** The grid has 0.05 um cells in a 14 x 14 um window, and the core (0.3 x 0.3 um) is 6 x 6 cells. The
+example builds it from integer cell indices, so it is symmetric. Each permittivity sample gets the mean over the
+cell around it: a sample on a face of the core (the Yee positions on cell corners) gets half core and half
+cladding, one on a corner of the core a quarter. The rule matters, because 6 cells resolve the core poorly. In
+development runs on the GPU computer (not in the log), neff was 1.44507 with the samples on the faces in the
+cladding, 1.45079 with them in the core (the one review), and 1.44719 with the mean. Row 1 shows the symmetry: the
+centroid of the source on its Yee positions is (6.5e-12, 4.8e-12) um, and its largest mirror asymmetry is 2.1e-11
+of its maximum.
+
+Before 2026-11-07 the core test used the coordinates of `np.arange(-7.0, 7.0 + 1e-9, 0.05)` with `|x| < 0.15`.
+The rounding put the samples on one face into the core and those on the other face into the cladding
+(g[143] = 0.1499999999999746 < 0.15, but g[137] = -0.15000000000002434). That core kept the x-y swap symmetry but
+lost both mirror symmetries: its two fundamental modes split by 2.06e-4 into two diagonal polarizations (equal
+power in Ex and Ey), and the mode moved off the axis (centroid (-0.0101, 0.0235) um on the Yee positions). The
+earlier code took the field component with the larger maximum of mode 0; the two maxima were equal by the swap
+symmetry, so rounding chose: Ey on 2026-10-30, Ex in the polish runs of 2026-11-07 (a source turned by 90
+degrees). These values are in row 1 of `benchmarks/2026-11-07/optics-pol-x.jsonl` and in
+`optics-polish.jsonl`; the one review of 2026-11-07 found the staircase error.
+
+**The source mode.** The two fundamental modes of the symmetric square core are degenerate, and the solver can
+give any basis of that pair. In row 1, modes 0 and 1 have the same neff 1.4471879 (difference 3.2e-14), x power
+fractions |Ex|^2 / (|Ex|^2 + |Ey|^2) of 0.112 and 0.658, and an overlap |P01| / sqrt(P00 P11) of 0.713: a rotated
+pair that is not orthogonal. "Mode 0" is therefore not a defined source. `optics_gpu.sources.polarized_mode`
+selects it:
+- modes 0 and 1 near-degenerate (|dneff| < `DEGENERATE_TOL` = 1e-3): the combination of the two with the largest
+  power fraction in the chosen component (a 2 x 2 generalized eigenvalue problem), normalized. A ValueError stops
+  it if the two modes are nearly the same field, or if they are not one x-like and one y-like field (for example
+  two supermodes of one polarization);
+- else the one of the two with the larger fraction; if the two fractions are equal to 1e-6, a ValueError stops it
+  (the choice would depend on rounding);
+- the example also refuses a source with less than 0.9 of its power in the chosen component (`MIN_FRACTION`).
+Row 1: the source has 0.99848 of its power in Ex. The parts have the relative powers 0.695 and 1.811: their sum is
+not 1, because the two modes are not orthogonal (the cross term). The x and y sources are transposes of each
+other, so x and y give the same efficiencies in this rotationally symmetric system, and the lateral scan is
+transposed. `tests/test_sources.py` checks the selection with synthetic fields.
+
+**Output of row 2.** Mode radius 3.04 um (the second-moment radius of |Ex|^2 along x of the interpolated source);
+13689 rays traced and 10877 kept; eta 0.8866 at the image surface, the best plane at dz = 0, eta 0.6665 at
+dz = +-60 um; the 1 dB full width of the lateral scan along x 5.39 um (linear interpolation between the scan points;
+5.0 um is the span of the 0.25 um scan points within 1 dB); the best lateral point at (0, 0). The source centroid is
+(0, 0) um and the image centroid (-0.0001, -0.0001) um (to the 4 decimals of the output). Against the host
+reference (the NumPy pipeline, the FFT focus scan and NumPy overlaps): 5.4e-11 (focus), 1.3e-15 (lateral). Time per
+scan point: 1.61 ms per focus plane with `image_planes` in complex128 and 0.172 ms in complex64, against 4.99 ms
+with one sum per plane (the earlier method, in the same run); 0.55 us per lateral point. The focus scan in one pass
+differs from one sum per plane by 6.7e-16, complex64 from complex128 by 9.1e-8.
+
+The FFT focus scan of the host reference took 0.31 ms per plane in row 2, and 8.8 to 8.9 ms in the rows of
+2026-10-30 (the last rows of `benchmarks/2026-10-30/optics-pipeline.jsonl` and `optics-image-sum.jsonl`), with
+the same environment (`.venv-optics`, installed on 2026-10-30 before those runs). Row 2 ran with 4 CPU threads,
+the rows of 2026-10-30 without a limit. The cause of the difference is not found, so this README does not compare
+the time of the FFT focus scan with the GPU times.
 
 The efficiencies use p0, the power on the 64 um image grid at the image surface, for all planes. p0 is not the
 total power, and the normalization of eta is uncertain by about 5e-4 here (`n_pad` 4):
-- The power on the grid is 1.000455 x p0 at dz = +-30 um and 0.998826 x p0 at dz = +-60 um. The grid power
-  increases first, so at least 4.6e-4 of the power of the ray-sum field is off the grid at dz = 0: by that
-  measure, eta 0.8888 is high by about 4e-4.
-- The Parseval power of the kept rays (`RayBundle.power`) is 0.999645 x p0; normalized by it, eta at the image
-  surface is 0.8891. In the 4f check with a Gaussian source, the grid power and `RayBundle.power` agree to
-  5.5e-5; for this mode with its wide-angle part they differ by 3.6e-4 (with `n_pad` 8: 5.6e-5, one run).
-These values are in the output of the example (`grid_power_over_p0_min_max`, `parseval_power_over_p0`,
-`eta_at_focus_parseval_power`); the `n_pad` 8 value is from one development run, not in the output.
+- The power on the grid is between 0.99888 x p0 and 1.000434 x p0 over the 25 planes. The grid power increases
+  above p0 at some planes, so at least 4.3e-4 of the power of the ray-sum field is off the grid at dz = 0: by that
+  measure, eta 0.8866 is high by about 4e-4.
+- The Parseval power of the kept rays (`RayBundle.power`) is 0.999648 x p0; normalized by it, eta at the image
+  surface is 0.8869. In the 4f check with a Gaussian source, the grid power and `RayBundle.power` agree to
+  5.5e-5; for this mode with its wide-angle part they differ by 3.5e-4 (for the source of 2026-10-30 with `n_pad`
+  8: 5.6e-5, one development run).
+These values are in row 2 (`grid_power_over_p0_min_max`, `parseval_power_over_p0`,
+`eta_at_focus_parseval_power`).
 
-The mode solve uses the complex128 Davidson polish of meow-gpu (`polish="davidson"`): with the default polish
-(`"refine"`), the solver stopped at a residual of 3.2e-10 after 255 iterations without its converged flag for
-this weakly guided mode, on the GPU computer.
-
-The lateral scan has its maximum at x = -0.25 um, not 0: the two points -0.25 and 0 give the same eta (0.8888).
-The cause is the source, not the pipeline: the intensity centroid of the interpolated source mode is at
-x = +0.0507 um (y = -0.0006 um), and that of the image at x = -0.1235 um (y = +0.0012 um). The lens pair inverts
-the image (magnification -2.5), so the expected image offset is -0.127 um. (The source is the mode as the
-earlier example interpolates it: the major field component on the cell centers of the mode-solver grid.)
+**The mode solve.** It uses the default polish of meow-gpu (`"refine"`). For this weakly guided mode the
+refinement alone does not converge, and the fallback of meow-gpu (since commit b495484) finishes the solve:
+`polish_used` "refine+davidson", converged, residual 6.4e-11 after 216 iterations, 6.3 s with the JAX compilation
+of a new process (row 1). Before that fix, the default polish stopped at a residual of 3.2e-10 after 255
+iterations without its converged flag, and this example used the earlier polish. The earlier complex128 Davidson
+polish stays available with `--polish davidson`. A comparison of the two polishes is in
+`benchmarks/2026-11-07/optics-polish.jsonl` (rows 1 and 2: the mode solves with the default polish and with
+`--polish davidson`; rows 3 and 4: the optics runs with each mode file). Those rows, and the rows of
+`optics-pol-x.jsonl`, used the asymmetric core and the earlier source definitions, so their neff and efficiencies
+are not those of this section. In the polish rows the default polish converged with a residual of 5.1e-11 after
+282 iterations in 12.2 s, and `--polish davidson` with 7.2e-11 after 286 iterations in 8.5 s (faster there). The
+two polishes gave the same mode: neff 1.447296249827 (difference 4.1e-14), and the saved mode fields (the major
+component, normalized) differed by 1.7e-11 (one comparison of the two mode files on the GPU computer; not in the
+log). The optics runs with the two mode files gave the same efficiencies.
 
 ## Known limits
 
