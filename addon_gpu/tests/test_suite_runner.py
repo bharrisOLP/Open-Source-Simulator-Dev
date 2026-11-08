@@ -138,6 +138,21 @@ def test_a_row_records_the_cupy_settings_with_a_repository_folder_relative():
 def test_a_kill_after_the_time_limit_counts_as_a_time_out():
     assert suite_runner.KILL_AFTER_S > 0
     assert set(suite_runner.TIMEOUT_EXITS) == {124, 137, -9}
+    for code in (124, 137, -9):
+        assert suite_runner.is_time_out(code, 300.2, 300)
+        assert not suite_runner.is_time_out(code, 12.0, 300)      # an earlier SIGKILL (the OOM killer) or exit
+    assert not suite_runner.is_time_out(1, 400.0, 300)
+
+
+def test_a_sigkill_before_the_limit_is_not_a_time_out():
+    """A command that ends by SIGKILL before the limit: GNU timeout raises the signal again on itself (return code
+    -9, as at the limit), so only the run time tells the two apart."""
+    t0 = time.monotonic()
+    proc = subprocess.run([suite_runner.timeout_program(), "-k", "1", "30", sys.executable, "-c",
+                           "import os, signal; os.kill(os.getpid(), signal.SIGKILL)"], timeout=60)
+    wall_s = time.monotonic() - t0
+    assert proc.returncode == -signal.SIGKILL and wall_s < 30
+    assert not suite_runner.is_time_out(proc.returncode, wall_s, 30)
 
 
 # The two modules of the pinned commit that install the policy 'keep' in a module fixture and set no cache folder: with
@@ -205,7 +220,7 @@ def test_a_keep_folder_that_the_addon_refuses_is_not_used(tmp_path):
     (unmarked / "an-entry").write_text("")              # files of unknown provenance, no marker
     folder, label, note = suite_runner.module_cache_dir("keep", _cache_args(), base)
     assert (folder, label) == (None, "plain")
-    assert note.startswith("the add-on refused the keep folder") and "marker" in note
+    assert note.startswith("the keep folder is not used") and "marker" in note
     assert not suite_runner.keep_folder_minted(str(unmarked))
     folder, label, note = suite_runner.module_cache_dir("keep", _cache_args(), None)
     assert (folder, label) == (None, "plain") and "no CUPY_CACHE_DIR" in note
@@ -244,8 +259,9 @@ def test_the_time_limit_ends_a_process_that_the_module_started(tmp_path):
     t0 = time.monotonic()
     proc = subprocess.run([suite_runner.timeout_program(), "-k", "1", "2", sys.executable, "-c", GRANDCHILD,
                            str(pid_file)], timeout=60)
-    assert proc.returncode == -signal.SIGKILL and proc.returncode in suite_runner.TIMEOUT_EXITS
-    assert time.monotonic() - t0 < 10
+    wall_s = time.monotonic() - t0
+    assert proc.returncode == -signal.SIGKILL and suite_runner.is_time_out(proc.returncode, wall_s, 2)
+    assert wall_s < 10
     pid = int(pid_file.read_text())
     deadline = time.monotonic() + 5
     while not _gone(pid) and time.monotonic() < deadline:
@@ -277,3 +293,45 @@ def test_a_row_names_the_cache_policy_and_the_timeout_program(tmp_path, monkeypa
     assert (plain_row["cache_policy"], plain_row["cupy_cache_dir"]) == ("plain", base)
     assert calls[0][0][0] == suite_runner.timeout_program() and calls[0][0][1:4] == ["-k", "30", "300"]
     assert keep_row["timeout_program"] == os.path.basename(suite_runner.timeout_program())
+    assert not keep_row["timed_out"] and not plain_row["timed_out"]
+
+    def killed(cmd, cwd, env, stdout, stderr):
+        return subprocess.CompletedProcess(cmd, -9)          # a SIGKILL at once, long before the 300 s limit
+
+    monkeypatch.setattr(suite_runner, "subprocess", types.SimpleNamespace(run=killed, STDOUT=subprocess.STDOUT))
+    row = suite_runner.run_module("meep_gpu/test_backends.py", "gpu", "t2", args, set())   # a new run: new log names
+    assert row["exit"] == -9 and row["timed_out"] is False
+
+
+def _mint_with(monkeypatch, script: str, timeout_s: float = 60):
+    """Replace the mint call of the add-on with ``script`` (run by the same Python, in the clone)."""
+    monkeypatch.setattr(suite_runner, "MINT_KEEP_FOLDER", script)
+    monkeypatch.setattr(suite_runner, "MINT_TIMEOUT_S", timeout_s)
+
+
+def _record(**kw) -> str:
+    return "print('MINT_JSON ' + " + repr(json.dumps(kw)) + ")"
+
+
+def test_a_mint_call_that_fails_gives_a_row_with_the_reason(tmp_path, monkeypatch):
+    """The failed mint calls do not stop the chunk: the module runs with the folder of the environment, and the note
+    of its row gives the reason."""
+    base = str(tmp_path / "cupy-cache")
+    keep = base + "-ftz_stripped"
+    cases = [("import time; time.sleep(30)", 1, "did not end within 1 s"),
+             ("print('MINT_JSON {not json')", 60, "no JSON record"),
+             ("print('MINT_JSON [1, 2]')", 60, "no JSON object"),
+             ("import sys; sys.exit(3)", 60, "exited 3"),
+             (_record(after=keep, writable=True, provenance={"reasons": [], "marked": False,
+                                                             "marker_error": "PermissionError(13)"}), 60,
+              "could not write its marker: PermissionError(13)"),
+             (_record(after=keep, writable=True, provenance={"reasons": []}), 60, "no marker beside the keep folder"),
+             (_record(after=keep, writable=False, error="OSError(30)", provenance={"reasons": []}), 60,
+              "not writable: OSError(30)")]
+    for script, timeout_s, reason in cases:
+        _mint_with(monkeypatch, script, timeout_s)
+        folder, label, note = suite_runner.module_cache_dir("keep", _cache_args(), base)
+        assert (folder, label) == (None, "plain"), script
+        assert note.startswith("the keep folder is not used") or "no marker" in note, note
+        assert reason in note, (script, note)
+    assert not suite_runner.keep_folder_minted(keep)

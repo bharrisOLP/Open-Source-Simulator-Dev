@@ -88,12 +88,16 @@ float32 `D - P` at the repair cells only, with the same in-place subtraction as 
 same device would, and the add-on states that the subset is bit for bit the subset of the whole. On the GPU it keeps
 the NaN sign of the GPU, like the array path and the kernels. A patch that gave the repair the host's words would
 break that equality on the GPU, and a patch for every float32 subtraction of the array path and the kernels is a
-change of the kernels. No test of the add-on compares NaN words there: of the 409 test modules, 79 name
-`deposit_repair` or `_fresh_at`, and 31 write a NaN value (`np.nan`, `float("nan")`, a NaN word, ...); the one
-module in both names the repair in a docstring and gives a NaN coefficient to a check that must refuse it. In the
-two runs of the whole suite no failure came from the repair (`addon_gpu/README.md`). A NaN in D or P is a field
-that has already diverged; the source deposit of patch 0004
-makes a NaN from a non-finite amplitude in a finite field, and its test compares those words with the host's.
+change of the kernels. No test of the add-on compares NaN words of the repair on the GPU: of the 409 test modules,
+79 name `deposit_repair` or `_fresh_at`, and 35 write a NaN value (a NaN of NumPy, CuPy or `math`, `float("nan")`,
+or a float32 or float64 NaN word; `_writes_nan` in `addon_gpu/tests/test_patches.py`; a NaN formed by arithmetic or
+bit operations is not found by this scan). Two modules are in both. `meep_gpu/test_triton_kernels.py` names the
+repair in a docstring only and gives a NaN coefficient to a check that must refuse it.
+`meep_gpu/test_region_dispatch.py` is host NumPy only (no CuPy): it plants the NaN word `0x7FC5A5A5` in auxiliary
+words outside the cells of each form and checks that the word survives, and its test of the repair plants no NaN.
+In the two runs of the whole suite no failure came from the repair (`addon_gpu/README.md`). A NaN in D or P is a
+field that has already diverged; the source deposit of patch 0004 makes a NaN from a non-finite amplitude in a
+finite field, and its test compares those words with the host's.
 `addon_gpu/nan_words_probe.py` part 3 measures it on the GPU (`benchmarks/2026-11-08/addon-nan-probe-repair.out`):
 for 49 pairs of planted words in D and P (finite, NaN of both signs, a NaN payload, infinities; 35 NaN results), the
 repair gives the words of the whole-volume form on the host and on the GPU (0 differing words each), and the GPU

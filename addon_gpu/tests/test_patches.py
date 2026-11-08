@@ -247,23 +247,59 @@ def test_the_repair_forms_d_minus_p_as_update_e_on_the_same_device():
     assert rep["device_vs_host_sign_only"] and rep["differ_where_p_nan_d_not"], rep["pairs_host_device"]
 
 
-def test_no_test_module_of_the_repair_compares_nan_words():
-    """The static count of the decision "no patch 0005": of the 409 test modules of the add-on, 79 name the repair and
-    31 write a NaN value; the one module in both (``meep_gpu/test_triton_kernels.py``) names the repair in a docstring
-    and gives a NaN coefficient to a check that must refuse it."""
+def _writes_nan(text: str) -> list[str]:
+    """The NaN values in the source of a module: a NaN of NumPy, CuPy, ``xp``, ``math`` or PyTorch,
+    ``float("nan")`` (also ``float32``/``float64``), and a hexadecimal literal of 8 or 16 digits (also with a C suffix
+    such as ``u``, in kernel source) that is a float32 or float64 NaN word (all exponent bits set, a mantissa that is
+    not zero). The all-ones bit masks (``0x7FFFFFFF``, ``0xFFFFFFFF`` and their 64-bit forms) are masks, not values,
+    and do not count; an infinity word (``0x7F800000``) is not a NaN. A NaN that a test forms by arithmetic or by bit
+    operations (``words | 0x7F800000``) is not found."""
+    import re
+
+    named = re.compile(r"\b(?:np|numpy|cp|cupy|xp|math|torch)\.nan\b|\bfloat(?:16|32|64)?\(\s*[\"'][+-]?nan[\"']",
+                       re.IGNORECASE)
+    found = named.findall(text)
+    for digits in re.findall(r"\b0[xX]([0-9a-fA-F]{16}|[0-9a-fA-F]{8})(?:[uUlL]{0,3})\b", text):
+        word = int(digits, 16)
+        if digits.upper() in ("7FFFFFFF", "FFFFFFFF", "7FFFFFFFFFFFFFFF", "FFFFFFFFFFFFFFFF"):
+            continue
+        exponent, mantissa = ((0x7F800000, 0x007FFFFF) if len(digits) == 8
+                              else (0x7FF0000000000000, 0x000FFFFFFFFFFFFF))
+        if word & exponent == exponent and word & mantissa:
+            found.append("0x" + digits)
+    return found
+
+
+def test_no_test_module_of_the_repair_compares_gpu_nan_words():
+    """The static count of the decision "no patch 0005": of the 409 test modules of the add-on, 79 name the repair
+    (``deposit_repair`` or ``_fresh_at``) and 35 write a NaN value (``_writes_nan``). Two modules are in both, and
+    neither compares a NaN word of the repair on the GPU:
+
+    - ``meep_gpu/test_triton_kernels.py`` names the repair in a docstring only, and gives a NaN coefficient to a check
+      that must refuse it;
+    - ``meep_gpu/test_region_dispatch.py`` is host NumPy only (no CuPy): it plants the NaN word ``0x7FC5A5A5`` in the
+      auxiliary words outside the cells of each form and checks that the word survives the steps; its test of the
+      repair (``deposit_repair.save``/``apply``) plants no NaN."""
     import re
 
     import suite_runner
 
     repair = re.compile(r"deposit_repair|_fresh_at")
-    nan = re.compile(r"numpy\.nan\b|np\.nan\b|float\([\"']-?nan[\"']\)|math\.nan\b|cupy\.nan\b|cp\.nan\b|"
-                     r"0x7fc00000|0xffc00000|0x7f800001", re.IGNORECASE)
     texts = {m: (PINNED_CLONE / m).read_text(errors="replace") for m in suite_runner.modules(PINNED_CLONE)}
     names = {m for m, text in texts.items() if repair.search(text)}
-    plants = {m for m, text in texts.items() if nan.search(text)}
-    assert (len(texts), len(names), len(plants)) == (409, 79, 31)
-    assert names & plants == {"meep_gpu/test_triton_kernels.py"}
+    plants = {m for m, text in texts.items() if _writes_nan(text)}
+    assert (len(texts), len(names), len(plants)) == (409, 79, 35)
+    assert names & plants == {"meep_gpu/test_triton_kernels.py", "meep_gpu/test_region_dispatch.py"}
+
     text = texts["meep_gpu/test_triton_kernels.py"]
     assert [line for line in text.splitlines() if repair.search(line)] == [
         "    ``deposit_repair`` cannot save and restore, so it stays refused under the shipped"]
-    assert len(nan.findall(text)) == 1 and 'float("nan"),) + tuple(c[1:]), "two_minus_od=nan is not finite"' in text
+    assert _writes_nan(text) == ['float("nan"']
+    assert 'float("nan"),) + tuple(c[1:]), "two_minus_od=nan is not finite"' in text
+
+    text = texts["meep_gpu/test_region_dispatch.py"]
+    assert not re.search(r"cupy|\bcp\.", text) and "Host NumPy only" in text
+    assert sorted(set(w.upper() for w in _writes_nan(text))) == ["0X7FC5A5A5"]
+    repair_test = text[text.index("def test_the_deposit_repair_takes_the_plain_form_outside_the_layer_chunks"):]
+    repair_test = repair_test[:repair_test.index("\ndef ", 1) if "\ndef " in repair_test[1:] else None]
+    assert "deposit_repair.apply" in repair_test and not _writes_nan(repair_test) and "SENTINEL" not in repair_test

@@ -108,8 +108,8 @@ for bit; "relative" is the relative L2 difference.
     bench case, 2,400 steps; fluxes equal), 0 of 2,097,152 (3-D bench case, 320 steps; flux equal), and 0 on the slab
     and the sphere of `tests/test_parity.py`.
 
-The tests of this folder: 51 of 51 pass (`tests/test_patches.py`, `tests/test_parity.py`,
-`tests/test_suite_runner.py`; 83 s, 2026-11-08 14:45 EST, on the pinned clone with the four patches, without
+The tests of this folder: 53 of 53 pass (`tests/test_patches.py`, `tests/test_parity.py`,
+`tests/test_suite_runner.py`; 84 s, ended 2026-11-08 15:25 EST, on the pinned clone with the four patches, without
 `ADDON_GPU_CLONE`).
 
 The test modules of the add-on, run one at a time (2026-11-07, pinned clone, then the work copy with both patches):
@@ -288,9 +288,12 @@ uv run --no-project --python 3.12 addon_gpu/suite_runner.py --run cache-keep-all
 
 The time limit of each module now uses GNU timeout (`gnutimeout` on the GPU computer, as `tools/gpu_run.sh`): at
 the limit it sends SIGTERM, and 30 s later SIGKILL, to the process group of the module, so a process that the module
-started also ends. GNU timeout is in that group, so the SIGKILL also ends it: the runner counts the return code -9
-as a time-out, with 124 and 137. `tests/test_suite_runner.py` checks this with a command and a second process that
-both ignore SIGTERM (both end, return code -9). Each row of the two files names `gnutimeout`.
+started also ends. GNU timeout is in that group, so the SIGKILL also ends it (return code -9). A SIGKILL of the
+module process from another source before the limit (the OOM killer) also gives -9 (or 137), so a row is a time-out
+only when the return code is 124, 137 or -9 and the call took at least the limit. `tests/test_suite_runner.py` checks
+this with a command and a second process that both ignore SIGTERM (both end, return code -9, a time-out), and with a
+command that ends by SIGKILL before the limit (return code -9, not a time-out). Each row of the two files names
+`gnutimeout`; no row of the two files is a time-out.
 
 ## Timings
 

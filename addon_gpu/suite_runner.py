@@ -28,19 +28,22 @@ Each module runs alone, as ``timeout -k 30 <--timeout> python -m pytest -q <modu
 (default 300 s; SIGTERM at the limit, SIGKILL 30 s later). The time limit uses GNU timeout: ``gnutimeout`` when it is
 on the PATH (as tools/gpu_run.sh does), else ``timeout``. GNU timeout sends both signals to the process group of the
 module, so a process that the module started also stops; the uutils ``timeout`` of the GPU computer sends them only
-to its direct child. The modules run in chunks: one call of
-``bash tools/gpu_run.sh .local/upstream/erised-fork`` (one hold of the GPU lock) runs at most ``--chunk`` modules, one
-after the other, and starts no new module after ``--chunk-seconds`` (default 240 s); then the next chunk waits for
-the lock again, so other runs of this repository get the GPU between chunks. The runner prints the uptime and the
-load before each chunk. With ``--hardware any`` (the default) the module runs with ``MEEP_GPU_HARDWARE=any``, the
-switch of the add-on that admits this GPU for its kernel tables (uncertified); ``--hardware default`` leaves the
-variable unset. The JSON line goes to ``.local/addon-runs/suite/<run>.jsonl`` and to the standard output; the pytest
-output and the JUnit file of the module go to ``.local/addon-runs/suite/<run>/``. Each line holds the module, the
-counts (passed, failed, skipped, errors; ``null`` after a time-out), the seconds of the test session and of the
-whole call, the exit code, the failed tests with the first line of their messages, how many of them the add-on lists
-as pending certification, the uptime and load of the computer before the module (a low uptime shows a restart), and
-the ``CUPY_GPU_MEMORY_LIMIT`` and ``CUPY_CACHE_DIR`` of the pytest call (a folder in this repository relative to
-it), the cache policy of the module and the name of the timeout program.
+to its direct child. A row is a time-out (``timed_out``) when the return code is 124, 137 or -9 and the call took at
+least the limit: a SIGKILL from another source (the OOM killer) also gives -9 or 137, earlier.
+
+The modules run in chunks: one call of ``bash tools/gpu_run.sh .local/upstream/erised-fork`` (one hold of the GPU
+lock) runs at most ``--chunk`` modules, one after the other, and starts no new module after ``--chunk-seconds``
+(default 240 s); then the next chunk waits for the lock again, so other runs of this repository get the GPU between
+chunks. The runner prints the uptime and the load before each chunk. With ``--hardware any`` (the default) the module
+runs with ``MEEP_GPU_HARDWARE=any``, the switch of the add-on that admits this GPU for its kernel tables
+(uncertified); ``--hardware default`` leaves the variable unset. The JSON line goes to
+``.local/addon-runs/suite/<run>.jsonl`` and to the standard output; the pytest output and the JUnit file of the module
+go to ``.local/addon-runs/suite/<run>/``. Each line holds the module, the counts (passed, failed, skipped, errors;
+``null`` after a time-out), the seconds of the test session and of the whole call, the exit code, the failed tests
+with the first line of their messages, how many of them the add-on lists as pending certification, the uptime and load
+of the computer before the module (a low uptime shows a restart), and the ``CUPY_GPU_MEMORY_LIMIT`` and
+``CUPY_CACHE_DIR`` of the pytest call (a folder in this repository relative to it), the cache policy of the module and
+the name of the timeout program.
 
 The CuPy cache folder follows the rule of the add-on (``meep_gpu/subnormal_policy.py``: ``cupy_cache_reasons``,
 ``keep_policy_cache_dir``). An install of the float32 subnormal policy ``keep`` needs a ``CUPY_CACHE_DIR`` whose path
@@ -53,9 +56,10 @@ and installs no ``flush`` (``KEEP_BY_HAND``; at the pinned commit two modules) r
 ``CUPY_CACHE_DIR=<CUPY_CACHE_DIR>-ftz_stripped`` (the keep folder that the dispatch derives), and every other module
 with the ``CUPY_CACHE_DIR`` of the environment (``.local/cupy-cache``, from tools/env/addon_gpu_activate.sh). When
 the marker of the keep folder is missing, the runner first lets the add-on mint the folder
-(``point_cupy_cache_at_keep_policy`` in a short process); if the add-on refuses the folder, the module runs with the
-folder of the environment, and its row gives the reason. ``--cache-policy plain`` gives every module the folder of
-the environment (the rows of 2026-11-08); ``--cupy-cache-dir`` gives every module one folder.
+(``point_cupy_cache_at_keep_policy`` in a short process); if the add-on refuses the folder, writes no marker, or the
+call fails, the module runs with the folder of the environment, and its row gives the reason. ``--cache-policy
+plain`` gives every module the folder of the environment (the rows of 2026-11-08); ``--cupy-cache-dir`` gives every
+module one folder.
 
 The counts come from the JUnit file, one outcome for each test case: a case with a failure counts as failed, else a
 case with an error counts as an error, else skipped or passed. pytest's own summary can differ when a test also has
@@ -102,7 +106,9 @@ TIERS = ("host", "gpu", "certification")
 MESSAGE_CHARS = 300
 KILL_AFTER_S = 30            # timeout -k: SIGKILL this many seconds after the SIGTERM at the time limit
 # The return codes of the timeout call at the limit: 124, SIGTERM ended the command; 137, SIGKILL ended it (the
-# uutils timeout, which survives); -9, GNU timeout sent SIGKILL to the process group, itself included
+# uutils timeout, which survives); -9, GNU timeout sent SIGKILL to the process group, itself included. A SIGKILL of
+# the module process from another source (the OOM killer) before the limit also gives -9 (both timeout programs raise
+# the signal of the child again on themselves), so a row is a time-out only at a run time of at least the limit.
 TIMEOUT_EXITS = (124, 137, -9)
 MAX_FAILURES = 40
 # The CuPy cache rule of the add-on (meep_gpu/subnormal_policy.py): CUPY_CACHE_POLICY_TOKEN, KEEP_POLICY_MARKER_SUFFIX
@@ -119,6 +125,7 @@ POLICY_WORDS = re.compile(r"install_subnormal_policy|set_subnormal_policy|instal
                           r"cupy_cache_reasons")
 # Run by the runner with CUPY_CACHE_DIR=<the folder of the environment>: the add-on mints its keep folder (or refuses
 # it) and prints the record of point_cupy_cache_at_keep_policy.
+MINT_TIMEOUT_S = 120
 MINT_KEEP_FOLDER = ("import json; from meep_gpu.subnormal_policy import point_cupy_cache_at_keep_policy as p; "
                     "print('MINT_JSON ' + json.dumps(p(), default=str))")
 
@@ -186,17 +193,29 @@ def keep_folder_minted(folder: str) -> bool:
 
 def mint_keep_folder(base: str) -> dict:
     """Let the add-on mint the keep folder of ``base`` (its marker), in a short process in the clone. Returns the
-    folder and the reasons of a refusal (a folder with files and without a marker; an unwritable folder)."""
+    folder and the reasons of a refusal (a folder with files and without a marker; an unwritable folder; a marker that
+    the add-on could not write) or of a failed call (no end within ``MINT_TIMEOUT_S``, no JSON record)."""
     env = dict(os.environ, CUPY_CACHE_DIR=base, PYTHONDONTWRITEBYTECODE="1")
-    proc = subprocess.run([sys.executable, "-c", MINT_KEEP_FOLDER], cwd=CLONE, env=env, capture_output=True,
-                          text=True, timeout=120)
+    try:
+        proc = subprocess.run([sys.executable, "-c", MINT_KEEP_FOLDER], cwd=CLONE, env=env, capture_output=True,
+                              text=True, timeout=MINT_TIMEOUT_S)
+    except subprocess.TimeoutExpired:
+        return {"folder": None, "reasons": [f"the mint call did not end within {MINT_TIMEOUT_S} s"]}
     for line in proc.stdout.splitlines():
         if line.startswith("MINT_JSON "):
-            record = json.loads(line[len("MINT_JSON "):])
-            reasons = list((record.get("provenance") or {}).get("reasons") or [])
+            try:
+                record = json.loads(line[len("MINT_JSON "):])
+            except json.JSONDecodeError as exc:
+                return {"folder": None, "reasons": [f"the mint call printed no JSON record ({exc})"[:MESSAGE_CHARS]]}
+            if not isinstance(record, dict):
+                return {"folder": None, "reasons": ["the mint call printed no JSON object"]}
+            provenance = record.get("provenance") or {}
+            reasons = [str(r) for r in provenance.get("reasons") or []]
             if not record.get("writable", False):
                 reasons.append(f"not writable: {record.get('error', '?')}")
-            return {"folder": record.get("after"), "reasons": reasons}
+            if provenance.get("marker_error"):
+                reasons.append(f"the add-on could not write its marker: {provenance['marker_error']}")
+            return {"folder": record.get("after"), "reasons": [r[:MESSAGE_CHARS] for r in reasons]}
     tail = (proc.stdout + proc.stderr).strip().splitlines()[-2:]
     return {"folder": None, "reasons": [f"the mint call exited {proc.returncode}: {' | '.join(tail)}"[:MESSAGE_CHARS]]}
 
@@ -214,10 +233,18 @@ def module_cache_dir(policy: str, args, base: str | None) -> tuple[str | None, s
         return folder, "keep", None
     minted = mint_keep_folder(base)
     if minted["reasons"] or minted["folder"] != folder:
-        return None, "plain", ("the add-on refused the keep folder: " + "; ".join(minted["reasons"])
+        return None, "plain", ("the keep folder is not used: " + "; ".join(minted["reasons"])
                                + ("" if minted["folder"] == folder else f" (it chose {minted['folder']})")
                                )[:MESSAGE_CHARS]
+    if not keep_folder_minted(folder):
+        return None, "plain", "the mint call gave no reason, but there is no marker beside the keep folder"
     return folder, "keep", "minted by the add-on before this module"
+
+
+def is_time_out(returncode: int, wall_s: float, limit: float) -> bool:
+    """The time limit ended the call: a return code of ``TIMEOUT_EXITS`` after at least ``limit`` seconds (the
+    clock of the runner starts before the timeout program). An earlier SIGKILL (-9 or 137) is not a time-out."""
+    return returncode in TIMEOUT_EXITS and wall_s >= limit
 
 
 def timeout_program() -> str:
@@ -312,7 +339,7 @@ def run_module(module: str, tier_name: str, run: str, args, pending: set[str]) -
     wall_s = time.perf_counter() - t0
     row = {"module": module, "tier": tier_name, "hardware": args.hardware, "started": started, **state,
            **row_environment(env), "cache_policy": cache_label, "timeout_program": Path(program).name,
-           "exit": proc.returncode, "timed_out": proc.returncode in TIMEOUT_EXITS}
+           "exit": proc.returncode, "timed_out": is_time_out(proc.returncode, wall_s, args.timeout)}
     if cache_note:
         row["cache_note"] = cache_note
     if xml_path.exists():
