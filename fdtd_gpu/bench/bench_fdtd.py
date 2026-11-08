@@ -11,6 +11,8 @@
     python bench/bench_fdtd.py --case near2far --resolution 20 [--index 1.5] [--component Ex]   # 3-D dipole
     python bench/bench_fdtd.py --case near2far2d --resolution 20 [--index 1.5] [--component Ex]  # 2-D line source
     python bench/bench_fdtd.py --case transform     # transform of exact fields (no FDTD), h = 0.1, 0.05, 0.025
+    python bench/bench_fdtd.py --case distance --resolution 20   # near2far error on shells 1 to 10 cells out
+    python bench/bench_fdtd.py --case subtract --resolution 20   # near2far with subtracted incident fields (2-D)
     python bench/bench_fdtd.py --case setup --resolution 50     # time of the subpixel average only, 3-D strip
     python bench/bench_fdtd.py --case all          # bragg, waveguide, ring, dipole, sheet at the default resolutions
     python bench/bench_fdtd.py --case ring --resolution 40,60,80 --both    # a list of resolutions; averaged and not
@@ -69,7 +71,8 @@ def setup(resolution: int = 50):
 
 ap = argparse.ArgumentParser()
 ap.add_argument("--case", choices=["bragg", "waveguide", "ring", "disk", "slab", "dipole", "sheet", "near2far",
-                                   "near2far2d", "transform", "setup", "all"], default="all")
+                                   "near2far2d", "transform", "distance", "subtract", "setup", "all"],
+                default="all")
 ap.add_argument("--component", type=str, default="Ez", help="source of the near2far cases: Ez, Ex or Ey")
 ap.add_argument("--resolution", type=str, default=None, help="one value, or a list: 20,40,80")
 ap.add_argument("--index", type=float, default=1.0, help="medium of the dipole and sheet cases")
@@ -116,7 +119,8 @@ for case, resolution, avg in itertools.product(todo, resolutions, averaging):
     if case == "waveguide":
         kw["three_d"] = a.three_d
         kw["src_freq"] = a.src_freq
-    fn = {"near2far": "near2far_dipole", "near2far2d": "near2far_line"}.get(case, case)
+    fn = {"near2far": "near2far_dipole", "near2far2d": "near2far_line", "distance": "near2far_distance",
+          "subtract": "near2far_subtract"}.get(case, case)
     res = setup(**kw) if case == "setup" else getattr(cases, fn)(**kw)
     row = {"case": case, **{k: v for k, v in kw.items()}, **res}
     if a.forward_diagonal:

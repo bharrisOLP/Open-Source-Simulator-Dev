@@ -139,9 +139,10 @@ sources or mode monitors.
     Green's function of the homogeneous medium: in 3-D exp(i k R) / (4 pi R) with all near terms (the Hertzian
     dipole fields, Jackson, Classical Electrodynamics, 3rd ed., eq. 9.18), in 2-D (i/4) H0^(1)(k rho) (line currents
     per unit length; the Hankel form). So `get_farfield` is valid at each distance outside the surface (it can be
-    outside the cell), not only in the far zone; the sum over the cells is a quadrature, so keep the points several
-    cells away from the surface (check 9 uses 3 um and 1000 um). Inside a closed surface the result is close to
-    zero.
+    outside the cell), not only in the far zone. The sum over the cells is a quadrature: keep the points at least 5
+    cells away from the surface. At 1, 2, 5 and 10 cells outside the box of check 9 (res 20) the error of E is
+    0.13, 8.4e-3, 4.6e-3 and 4.0e-3 (`--case distance`; at 1000 um 1.6e-3). Inside a closed surface the result is
+    close to zero.
   - The surface cells are the cells of the planes, with the trapezoidal weight 1/2 at the plane edges (as for flux);
     the field point of each cell is the point where fdtdx co-locates the six components: the cell center, + dx / 2
     along z (in 3-D). A point source is at its own Yee point (`tests/cases.py`, `yee_point`).
@@ -153,14 +154,24 @@ sources or mode monitors.
     shape (the axes with more than one point, nfreq). `n2f.flux` sums Re(E x conj H) . e_direction over these
     points with the trapezoidal rule.
   - Phase: against the current spectrum of `GaussianSource.fourier_transform`, the far fields of a point source have
-    the extra phase -omega dt / 2 (within 2e-3 rad at res 20, check 9). fdtdx takes the current of the E update of
-    step n at the time n dt of the new E; the leapfrog scheme puts it at the time of the curl of H, half a step
-    earlier. So the effective current is J(t + dt / 2). Ratios of two runs (normalization) cancel the phase.
+    the extra phase -omega dt / 2. fdtdx takes the current of the E update of step n at the time n dt of the new E;
+    the leapfrog scheme puts it at the time of the curl of H, half a step earlier. So the effective current is
+    J(t + dt / 2), and the same phase is in each DFT output of a point source (the DFT fields, the mode
+    coefficients and the far fields), not only in the far fields. Magnetic point sources get the same half-step
+    shift (fdtdx `update_H` takes the source at the time step + 1/2, where the curl of E is at the time step; not
+    tested). The mode source (TFSF) is not checked. Measured (check 9, n = 1, res 20, both boxes, all frequencies):
+    the far fields have the phase -omega dt / 2 within 2.14e-3 rad (3-D Ez), 2.26e-3 (3-D Ex), 2.16e-3 (2-D Ez) and
+    2.41e-3 (2-D Ex); at res 40 within 5.3e-4 (3-D Ez, 2-D Ez) and 6.0e-4 (2-D Ex). The rest is the phase error of
+    the grid dispersion, which is larger in a medium: at n = 1.5 within 1.08e-2 (3-D) and 1.46e-2 rad (2-D) at res
+    20, 2.65e-3 (3-D) and 3.60e-3 (2-D) at res 40. Ratios of two runs (normalization) cancel the phase.
   - The 3-D sum runs in float64 with JAX on the GPU (chunks of about 2 M point-cell pairs); the 2-D sum in float64
-    with NumPy and the Hankel functions of SciPy on the CPU. Time of the 3-D case of check 9 at res 20 (1,152 far
-    and 231 near points, 5 frequencies; 10,086 or 2,646 surface cells): 0.54 s per box, the mean of the two boxes,
-    with the compile (`farfield_seconds`). The work is points x surface cells x frequencies; a chunk holds at least
-    one point, so a surface of millions of cells makes many small chunks.
+    with NumPy and the Hankel functions of SciPy on the CPU, with one line element per cell (E and H averaged over
+    the TRIVIAL_CELLS cells of the axis of size 0). Time of the 3-D case of check 9 at res 20 (1,152 far and 231
+    near points, 5 frequencies; 10,086 or 2,646 surface cells; `farfield_seconds`, the mean of the two boxes): 0.53 s
+    per box in the rows of `--component Ex` and `--index 1.5` (one process each, with the compile), 0.29 s in the
+    res-20 row of `--resolution 10,20,30,40` (the res-10 run of the same process compiled some of the shapes). The
+    work is points x surface cells x frequencies; a chunk holds at least one point, so a surface of millions of
+    cells makes many small chunks.
   - Only the 2-D cell in the x-y plane is checked (the code takes any axis of size 0).
   - Differences from the MIT package: no `nperiods`, no files (`output_farfields`, `save_near2far`,
     `load_near2far`), the extra `get_farfields_at`; the rule of the medium and the points of `get_farfields` above are
@@ -186,7 +197,8 @@ rows of `benchmarks/2026-11-07/fdtd-gpu-avg.jsonl` (subpixel averaging on, unles
 7900 XT, 2026-11-07: `--case all`, the two 3-D waveguide commands and the six commands from `--case ring
 --resolution 40,60,80 --both` to `--case setup` under "Tests and bench", in that order; other jobs can share the
 computer, so times can change between runs). The numbers of check 9 are from the rows of
-`benchmarks/2026-11-08/fdtd-gpu-near2far.jsonl` (the near2far commands under "Tests and bench"). In the logged run, a
+`benchmarks/2026-11-08/fdtd-gpu-near2far.jsonl` (the first seven check-9 commands under "Tests and bench") and of
+`benchmarks/2026-11-08/fdtd-gpu-near2far-2.jsonl` (the last four). In the logged run, a
 scipy RuntimeWarning on stderr cut the row of check 7 (staircase, res 160); line 31 of the file is the row of a
 repeat of the same command on the same day (with a "note" key), which replaces it. (`references.disk_resonance`
 now hides these warnings.) The other rows of checks 4 and 5 are from version 0.1 (the staircase only) in
@@ -300,8 +312,9 @@ the digits shown. "res" is the resolution in cells per um; times are the FDTD lo
    `near2far_line`). References: the fields of a point dipole in spherical components (Balanis, Antenna Theory, 3rd
    ed., Sec. 4.2; `references.dipole_fields_3d`) and of a line current in the Hankel form
    (`references.line_source_fields_2d`), written independently of the Cartesian form of the transform; the analytic
-   power n omega^2 abs(I)^2 / (6 pi) (3-D, as check 4) and omega abs(I)^2 / 4 (2-D, current along z) or
-   omega abs(I)^2 / 8 (2-D, current in the plane) per unit length.
+   power in the DFT convention of the monitors (twice the time average): n omega^2 abs(I)^2 / (6 pi) in 3-D
+   (`references.dipole_flux_3d`; check 4 gives the time average n omega^2 abs(I)^2 / (12 pi)), and per unit length
+   omega abs(I)^2 / 4 (2-D, current along z) or omega abs(I)^2 / 8 (2-D, current in the plane).
    - Transform of exact fields (no FDTD, `--case transform`): the exact fields of a source at (0.1, -0.05, 0.07) um
      (z = 0 in 2-D) in n = 1.5 on a closed box or square of half width 1 um (trapezoidal rule, spacing h), f = 0.4
      and 0.6 / um, against the exact fields at 1000 um (max abs(error) / max abs(exact) of E):
@@ -312,7 +325,7 @@ the digits shown. "res" is the resolution in cells per um; times are the FDTD lo
      | 0.05 | 2.4e-3 | 2.2e-3 | 1.9e-3 | 1.2e-3 |
      | 0.025 | 5.9e-4 | 5.4e-4 | 4.7e-4 | 2.9e-4 |
 
-     Second order: each halving of h divides the error by 4.00 to 4.04. At 3 um the errors are 1.04 to 1.16 times
+     Second order: each halving of h divides the error by 4.00 to 4.04. At 3 um the errors are 1.040 to 1.154 times
      these values. Inside the surface (0.4 um from the source) max abs(E) / min abs(E_exact) is below 9.6e-4,
      2.4e-4 and 5.9e-5 (extinction theorem). The JAX sum (GPU, float64) and the NumPy sum differ by at most 8.3e-15.
      The test (h = 0.1 and 0.05) requires the errors below 3e-3 (1000 um) and 4e-3 (3 um), the order above 1.9, and
@@ -327,19 +340,27 @@ the digits shown. "res" is the resolution in cells per um; times are the FDTD lo
 
      | res | P_far / flux | P_far / exact | field error | pattern error | at 3 um | boxes | FDTD loop |
      |---|---|---|---|---|---|---|---|
-     | 10 | 0.9879 to 1.0057 | 0.9938 to 1.0094 | 6.7e-3 | 1.2e-2 | 7.7e-3 | 1.3e-2 | 1.0 s |
+     | 10 | 0.9879 to 1.0057 | 0.9938 to 1.0094 | 6.7e-3 | 1.2e-2 | 7.7e-3 | 1.3e-2 | 1.1 s |
      | 20 | 0.9970 to 1.0014 | 0.9985 to 1.0023 | 1.7e-3 | 2.8e-3 | 1.9e-3 | 3.1e-3 | 1.5 s |
-     | 30 | 0.9987 to 1.0006 | 0.9993 to 1.0010 | 7.6e-4 | 1.3e-3 | 8.5e-4 | 1.4e-3 | 5.2 s |
-     | 40 | 0.9992 to 1.0004 | 0.9996 to 1.0006 | 4.3e-4 | 7.2e-4 | 4.9e-4 | 7.7e-4 | 16.0 s |
+     | 30 | 0.9987 to 1.0006 | 0.9993 to 1.0010 | 7.6e-4 | 1.3e-3 | 8.5e-4 | 1.4e-3 | 5.1 s |
+     | 40 | 0.9992 to 1.0004 | 0.9996 to 1.0006 | 4.3e-4 | 7.2e-4 | 4.9e-4 | 7.7e-4 | 16.1 s |
 
      All fall at second order: what remains is the discretization of the FDTD near fields (the dispersion of the Yee
      grid; the flux of check 4 has the same order), not the transform. At res 20 the global phase is -omega dt / 2
-     within 1.92e-3 rad (see "Differences"). Ex dipole (res 20, `--component Ex`): P_far / flux 0.9972 to 1.0000,
+     within 2.14e-3 rad (n = 1; see "Differences"). Ex dipole (res 20, `--component Ex`): P_far / flux 0.9972 to 1.0000,
      P_far / exact 0.9943 to 0.9993, field error 3.0e-3, pattern error 5.9e-3, at 3 um 4.0e-3, boxes 5.3e-3. n = 1.5
      (res 20, `--index 1.5`): P_far / flux 0.99738 to 1.00345, P_far / exact 1.0002 to 1.0089 (flux / exact 1.0023
-     to 1.0066, as check 4), field error 1.5e-2, pattern error 2.1e-2, at 3 um 1.2e-2, boxes 1.6e-2: larger, because
-     k dx is 1.5 times larger in the medium. `n2f.flux` through the six faces of a cube of half width 100 um (40 x 40
-     points per face) / P_far: 0.99968 at all resolutions (the trapezoidal rule of the flux points).
+     to 1.0066, as check 4), field error 1.5e-2, pattern error 2.1e-2, at 3 um 1.2e-2, boxes 1.6e-2. The field error
+     is 9.0 times that at n = 1 (the boxes 5.2 times), more than the factor 2.25 of a second-order error in k dx.
+     The cause is the dispersion of the Yee grid in the medium: its phase error grows along the path inside the box,
+     about as k (k dx)^2 L (1 - S^2), that is about as n^3, with the Courant number S = c dt / (n dx), which is lower
+     in the medium (Taflove and Hagness, Computational Electrodynamics, ch. 4). Measured: the field error grows with
+     the box (1.5e-2 for the box of 1.0 um, 5.1e-3 for 0.5 um; at n = 1 1.7e-3 and 1.5e-3) and with the frequency
+     (box 1.0 um: 1.5e-3 at 0.4 / um, 1.5e-2 at 0.6 / um); the phase rest (1.08e-2 rad) is 5.0 times that of n = 1. It
+     is the FDTD discretization, not the transform: at res 40 (`--resolution 40 --index 1.5`) the field error is
+     3.8e-3, the boxes 4.1e-3, the phase rest 2.65e-3 rad, P_far / flux 0.99935 to 1.00086 (second order: the
+     ratios 4.0, 4.0 and 4.1). `n2f.flux` through the six faces of a cube of half width 100 um (40 x 40 points per
+     face) / P_far: 0.99968 at all resolutions (the trapezoidal rule of the flux points).
    - FDTD, 2-D line source (n = 1, `--case near2far2d`): squares of half width 1.0 and 0.5 um, a circle of 72 points
      at 1000 um and at 3 um, the same metrics:
 
@@ -352,20 +373,37 @@ the digits shown. "res" is the resolution in cells per um; times are the FDTD lo
      | 40 | Ex | 0.9992 to 1.0007 | 0.9992 to 1.0004 | 5.1e-4 | 1.0e-3 | 5.7e-4 | 6.5e-4 |
      | 80 | Ex | 0.9998 to 1.0002 | 0.9998 to 1.0001 | 1.3e-4 | 2.5e-4 | 1.4e-4 | 1.7e-4 |
 
-     Second order. At res 20 the global phase is -omega dt / 2 within 1.9e-3 rad. Ez in n = 1.5 (res 20): P_far /
-     flux 0.99707 to 1.00455, field error 1.2e-2, pattern error 1.8e-2, boxes 1.2e-2. `n2f.flux` through a square of
-     half width 100 um (200 points per side) / P_far: 0.9999946.
+     Second order. At res 20 (n = 1) the global phase is -omega dt / 2 within 2.16e-3 (Ez) and 2.41e-3 rad (Ex). Ez
+     in n = 1.5 (`--index 1.5`): P_far / flux 0.99707 to 1.00455 (res 20), 0.99926 to 1.00112 (res 40), 0.99981 to
+     1.00028 (res 80); field error 1.2e-2, 3.0e-3, 7.4e-4; boxes 1.2e-2, 3.0e-3, 7.8e-4; pattern error 1.8e-2 at res
+     20: second order, as in 3-D. `n2f.flux` through a square of half width 100 um (200 points per side) / P_far:
+     0.9999946.
+   - Distance from the surface (`--case distance`; the 3-D Ez dipole, n = 1, res 20, one box of half width 1 um):
+     max abs(error) / max abs(exact) of E (and of H) on cube shells m cells outside the box of the DFT points (9 x 9
+     points per face), after the global phase of the far fields, the worst frequency. m = 1: 0.13 (0.096); 2: 8.4e-3
+     (9.0e-3); 3: 5.1e-3 (3.4e-3); 5: 4.6e-3 (2.5e-3); 10: 4.0e-3 (2.4e-3); at 1000 um 1.6e-3. The transform of the
+     exact fields on the same points (the quadrature alone): 0.13 (0.096), 8.0e-3 (8.9e-3), 3.3e-3 (3.4e-3),
+     1.8e-3 (2.1e-3), 1.3e-3 (1.1e-3). So the quadrature limits the points to at least 5 cells from the surface.
+   - Subtraction of incident fields (`--case subtract`; 2-D, Ez, n = 1, the cell interior +-2 um, a square of half
+     width 1 um): run A has a line source S2 at (0, -1.6) um, outside the square; run B has S2 and a line source S1
+     at the origin, inside it. Res 20 / 40, the worst frequency: the far fields of B with the DFT fields of A
+     subtracted (`load_minus_near2far_data`) against the field of S1: 1.3e-3 / 3.0e-4; of B without the subtraction:
+     6.5e-3 / 1.6e-3 (the transform of the outer source is not exactly zero outside the square: 6.8e-3 / 1.6e-3 of
+     its far field); the transform of A at 0.5 um from the center, inside the square, against minus the field of S2:
+     3.3e-3 / 8.2e-4.
    - The tests (3-D at res 10 and 20; 2-D, Ez and Ex, at res 20 and 40) require at res 20: abs(P_far / flux - 1)
      below 6e-3, abs(P_far / exact - 1) below 1e-2, the pattern error below 1.5e-2, the field error, the error at
      3 um and the box difference below 7e-3, the phase -omega dt / 2 within 4e-3 rad, abs(n2f.flux / P_far - 1)
      below 1e-3; an order above 1.8 for the worst P_far / flux, field error and box difference; and in 3-D that
-     get_farfield equals get_farfields_at and the shape of get_farfields. One more test: load_minus_near2far_data with
-     the data of the same run gives zero far fields (below 1e-6 of the far fields), and a surface that crosses a
-     second material gives the warning.
+     get_farfield equals get_farfields_at and the shape of get_farfields. More tests: load_minus_near2far_data with
+     the data of a second, equal run gives zero far fields (below 1e-6 of the far fields), and a surface that
+     crosses a second material gives the warning; the distance test requires the errors at 5 and 10 cells below
+     1e-2 (FDTD) and 4e-3 (exact fields), and above 5e-2 at 1 cell; the subtraction test (res 20) requires the error
+     of B - A below 3e-3, of B and of the outer source outside below 1.5e-2, and inside below 7e-3.
 
-Tests: 36 (21 without FDTD runs: geometry, Prism center, 2-D parities, Harminv, the averaged permittivity against
+Tests: 38 (21 without FDTD runs: geometry, Prism center, 2-D parities, Harminv, the averaged permittivity against
 exact fill fractions and the formula of Kottke et al. (2-D and 3-D, both diagonals), periodic faces, NumPy against
-JAX, the transfer to fdtdx, the near-to-far-field transform of exact fields, the points of get_farfields; 15 FDTD
+JAX, the transfer to fdtdx, the near-to-far-field transform of exact fields, the points of get_farfields; 17 FDTD
 checks, some with more than one run).
 
 ## Tests and bench (on the GPU computer)
@@ -393,6 +431,10 @@ bash tools/gpu_run.sh fdtd_gpu $B --case near2far --resolution 20 --index 1.5
 bash tools/gpu_run.sh fdtd_gpu $B --case near2far2d --resolution 20,40,80            # check 9, 2-D line source
 bash tools/gpu_run.sh fdtd_gpu $B --case near2far2d --resolution 20,40,80 --component Ex
 bash tools/gpu_run.sh fdtd_gpu $B --case near2far2d --resolution 20 --index 1.5
+bash tools/gpu_run.sh fdtd_gpu $B --case near2far --resolution 40 --index 1.5        # check 9, second file
+bash tools/gpu_run.sh fdtd_gpu $B --case near2far2d --resolution 40,80 --index 1.5
+bash tools/gpu_run.sh fdtd_gpu $B --case distance --resolution 20
+bash tools/gpu_run.sh fdtd_gpu $B --case subtract --resolution 20,40
 ```
 
 If the package is not installed in `.venv-rocm`, use `PYTHONPATH=src`. It needs fdtdx 0.6.3 (with tidy3d for its mode

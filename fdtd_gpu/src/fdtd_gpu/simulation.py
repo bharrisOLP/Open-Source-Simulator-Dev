@@ -421,12 +421,15 @@ class Simulation:
 
     def _near2far_currents(self, n2f):
         """Positions (N, 3) and current elements J = n x H, M = -n x E (nfreq, N, 3; times the area of the cell, the
-        trapezoidal weight of the plane and the region weight) of all surface cells. Sets n2f.eps: the staircase
-        material of the surface cells (a warning if they have more than one material: the far fields assume one
-        homogeneous medium)."""
+        trapezoidal weight of the plane and the region weight) of all surface cells. In 2-D the fields do not change
+        along the axis of size 0: E and H are averaged over its TRIVIAL_CELLS cells, and each cell of the plane gives
+        one line element of length dx (times the trapezoidal weight). Sets n2f.eps: the staircase material of the
+        surface cells (a warning if they have more than one material: the far fields assume one homogeneous
+        medium)."""
         self._need_run()
         pos, Js, Ms, eps = [], [], [], []
         nf = len(n2f.freqs)
+        triv = tuple(2 + q for q in range(3) if self.trivial[q])         # axes of E (nfreq, 3, nx, ny, nz)
         for j, r in enumerate(n2f.regions):
             E, H = self._phasors(n2f, j)
             if n2f.minus is not None:
@@ -434,7 +437,11 @@ class Simulation:
             a = n2f.axes[j]
             b, c = (a + 1) % 3, (a + 2) % 3
             rng = [self._range(r.center, r.size, ax) for ax in range(3)]
-            w = (r.weight * self._area(a) * self._trapezoid(E.shape[2:], a)).reshape(-1)
+            if triv:                                # the normal a is never an axis of size 0 (_normal)
+                E, H = E.mean(axis=triv, keepdims=True), H.mean(axis=triv, keepdims=True)
+                rng = [(0, 1) if self.trivial[q] else rng[q] for q in range(3)]
+            area = self._area(a) * TRIVIAL_CELLS ** len(triv)               # dx^(dims - 1)
+            w = (r.weight * area * self._trapezoid(E.shape[2:], a)).reshape(-1)
             E, H = E.reshape(nf, 3, -1), H.reshape(nf, 3, -1)
             J, M = np.zeros((nf, E.shape[2], 3), complex), np.zeros((nf, E.shape[2], 3), complex)
             J[:, :, b], J[:, :, c] = -H[:, c] * w, H[:, b] * w             # e_a x H

@@ -95,8 +95,9 @@ def test_near2far_line_2d(component):
 
 @pytest.mark.gpu
 def test_near2far_minus_data_and_medium_warning():
-    """load_minus_near2far_data subtracts the DFT fields of another run (the same run: zero far fields); a surface
-    that crosses a second material gives a warning, and the far fields use the material of most surface cells."""
+    """load_minus_near2far_data subtracts the DFT fields of another run (here a second, equal run: zero far fields;
+    test_near2far_subtract_incident_fields subtracts fields that differ); a surface that crosses a second material
+    gives a warning, and the far fields use the material of most surface cells."""
     def run(minus=None):
         gs = fg.GaussianSource(0.5, fwidth=0.2)
         block = fg.Block(size=fg.Vector3(0.4, 0.4, fg.inf), center=fg.Vector3(1.0, 0), material=fg.Medium(index=2))
@@ -114,3 +115,29 @@ def test_near2far_minus_data_and_medium_warning():
     assert n2f.eps == 1.0 and ff["Ez"].shape == (4, 3) and np.abs(ff["Ez"]).min() > 0
     _, _, ff0 = run(sim.get_near2far_data(n2f))
     assert np.abs(ff0["Ez"]).max() < 1e-6 * np.abs(ff["Ez"]).max(), np.abs(ff0["Ez"]).max()
+
+
+@pytest.mark.gpu
+def test_near2far_close_to_the_surface():
+    """3-D Ez dipole, res 20: the error of the transform at 5 and 10 cells outside the box of the DFT points (both
+    from the FDTD fields and, the quadrature alone, from the exact fields on the same points). README: keep the
+    points at least 5 cells away."""
+    r = cases.near2far_distance(resolution=20, cells=(1, 5, 10))
+    assert r["surface_points_match"], r
+    for k in ("err_E", "err_H"):
+        assert max(r[k][1:]) < 1e-2, r                      # measured: 4.6e-3 and 4.0e-3 (E)
+    for k in ("exact_E", "exact_H"):
+        assert max(r[k][1:]) < 4e-3, r                      # measured: 2.1e-3 (H, 5 cells)
+    assert min(r["err_E"][0], r["exact_E"][0]) > 5e-2, r      # 1 cell: the quadrature fails (0.13)
+
+
+@pytest.mark.gpu
+def test_near2far_subtract_incident_fields():
+    """2-D: a source outside the closed square (run A) and the same source plus one inside it (run B). The far fields
+    of B - A equal the field of the inner source; the transform of A is close to zero outside the square and close to
+    minus the field of the outer source inside it (res 20)."""
+    r = cases.near2far_subtract(resolution=20)
+    assert np.max(r["err_sub"]) < 3e-3, r["err_sub"]                       # measured 1.3e-3
+    assert np.max(r["err_plain"]) < 1.5e-2, r["err_plain"]                 # 6.5e-3: plus the residual of A
+    assert np.max(r["outside_source_far"]) < 1.5e-2, r["outside_source_far"]   # 6.8e-3
+    assert np.max(r["inside_err"]) < 7e-3, r["inside_err"]                 # 3.3e-3

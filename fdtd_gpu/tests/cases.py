@@ -526,3 +526,115 @@ def transform_exact(dims: int = 3, component: str = "Ez", h: float = 0.05, n: fl
         Ejx, _ = radiate(far, pts, J, M, freqs, eps=n * n, backend="jax")
         out["jax_vs_numpy"] = rel(Ejx, Enp)
     return out
+
+
+def _shell(center, half, n_face: int):
+    """Points on the 6 faces of the box center +- half (half per axis), n_face x n_face points per face."""
+    pts = []
+    for a in range(3):
+        t = [q for q in range(3) if q != a]
+        g = np.meshgrid(*[np.linspace(center[q] - half[q], center[q] + half[q], n_face) for q in t], indexing="ij")
+        for sign in (-1, 1):
+            p = np.zeros((n_face * n_face, 3))
+            p[:, a] = center[a] + sign * half[a]
+            p[:, t[0]], p[:, t[1]] = g[0].reshape(-1), g[1].reshape(-1)
+            pts.append(p)
+    return np.concatenate(pts)
+
+
+def near2far_distance(resolution: int = 20, cells=(1, 2, 3, 5, 10), nfreq: int = 5, n_face: int = 9):
+    """How close to the surface the transform is accurate. 3-D Ez dipole in vacuum (as near2far_dipole; one closed
+    box of half width 1 um): the fields of the transform on cube shells m cells (m in `cells`) outside the box of
+    the DFT points (n_face x n_face points per face), against the analytic dipole fields after the global phase of
+    the far fields (1000 um). The same for the transform of the exact dipole fields on the same surface points
+    (trapezoidal rule, spacing dx): the error of the quadrature alone. Errors: max abs(error) / max abs(exact) of E
+    and of H on each shell, the worst frequency."""
+    from fdtd_gpu.near2far import radiate
+
+    pml, half = 1.0, 1.0
+    s = 2 * (pml + half + 0.5)
+    fcen, df = 0.5, 0.2
+    gs = fg.GaussianSource(fcen, fwidth=df)
+    sim = fg.Simulation(cell_size=fg.Vector3(s, s, s), resolution=resolution, sources=[fg.Source(gs, fg.Ez)],
+                        boundary_layers=[fg.PML(pml)])
+    n2f = sim.add_near2far(fcen, df, nfreq, *box_regions(fg.Near2FarRegion, half))
+    sim.run(until_after_sources=20)
+    freqs = np.array(sim.get_near2far_freqs(n2f))
+    current = gs.fourier_transform(freqs)
+    r0 = yee_point(sim, "Ez", fg.Vector3())
+    src, _, _ = sim._near2far_currents(n2f)
+    lo, hi = src.min(axis=0), src.max(axis=0)                       # the box of the DFT points
+    ctr, hw = (lo + hi) / 2, (hi - lo) / 2
+    u, _ = sphere_rule(8, 16)
+    E_far, _ = _ff_arrays(sim.get_farfields_at(n2f, r0 + 1000 * u))
+    phase, far_err, _ = _compare(E_far, dipole_fields_3d(r0 + 1000 * u, freqs, 1.0, current, r0, 2)[0])
+    rot = np.exp(-1j * phase)[:, None, None]
+    pts, nrm, w = closed_surface(hw[0], sim.dx, (0, 1, 2))           # the same points as the DFT box
+    pts = pts + ctr
+    Ex_s, Hx_s = dipole_fields_3d(pts, freqs, 1.0, current, r0, 2)
+    J, M = np.cross(nrm, Hx_s) * w[:, None], -np.cross(nrm, Ex_s) * w[:, None]
+
+    def err(a, b):
+        return float(np.max(np.abs(a - b).max(axis=(1, 2)) / np.abs(b).max(axis=(1, 2))))
+    rows = {k: [] for k in ("err_E", "err_H", "exact_E", "exact_H")}
+    for m in cells:
+        p = _shell(ctr, hw + m * sim.dx, n_face)
+        E_ref, H_ref = dipole_fields_3d(p, freqs, 1.0, current, r0, 2)
+        E, H = _ff_arrays(sim.get_farfields_at(n2f, p))
+        Ee, He = radiate(p, pts, J, M, freqs, eps=1.0)
+        rows["err_E"].append(err(E * rot, E_ref))
+        rows["err_H"].append(err(H * rot, H_ref))
+        rows["exact_E"].append(err(Ee, E_ref))
+        rows["exact_H"].append(err(He, H_ref))
+    return dict(freqs=freqs, resolution=resolution, cells=list(cells), dx=sim.dx, far_err=float(far_err.max()),
+                surface_points_match=bool(np.allclose(np.sort(src, axis=0), np.sort(pts, axis=0))), **rows,
+                seconds=sim.run_seconds, device=sim.device, cells_total=int(np.prod(sim.shape)))
+
+
+def near2far_subtract(resolution: int = 20, nfreq: int = 5, s2=(0.0, -1.6)):
+    """load_minus_near2far_data with incident fields that differ from the total fields. 2-D (x-y), Ez, n = 1, the
+    cell interior +-2 um, a closed square of half width 1 um. Run A: a line source S2 at s2, outside the square.
+    Run B: S2 and a line source S1 at the origin, inside the square; two near2far objects on the same square, one
+    with the DFT fields of A subtracted. Results (worst frequency): the far fields (1000 um, 72 points) of B - A and of
+    B against the analytic field of S1 (one global phase); far(A) / max abs(field of S2) (zero for a source outside
+    a closed surface); and at points 0.5 um from the center, inside the square, transform(A) against -(field of S2)
+    (the transform of the fields of an outside source gives minus those fields inside)."""
+    pml, half = 1.0, 1.0
+    s = 2 * (pml + 2.0)
+    fcen, df = 0.5, 0.2
+    gs = fg.GaussianSource(fcen, fwidth=df)
+    S1 = fg.Source(gs, fg.Ez)
+    S2 = fg.Source(gs, fg.Ez, center=fg.Vector3(*s2))
+
+    def sim_with(sources):
+        return fg.Simulation(cell_size=fg.Vector3(s, s, 0), resolution=resolution, sources=sources,
+                             boundary_layers=[fg.PML(pml)])
+    simA = sim_with([S2])
+    n2fA = simA.add_near2far(fcen, df, nfreq, *box_regions(fg.Near2FarRegion, half, (0, 1)))
+    simA.run(until_after_sources=40)
+    simB = sim_with([S1, S2])
+    n2fB = simB.add_near2far(fcen, df, nfreq, *box_regions(fg.Near2FarRegion, half, (0, 1)))
+    n2fBA = simB.add_near2far(fcen, df, nfreq, *box_regions(fg.Near2FarRegion, half, (0, 1)))
+    simB.load_minus_near2far_data(n2fBA, simA.get_near2far_data(n2fA))
+    simB.run(until_after_sources=40)
+    freqs = np.array(simB.get_near2far_freqs(n2fB))
+    current = gs.fourier_transform(freqs)
+    r1, r2 = yee_point(simB, "Ez", S1.center), yee_point(simB, "Ez", S2.center)
+    phi = 2 * np.pi * np.arange(72) / 72
+    u = np.stack([np.cos(phi), np.sin(phi), np.zeros_like(phi)], axis=-1)
+    far, inside = 1000 * u, 0.5 * u[::4]
+    E1, _ = line_source_fields_2d(far, freqs, 1.0, current, r1)
+    E2, _ = line_source_fields_2d(far, freqs, 1.0, current, r2)
+    E2_in, _ = line_source_fields_2d(inside, freqs, 1.0, current, r2)
+    EBA, _ = _ff_arrays(simB.get_farfields_at(n2fBA, far))
+    EB, _ = _ff_arrays(simB.get_farfields_at(n2fB, far))
+    EA, _ = _ff_arrays(simA.get_farfields_at(n2fA, far))
+    EA_in, _ = _ff_arrays(simA.get_farfields_at(n2fA, inside))
+    phase, err_sub, _ = _compare(EBA, E1)
+    _, err_plain, _ = _compare(EB, E1)
+    rot = np.exp(-1j * phase)[:, None, None]
+    ext = np.abs(EA).max(axis=(1, 2)) / np.abs(E2).max(axis=(1, 2))
+    inside_err = np.abs(EA_in * rot + E2_in).max(axis=(1, 2)) / np.abs(E2_in).max(axis=(1, 2))
+    return dict(freqs=freqs, resolution=resolution, s2=list(s2), err_sub=err_sub, err_plain=err_plain,
+                outside_source_far=ext, inside_err=inside_err, phase=phase, omega_dt_half=np.pi * freqs * simB.dt,
+                seconds=simA.run_seconds + simB.run_seconds, device=simB.device, cells=int(np.prod(simB.shape)))
