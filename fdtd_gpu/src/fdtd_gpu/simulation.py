@@ -395,6 +395,10 @@ class Simulation:
         if self.dims == 1:
             raise NotImplementedError("the near-to-far-field transform needs a 2-D or 3-D cell")
         freqs, regions = _freqs(args)
+        for r in regions:                   # an explicit direction is not checked by _normal
+            a = self._normal(r.size, r.direction)
+            if a not in (0, 1, 2) or self.trivial[a]:
+                raise ValueError(f"a Near2FarRegion needs a normal along an axis of size > 0 (direction {a})")
         mon = self._add_monitor(freqs, regions, mode=False, cls=DftNear2Far)
         mon.sim = self
         return mon
@@ -437,7 +441,7 @@ class Simulation:
             a = n2f.axes[j]
             b, c = (a + 1) % 3, (a + 2) % 3
             rng = [self._range(r.center, r.size, ax) for ax in range(3)]
-            if triv:                                # the normal a is never an axis of size 0 (_normal)
+            if triv:                                # the normal a is not an axis of size 0 (add_near2far checks it)
                 E, H = E.mean(axis=triv, keepdims=True), H.mean(axis=triv, keepdims=True)
                 rng = [(0, 1) if self.trivial[q] else rng[q] for q in range(3)]
             area = self._area(a) * TRIVIAL_CELLS ** len(triv)               # dx^(dims - 1)

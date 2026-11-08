@@ -327,18 +327,19 @@ def _compare(E, E_ref):
 
 
 def near2far_dipole(resolution: int = 20, n: float = 1.0, nfreq: int = 5, halves=(1.0, 0.5), component: str = "Ez",
-                    r_far: float = 1000.0, r_near: float = 3.0, n_theta: int = 24, n_phi: int = 48):
+                    r_far: float = 1000.0, r_near: float = 3.0, n_theta: int = 24, n_phi: int = 48,
+                    fcen: float = 0.5, df: float = 0.2):
     """3-D point dipole in a homogeneous medium: the near-to-far-field transform from closed boxes of the half widths
     `halves` (all in one run) against the analytic dipole fields (references.dipole_fields_3d) on a sphere of radius
     r_far (pattern, complex fields after one global phase, the radiated power) and at r_near (near terms); the power
     of the far field against the flux through the same box and the analytic power; the far fields of the boxes
     against each other. API: get_farfield against get_farfields_at, the shape of get_farfields, and DftNear2Far.flux
-    through a cube of half width 0.1 r_far against the power on the sphere."""
+    through a cube of half width 0.1 r_far against the power on the sphere. The source and the monitors have the
+    center frequency fcen and the width df (1/um)."""
     import time
 
     pml = 1.0
     s = 2 * (pml + max(halves) + 0.5)
-    fcen, df = 0.5, 0.2
     gs = fg.GaussianSource(fcen, fwidth=df)
     sim = fg.Simulation(cell_size=fg.Vector3(s, s, s), resolution=resolution, sources=[fg.Source(gs, component)],
                         boundary_layers=[fg.PML(pml)], default_material=fg.Medium(index=n))
@@ -393,19 +394,19 @@ def near2far_dipole(resolution: int = 20, n: float = 1.0, nfreq: int = 5, halves
 
 
 def near2far_line(resolution: int = 20, n: float = 1.0, nfreq: int = 5, halves=(1.0, 0.5), component: str = "Ez",
-                  r_far: float = 1000.0, r_near: float = 3.0, n_phi: int = 72, run_after: float = 40.0):
+                  r_far: float = 1000.0, r_near: float = 3.0, n_phi: int = 72, run_after: float = 40.0,
+                  fcen: float = 0.5, df: float = 0.2):
     """2-D line source (x-y cell) in a homogeneous medium: the near-to-far-field transform (2-D Hankel form) from
     closed squares of the half widths `halves` against the analytic line-source fields (references.
     line_source_fields_2d) on a circle of radius r_far (pattern, complex fields after one global phase, power) and
     at r_near; the power of the far field against the flux through the same square and the analytic power
     (references.line_source_power_2d); the far fields of the squares against each other; DftNear2Far.flux through a
     square of half width 0.1 r_far against the power on the circle. component: "Ez" (E normal to the plane) or
-    "Ex" (E in the plane)."""
+    "Ex" (E in the plane). The source and the monitors have the center frequency fcen and the width df (1/um)."""
     import time
 
     pml = 1.0
     s = 2 * (pml + max(halves) + 0.5)
-    fcen, df = 0.5, 0.2
     gs = fg.GaussianSource(fcen, fwidth=df)
     sim = fg.Simulation(cell_size=fg.Vector3(s, s, 0), resolution=resolution, sources=[fg.Source(gs, component)],
                         boundary_layers=[fg.PML(pml)], default_material=fg.Medium(index=n))
@@ -598,7 +599,9 @@ def near2far_subtract(resolution: int = 20, nfreq: int = 5, s2=(0.0, -1.6)):
     with the DFT fields of A subtracted. Results (worst frequency): the far fields (1000 um, 72 points) of B - A and of
     B against the analytic field of S1 (one global phase); far(A) / max abs(field of S2) (zero for a source outside
     a closed surface); and at points 0.5 um from the center, inside the square, transform(A) against -(field of S2)
-    (the transform of the fields of an outside source gives minus those fields inside)."""
+    (the transform of the fields of an outside source gives minus those fields inside; the fields of an inside
+    source give zero there). At the same inner points, max abs(transform) / max abs(field of S2) of B - A
+    ("inside_sub": close to 0, only S1 is left) and of B ("inside_plain": close to 1, the -S2 part)."""
     pml, half = 1.0, 1.0
     s = 2 * (pml + 2.0)
     fcen, df = 0.5, 0.2
@@ -630,11 +633,16 @@ def near2far_subtract(resolution: int = 20, nfreq: int = 5, s2=(0.0, -1.6)):
     EB, _ = _ff_arrays(simB.get_farfields_at(n2fB, far))
     EA, _ = _ff_arrays(simA.get_farfields_at(n2fA, far))
     EA_in, _ = _ff_arrays(simA.get_farfields_at(n2fA, inside))
+    EBA_in, _ = _ff_arrays(simB.get_farfields_at(n2fBA, inside))
+    EB_in, _ = _ff_arrays(simB.get_farfields_at(n2fB, inside))
     phase, err_sub, _ = _compare(EBA, E1)
     _, err_plain, _ = _compare(EB, E1)
     rot = np.exp(-1j * phase)[:, None, None]
     ext = np.abs(EA).max(axis=(1, 2)) / np.abs(E2).max(axis=(1, 2))
-    inside_err = np.abs(EA_in * rot + E2_in).max(axis=(1, 2)) / np.abs(E2_in).max(axis=(1, 2))
+    scale_in = np.abs(E2_in).max(axis=(1, 2))
+    inside_err = np.abs(EA_in * rot + E2_in).max(axis=(1, 2)) / scale_in
     return dict(freqs=freqs, resolution=resolution, s2=list(s2), err_sub=err_sub, err_plain=err_plain,
-                outside_source_far=ext, inside_err=inside_err, phase=phase, omega_dt_half=np.pi * freqs * simB.dt,
-                seconds=simA.run_seconds + simB.run_seconds, device=simB.device, cells=int(np.prod(simB.shape)))
+                outside_source_far=ext, inside_err=inside_err, inside_sub=np.abs(EBA_in).max(axis=(1, 2)) / scale_in,
+                inside_plain=np.abs(EB_in).max(axis=(1, 2)) / scale_in, phase=phase,
+                omega_dt_half=np.pi * freqs * simB.dt, seconds=simA.run_seconds + simB.run_seconds,
+                device=simB.device, cells=int(np.prod(simB.shape)))

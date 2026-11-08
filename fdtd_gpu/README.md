@@ -198,7 +198,8 @@ rows of `benchmarks/2026-11-07/fdtd-gpu-avg.jsonl` (subpixel averaging on, unles
 --resolution 40,60,80 --both` to `--case setup` under "Tests and bench", in that order; other jobs can share the
 computer, so times can change between runs). The numbers of check 9 are from the rows of
 `benchmarks/2026-11-08/fdtd-gpu-near2far.jsonl` (the first seven check-9 commands under "Tests and bench") and of
-`benchmarks/2026-11-08/fdtd-gpu-near2far-2.jsonl` (the last four). In the logged run, a
+`benchmarks/2026-11-08/fdtd-gpu-near2far-2.jsonl` (the next four) and of
+`benchmarks/2026-11-08/fdtd-gpu-near2far-3.jsonl` (the last three). In the logged run, a
 scipy RuntimeWarning on stderr cut the row of check 7 (staircase, res 160); line 31 of the file is the row of a
 repeat of the same command on the same day (with a "note" key), which replaces it. (`references.disk_resonance`
 now hides these warnings.) The other rows of checks 4 and 5 are from version 0.1 (the staircase only) in
@@ -351,16 +352,17 @@ the digits shown. "res" is the resolution in cells per um; times are the FDTD lo
      P_far / exact 0.9943 to 0.9993, field error 3.0e-3, pattern error 5.9e-3, at 3 um 4.0e-3, boxes 5.3e-3. n = 1.5
      (res 20, `--index 1.5`): P_far / flux 0.99738 to 1.00345, P_far / exact 1.0002 to 1.0089 (flux / exact 1.0023
      to 1.0066, as check 4), field error 1.5e-2, pattern error 2.1e-2, at 3 um 1.2e-2, boxes 1.6e-2. The field error
-     is 9.0 times that at n = 1 (the boxes 5.2 times), more than the factor 2.25 of a second-order error in k dx.
-     The cause is the dispersion of the Yee grid in the medium: its phase error grows along the path inside the box,
-     about as k (k dx)^2 L (1 - S^2), that is about as n^3, with the Courant number S = c dt / (n dx), which is lower
-     in the medium (Taflove and Hagness, Computational Electrodynamics, ch. 4). Measured: the field error grows with
-     the box (1.5e-2 for the box of 1.0 um, 5.1e-3 for 0.5 um; at n = 1 1.7e-3 and 1.5e-3) and with the frequency
-     (box 1.0 um: 1.5e-3 at 0.4 / um, 1.5e-2 at 0.6 / um); the phase rest (1.08e-2 rad) is 5.0 times that of n = 1. It
-     is the FDTD discretization, not the transform: at res 40 (`--resolution 40 --index 1.5`) the field error is
-     3.8e-3, the boxes 4.1e-3, the phase rest 2.65e-3 rad, P_far / flux 0.99935 to 1.00086 (second order: the
-     ratios 4.0, 4.0 and 4.1). `n2f.flux` through the six faces of a cube of half width 100 um (40 x 40 points per
-     face) / P_far: 0.99968 at all resolutions (the trapezoidal rule of the flux points).
+     is 9.0 times that at n = 1 and the same f, but it depends on k = n omega (at the same dx and box), not on the
+     medium: a vacuum run at the same k (n = 1, f = 0.6 to 0.9 / um, `--fcen 0.75 --df 0.3`) gives the field errors
+     1.8e-3, 4.5e-3, 1.0e-2, 1.5e-2 and 1.6e-2 (box 1.0 um), against 1.5e-3, 4.7e-3, 9.9e-3, 1.4e-2 and 1.5e-2 in
+     n = 1.5 at f = 0.4 to 0.6 / um (2-D: 1.1e-3, 4.9e-3, 1.0e-2, 1.3e-2, 1.2e-2 against 9.3e-4, 5.0e-3, 9.8e-3,
+     1.2e-2, 1.1e-2). In this band the error grows steeply with k dx: 8.5 to 13 times from n f = 0.6 to 0.825 / um
+     (the cube of the ratio of k is 2.6). The Courant number S = c dt / (n dx), lower in the medium, changes only the
+     global phase rest, which the field error removes: 1.08e-2 rad in n = 1.5, 6.7e-3 in vacuum at the same k (2-D:
+     1.46e-2 and 1.10e-2). It is the FDTD discretization, not the transform: at res 40 (`--resolution 40 --index
+     1.5`) the field error is 3.8e-3, the boxes 4.1e-3, the phase rest 2.65e-3 rad, P_far / flux 0.99935 to 1.00086
+     (second order: the ratios 4.0, 4.0 and 4.1). `n2f.flux` through the six faces of a cube of half width 100 um
+     (40 x 40 points per face) / P_far: 0.99968 at all resolutions (the trapezoidal rule of the flux points).
    - FDTD, 2-D line source (n = 1, `--case near2far2d`): squares of half width 1.0 and 0.5 um, a circle of 72 points
      at 1000 um and at 3 um, the same metrics:
 
@@ -390,7 +392,8 @@ the digits shown. "res" is the resolution in cells per um; times are the FDTD lo
      subtracted (`load_minus_near2far_data`) against the field of S1: 1.3e-3 / 3.0e-4; of B without the subtraction:
      6.5e-3 / 1.6e-3 (the transform of the outer source is not exactly zero outside the square: 6.8e-3 / 1.6e-3 of
      its far field); the transform of A at 0.5 um from the center, inside the square, against minus the field of S2:
-     3.3e-3 / 8.2e-4.
+     3.3e-3 / 8.2e-4. At these inner points (res 20) max abs(transform) / max abs(field of S2) is at most 3.8e-3
+     for B - A (only S1 is left, and an inner source gives zero inside) and 0.995 to 0.999 for B (the -S2 part).
    - The tests (3-D at res 10 and 20; 2-D, Ez and Ex, at res 20 and 40) require at res 20: abs(P_far / flux - 1)
      below 6e-3, abs(P_far / exact - 1) below 1e-2, the pattern error below 1.5e-2, the field error, the error at
      3 um and the box difference below 7e-3, the phase -omega dt / 2 within 4e-3 rad, abs(n2f.flux / P_far - 1)
@@ -399,7 +402,9 @@ the digits shown. "res" is the resolution in cells per um; times are the FDTD lo
      the data of a second, equal run gives zero far fields (below 1e-6 of the far fields), and a surface that
      crosses a second material gives the warning; the distance test requires the errors at 5 and 10 cells below
      1e-2 (FDTD) and 4e-3 (exact fields), and above 5e-2 at 1 cell; the subtraction test (res 20) requires the error
-     of B - A below 3e-3, of B and of the outer source outside below 1.5e-2, and inside below 7e-3.
+     of B - A below 3e-3, of B and of the outer source outside below 1.5e-2, and inside below 7e-3, and at the inner
+     points the transform of B - A below 1e-2 and that of B above 0.9 of max abs(field of S2). A Near2FarRegion
+     whose normal is an axis of size 0 (for example direction=Z in an x-y cell) raises ValueError (test).
 
 Tests: 38 (21 without FDTD runs: geometry, Prism center, 2-D parities, Harminv, the averaged permittivity against
 exact fill fractions and the formula of Kottke et al. (2-D and 3-D, both diagonals), periodic faces, NumPy against
@@ -435,6 +440,9 @@ bash tools/gpu_run.sh fdtd_gpu $B --case near2far --resolution 40 --index 1.5   
 bash tools/gpu_run.sh fdtd_gpu $B --case near2far2d --resolution 40,80 --index 1.5
 bash tools/gpu_run.sh fdtd_gpu $B --case distance --resolution 20
 bash tools/gpu_run.sh fdtd_gpu $B --case subtract --resolution 20,40
+bash tools/gpu_run.sh fdtd_gpu $B --case near2far --resolution 20 --fcen 0.75 --df 0.3   # check 9, third file
+bash tools/gpu_run.sh fdtd_gpu $B --case near2far2d --resolution 20 --fcen 0.75 --df 0.3
+bash tools/gpu_run.sh fdtd_gpu $B --case subtract --resolution 20                    # with the inner points
 ```
 
 If the package is not installed in `.venv-rocm`, use `PYTHONPATH=src`. It needs fdtdx 0.6.3 (with tidy3d for its mode

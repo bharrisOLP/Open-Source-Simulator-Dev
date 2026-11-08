@@ -10,6 +10,7 @@
     python bench/bench_fdtd.py --case sheet --resolution 40 [--index 1.5]
     python bench/bench_fdtd.py --case near2far --resolution 20 [--index 1.5] [--component Ex]   # 3-D dipole
     python bench/bench_fdtd.py --case near2far2d --resolution 20 [--index 1.5] [--component Ex]  # 2-D line source
+    python bench/bench_fdtd.py --case near2far2d --resolution 20 --fcen 0.75 --df 0.3   # other frequencies (both cases)
     python bench/bench_fdtd.py --case transform     # transform of exact fields (no FDTD), h = 0.1, 0.05, 0.025
     python bench/bench_fdtd.py --case distance --resolution 20   # near2far error on shells 1 to 10 cells out
     python bench/bench_fdtd.py --case subtract --resolution 20   # near2far with subtracted incident fields (2-D)
@@ -73,9 +74,11 @@ ap = argparse.ArgumentParser()
 ap.add_argument("--case", choices=["bragg", "waveguide", "ring", "disk", "slab", "dipole", "sheet", "near2far",
                                    "near2far2d", "transform", "distance", "subtract", "setup", "all"],
                 default="all")
-ap.add_argument("--component", type=str, default="Ez", help="source of the near2far cases: Ez, Ex or Ey")
+ap.add_argument("--component", type=str, default=None, help="source of the near2far cases: Ez (default), Ex or Ey")
+ap.add_argument("--fcen", type=float, default=None, help="center frequency of the near2far cases (default 0.5 / um)")
+ap.add_argument("--df", type=float, default=None, help="frequency width of the near2far cases (default 0.2 / um)")
 ap.add_argument("--resolution", type=str, default=None, help="one value, or a list: 20,40,80")
-ap.add_argument("--index", type=float, default=1.0, help="medium of the dipole and sheet cases")
+ap.add_argument("--index", type=float, default=None, help="medium of the dipole, sheet and near2far cases (default 1)")
 ap.add_argument("--half", type=float, default=1.0, help="half width of the flux box of the dipole case (um)")
 ap.add_argument("--three-d", action="store_true", help="3-D strip for the waveguide case")
 ap.add_argument("--src-freq", type=float, default=None, help="source center frequency of the waveguide case")
@@ -87,6 +90,12 @@ ap.add_argument("--both", action="store_true", help="each case averaged and with
 ap.add_argument("--forward-diagonal", action="store_true",
                 help="keep the diagonal of the forward tensor (fdtd_gpu._averaging.DIAGONAL = \"forward\")")
 a = ap.parse_args()
+_USED_BY = {"index": ("dipole", "sheet", "near2far", "near2far2d", "all"), "component": ("near2far", "near2far2d"),
+            "fcen": ("near2far", "near2far2d"), "df": ("near2far", "near2far2d")}
+for opt, used_by in _USED_BY.items():          # an option that the case does not use is an error, not ignored
+    if getattr(a, opt) is not None and a.case not in used_by:
+        ap.error(f"--{opt} is not used by --case {a.case}")
+index = 1.0 if a.index is None else a.index
 if a.forward_diagonal:
     import fdtd_gpu._averaging
     fdtd_gpu._averaging.DIAGONAL = "forward"
@@ -109,13 +118,14 @@ for case, resolution, avg in itertools.product(todo, resolutions, averaging):
     if case == "slab":
         kw["e_normal"] = a.e_normal
     if case == "dipole":
-        kw["n"] = a.index
+        kw["n"] = index
         kw["half"] = a.half
     if case == "sheet":
-        kw["n"] = a.index
+        kw["n"] = index
     if case in ("near2far", "near2far2d"):
-        kw["n"] = a.index
-        kw["component"] = a.component
+        kw["n"] = index
+        kw["component"] = a.component or "Ez"
+        kw.update({k: getattr(a, k) for k in ("fcen", "df") if getattr(a, k) is not None})
     if case == "waveguide":
         kw["three_d"] = a.three_d
         kw["src_freq"] = a.src_freq

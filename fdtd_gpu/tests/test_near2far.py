@@ -41,6 +41,11 @@ def test_farfield_grid_and_errors():
     reg = fg.Near2FarRegion(center=fg.Vector3(1), size=fg.Vector3(0, 2))
     with pytest.raises(NotImplementedError):
         sim.add_near2far(0.5, 0.1, 3, reg, nperiods=2)
+    for d in (fg.Z, 5):                                       # a normal along the axis of size 0, or no axis
+        with pytest.raises(ValueError, match="normal along an axis of size > 0"):
+            sim.add_near2far(0.5, 0.1, 3, reg, fg.Near2FarRegion(center=fg.Vector3(1), size=fg.Vector3(0, 2),
+                                                                 direction=d))
+    assert sim._monitors == []                                # nothing is added on an error
     n2f = sim.add_near2far(0.5, 0.1, 3, reg)
     assert isinstance(n2f, fg.DftNear2Far) and np.allclose(sim.get_near2far_freqs(n2f), [0.45, 0.5, 0.55])
     with pytest.raises(RuntimeError):
@@ -135,9 +140,13 @@ def test_near2far_close_to_the_surface():
 def test_near2far_subtract_incident_fields():
     """2-D: a source outside the closed square (run A) and the same source plus one inside it (run B). The far fields
     of B - A equal the field of the inner source; the transform of A is close to zero outside the square and close to
-    minus the field of the outer source inside it (res 20)."""
+    minus the field of the outer source inside it (res 20). At the inner points the transform of B - A is close to
+    zero and that of B close to the size of the outer field: a subtraction that does nothing, or that also changes
+    the object without load_minus_near2far_data, fails by a factor of about 100."""
     r = cases.near2far_subtract(resolution=20)
     assert np.max(r["err_sub"]) < 3e-3, r["err_sub"]                       # measured 1.3e-3
     assert np.max(r["err_plain"]) < 1.5e-2, r["err_plain"]                 # 6.5e-3: plus the residual of A
     assert np.max(r["outside_source_far"]) < 1.5e-2, r["outside_source_far"]   # 6.8e-3
     assert np.max(r["inside_err"]) < 7e-3, r["inside_err"]                 # 3.3e-3
+    assert np.max(r["inside_sub"]) < 1e-2, r["inside_sub"]                 # B - A: only S1 (inside): zero
+    assert np.min(r["inside_plain"]) > 0.9, r["inside_plain"]              # B: the -S2 part is left
