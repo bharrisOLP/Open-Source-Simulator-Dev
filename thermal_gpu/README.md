@@ -4,7 +4,8 @@ Steady and transient heat conduction for photonic heaters on the GPU (JAX; AMD R
 -div(kappa grad T) = q (and rho c_p dT/dt on the left for transients) on a 2-D rectilinear, non-uniform grid (a
 device cross-section), with Dirichlet, adiabatic or convective (Robin) boundaries. Steady state and transients
 also in 3-D (`solver3d.py`, `transient3d.py`): a finite-length heater with its ends, and its thermal rise time.
-Steady state with a temperature-dependent conductivity kappa(T) in 2-D and 3-D (`nonlinear.py`).
+Steady state with a temperature-dependent conductivity kappa(T) in 2-D and 3-D (`nonlinear.py`), and transients
+with kappa(T) and a temperature-dependent heat capacity rho c_p(T) in 2-D and 3-D (`transient_kappa.py`).
 
 ```python
 from thermal_gpu.solver import solve_steady
@@ -30,6 +31,11 @@ from thermal_gpu.nonlinear import SI_POWER_LAW, SIO2_CONSTANT, Constant, materia
 
 kappa_t = material_kappa(material_labels(kappa), [SI_POWER_LAW, SIO2_CONSTANT, Constant(100.0)])
 nl = solve_steady_kappa3d(x, y, z, kappa_t, q, bc)                                 # Picard iteration; nl.converged
+
+from thermal_gpu.transient_kappa import solve_transient_kappa3d
+
+tk = solve_transient_kappa3d(x, y, z, kappa_t, q, bc, heat_capacity(kappa), stages, scheme="bdf2",
+                             monitors=[masks["waveguide"]])    # a Picard iteration in each step; tk.converged
 ```
 
 ## Method
@@ -120,6 +126,34 @@ nl = solve_steady_kappa3d(x, y, z, kappa_t, q, bc)                              
 - Heat capacities (`structures.heat_capacity`), Incropera Tables A.1 (Si, tungsten) and A.2 (fused silica) at
   300 K: Si 2330 x 712, fused silica 2220 x 745, and tungsten 19300 x 132 J/m^3/K for the generic heater metal.
 
+## Method: kappa(T) and rho c_p(T) in transients (`transient_kappa.py`)
+
+- rho c_p(T) dT/dt = div(kappa(T) grad T) + q in the enthalpy form dH/dt = F(T): H_c = V_c integral rho c_p dT per
+  cell, F(T) = b(T) - A(kappa(T)) T with the finite volumes of `fv3d.py` (kappa at the cell temperatures, series
+  face conductance, as in `nonlinear.py`). The schemes of `transient3d.py` (`euler`, `bdf2`, `cn`) apply to H; with
+  a constant rho c_p, H = M T and the system is that of `transient3d.py`.
+- Each time step solves its nonlinear equation with a Picard iteration from the extrapolated field:
+  (d C(T_k) + A(kappa(T_k))) T_k+1 = hist + b(T_k) - d (H(T_k) - C(T_k) T_k), C = rho c_p(T) V. This is a Picard
+  step in kappa (the operator stays symmetric positive definite, so the multigrid CG applies) and a Newton step in
+  H. Stop rule: max |T_k+1 - T_k| <= tol_picard max(1 K, max |T_k+1 - T_ref|) (default 1e-10), or `max_picard` (50).
+  `converged` is False when a step does not meet the stop rule, when the true residual of its nonlinear equation
+  (relative to the right-hand side of the linear system at the final T of the step) is above `tol` (1e-10), or when
+  kappa or rho c_p is not finite and positive. With constant laws each step is one linear solve.
+- Choose `tol` and `tol_picard` together: `tol` bounds the residual of each step, `tol_picard` the last change.
+  The residual after the stop is about the Picard rate times the last change (Si slab, bdf2 at tau / 20: 1.9e-6
+  with `tol_picard` = 1e-4, so `converged` is False at `tol` = 1e-10 and True at `tol` = 1e-5). With
+  `tol_picard` = `tol` (the defaults) each test converged.
+- Laws: `Constant`, `PowerLaw` and `LinearLaw` of `nonlinear.py`, or `material_kappa(labels, laws)` of these, for
+  kappa and for rho c_p; an array is a constant. On the device each law is k0 (t0 / T)^n (1 + beta (T - t0)),
+  selected per cell by its label, and H uses the exact integral of the law (with expm1 and log1p, no cancellation
+  for small changes). The whole stage (steps, Picard iterations, CG loops) runs as one jitted `lax.scan`.
+- Multigrid: one hierarchy per stage, built at kappa(T) and d C(T) of the field at the start of the stage; in each
+  Picard iteration the fine level is the current operator and the coarse levels are those of the stage.
+- Valid range: the running minimum and maximum of each cell over all steps (not only the final field) are compared
+  with the range of its laws: a RuntimeWarning and `out_of_range` > 0.
+- `SI_RHO_CP_LINEAR`: Si, 2330 kg/m^3 x (712 J/kg/K at 300 K, 790 J/kg/K at 400 K, linear), Incropera Table A.1;
+  valid range 300 to 400 K. `solve_transient_kappa2d`: the 2-D cross-section (one z cell).
+
 ## Checks (`tests/test_steady.py`)
 
 | Case | Reference | Agreement |
@@ -167,6 +201,27 @@ kappa(T) (`tests/test_nonlinear.py`):
 | Si slab at 765 K, 200 cells: a new hierarchy each iteration, automatic rebuild (default), first hierarchy only | the same field | below 1e-9 of the rise; CG iterations 14, 47 (3 hierarchies) and 143 (at 1186 K: 16, 65 and 245) |
 | Si slab at 1186 K (Si law valid to 800 K) | valid range | RuntimeWarning, `out_of_range` > 0 (no warning at 765 K) |
 | constant kappa through the Picard path, 2-D heater stack | `solve_steady` | below 1e-8 of the rise |
+
+Transients with kappa(T) and rho c_p(T) (`tests/test_transient_kappa.py`; measured values, the test bounds are
+larger):
+
+| Case | Reference | Agreement |
+|---|---|---|
+| device operator (random 7 x 6 x 5 cells and kappa, Dirichlet and Robin sides); H of 6 laws, also for 1e-6 K | `fv3d.build3`; k0 (kirchhoff(T) - kirchhoff(T_ref)) of each law (Taylor series for 1e-6 K) | 6e-16 (g); H 9e-15 (2e-16 at 1e-6 K) |
+| constant laws, heater box 26 x 22 x 18, three stages (dt ratios 2 and 0.5) | `solve_transient3d` (each scheme) | 1.4e-14 to 3.4e-12 of the rise; one Picard iteration per step |
+| Si slab 10 um, 100 cells, Si kappa(T) and rho c_p(T), from 300 + 100 sin(pi y / L) K to t = tau (114 ns) | `solve_ivp` (BDF, rtol 1e-12) of the same method-of-lines system (Radau: 2.0e-11) | at dt = tau / 80: 1.9e-3 (euler), 2.3e-5 (bdf2), 2.0e-6 (cn) of the 100 K amplitude |
+| the same at dt = tau / 20, / 40, / 80 | order in dt | 0.99, 0.99 (euler); 2.03, 2.01 (bdf2); 2.00, 2.00 (cn) |
+| the same slab from 300 K, uniform source from t = 0, bdf2 | `solve_ivp` | 4.4e-5 of the rise at tau / 80; order 2.02, 2.01 |
+| kappa and rho c_p both 148 (300 / T)^1.3 x const (constant diffusivity), decay from 450 K | exact Kirchhoff solution u = 300 + U0 sin(pi y / L) exp(-t / tau) | 1.34e-4 to 3.33e-5 (bdf2), 2.68e-5 to 6.69e-6 (cn) of 150 K from (100 cells, tau / 40) to (200, tau / 80): ratio 4.0 |
+| heater box 26 x 22 x 18, Si and SiO2 kappa(T), Si rho c_p(T), heater 414 to 417 K, three stages | an independent scipy stepper of the same nonlinear recurrences (H from the Kirchhoff integrals, direct solves) | 9.5e-12 to 2.2e-11 of the rise (V and W cycle, each scheme); 5 to 6 Picard iterations per step |
+| heater box 14 x 12 x 10, kappa(T) and rho c_p(T), steps growing to 30 us | `solve_steady_kappa3d` | 1.4e-11 (euler), 1.7e-11 (bdf2) of the rise |
+| 2-D heater stack, 100 W/m, 100 nm, Si and SiO2 kappa(T), bdf2 to 200 us | `solve_steady_kappa2d` | waveguide mean 5.1e-10 K |
+| Si slab from 820 K (above the 800 K of the Si law) | valid range during the transient | RuntimeWarning, `out_of_range` > 0 (the final field is inside) |
+
+The 2-D heater stack (100 nm grid, 200 bdf2 steps): kappa(T) of Si and SiO2 lowers the waveguide rise from 20.287 K
+to 20.098 K and the 10 % to 90 % rise time from 17.939 us to 17.606 us (-1.9 %); Si rho c_p(T) in addition changes
+the rise time by 9e-5. Picard: 768 iterations for the 200 steps (at most 5 per step), CG iterations 4529 against
+2072 with constant kappa (`test_2d_heater_stack_ends_at_the_steady_kappa_solution`).
 
 ## Example: thermo-optic phase shifter (`examples/thermo_optic_phase_shifter.py`)
 
@@ -276,6 +331,14 @@ bash tools/gpu_run.sh thermal_gpu python bench/bench_kappa_t.py --case cross2d -
 bash tools/gpu_run.sh thermal_gpu python bench/bench_kappa_t.py --case heater3d --dx 0.1e-6 0.05e-6 --power 100
 ```
 
+Transients with kappa(T) against the constant-kappa transient (`bench/bench_transient_kappa_t.py`; models constant,
+constant_new, si_T, si_T+sio2_T, all_T+cp_T; the rows go into the benchmark log):
+
+```
+bash tools/gpu_run.sh thermal_gpu python bench/bench_transient_kappa_t.py --case cross2d --dx 0.05e-6 0.02e-6 --repeat
+bash tools/gpu_run.sh thermal_gpu python bench/bench_transient_kappa_t.py --case heater3d --dx 0.1e-6 0.05e-6 --repeat
+```
+
 | Transient (BDF2, 200 steps to 200 us) | Cells | GPU | CPU | 10-90 % rise time |
 |---|---|---|---|---|
 | 3-D heater, 100 nm, V-cycle | 686k | 3.6 s | 44.2 s (12x) | 17.939 us (2-D: 17.939 us) |
@@ -290,8 +353,16 @@ the 2-D cross-section at 10 nm (730k cells), and 1.1 to 1.5 s against 5.4 to 15.
 
 ## Known limits and next steps
 
-- kappa(T) is for the steady state only; the transients use a constant kappa and a constant rho c_p. The source of
-  a transient is constant from t = 0 (a step response; the fall after switch-off is its complement).
+- The source of a transient is constant from t = 0 (a step response; with constant kappa and rho c_p the fall
+  after switch-off is its complement, with kappa(T) it is not).
+- Transients with kappa(T) (`transient_kappa.py`): Picard converges linearly, so each step costs 3 to 7 linear
+  solves at the default stop rule 1e-10 (a looser `tol_picard` and `tol` cost fewer). The coarse levels of the
+  multigrid are those of the field at the start of the stage: a long stage in which kappa changes much needs more
+  CG iterations (split it into shorter stages). The laws must be `Constant`, `PowerLaw` or `LinearLaw` (or
+  `material_kappa` of these); other callables raise TypeError. Neither the stop rule nor the residual check bounds
+  the error of a step when the Picard rate is near 1: the check bounds the residual of the step (its backward
+  error), and the error can be rate / (1 - rate) times the last change. Crank-Nicolson reaches its order 2 only
+  when dt resolves the fast modes of the start (on the Si slab: from dt = tau / 20).
 - Picard converges linearly: for Si kappa(T) on the heater 4 iterations (2-D) to 6 (3-D), 7 to 8 with SiO2
   kappa(T), 11 on the 450 K Si slab, 14 on the 765 K Si slab. When kappa changes by a large factor, the first
   hierarchy alone needs 10 to 15 times more CG iterations than a new hierarchy at each iteration (Si slab: 143
