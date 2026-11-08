@@ -289,6 +289,63 @@ def yee_rt(f, eps_nodes, dx: float, dt: float):
     return R, T
 
 
+def eps_conductive(f, eps_inf: float, sigma_d: float, dt: float | None = None) -> np.ndarray:
+    """eps(f) of a medium with D_conductivity sigma_d: eps_inf (1 + i sigma_d / omega). dt: the eps of the
+    semi-implicit update instead, eps_inf (E^(n+1) - E^n) / dt + sigma_d eps_inf (E^(n+1) + E^n) / 2 = curl H, which
+    gives eps_inf (1 + i sigma_d cos(omega dt / 2) / w), w = (2 / dt) sin(omega dt / 2) (second order in dt)."""
+    w = 2 * np.pi * np.asarray(f, complex)
+    if dt is None:
+        return eps_inf * (1 + 1j * sigma_d / w)
+    return eps_inf * (1 + 1j * sigma_d * np.cos(w * dt / 2) / (2 / dt * np.sin(w * dt / 2)))
+
+
+def yee_halfspace(f, eps_half, dx: float, dt: float):
+    """The exact reflectance R of a 1-D Yee grid (as yee_rt) at the face between vacuum (nodes j < 0) and a uniform
+    half-space with the relative permittivity eps_half(f) (complex; nodes j >= 0), and the wave of the half-space:
+    E_j = exp(i theta_m j) with cos(theta_m) = 1 - eps q^2 / 2 (Im theta_m >= 0: it decays or goes to the right).
+    The equation of node 0 gives E_(-1) = 2 cos(theta_m) - E_1 = exp(-i theta_m); the vacuum wave a exp(i theta j) +
+    b exp(-i theta j) through the nodes -1 and 0 gives r = b / a = (exp(-i theta_m) - exp(-i theta)) / (exp(i theta)
+    - exp(-i theta_m)). Returns (R = |r|^2, theta_m) at each frequency."""
+    f = np.atleast_1d(np.asarray(f, float))
+    R, tm = np.empty(len(f)), np.empty(len(f), complex)
+    for i, fi in enumerate(f):
+        q = 2 * dx / dt * np.sin(np.pi * fi * dt)
+        theta = np.arccos(1 - q**2 / 2)
+        t = np.arccos(complex(1 - complex(eps_half(fi)) * q**2 / 2))
+        if t.imag < 0 or (t.imag == 0 and t.real < 0):
+            t = -t
+        R[i] = abs((np.exp(-1j * t) - np.exp(-1j * theta)) / (np.exp(1j * theta) - np.exp(-1j * t))) ** 2
+        tm[i] = t
+    return R, tm
+
+
+def dipole_flux_surface(points, normals, weights, f, n, current, r0, axis: int = 2) -> np.ndarray:
+    """The flux sum w Re(E x conj H) . normal (the DFT convention of the monitors) of the exact fields of a point
+    current element (dipole_fields_3d) through a closed surface given by quadrature points, outward normals and
+    weights, at each frequency. n: a number, or one (complex, Im n >= 0) index per frequency: in a lossy medium the
+    flux depends on the surface."""
+    f = np.atleast_1d(np.asarray(f, float))
+    n = np.broadcast_to(np.asarray(n, complex), f.shape)
+    current = np.broadcast_to(np.asarray(current, complex), f.shape)
+    out = np.empty(len(f))
+    for i in range(len(f)):
+        E, H = dipole_fields_3d(points, f[i:i + 1], n[i], current[i], r0, axis)
+        out[i] = np.sum(weights * np.sum(np.real(np.cross(E[0], np.conj(H[0]))) * normals, axis=-1))
+    return out
+
+
+def dipole_flux_sphere(f, n, current, r: float) -> np.ndarray:
+    """The flux of dipole_fields_3d through a sphere of radius r about the dipole, closed form (the DFT convention):
+    Re(eta k conj(k) A conj(B)) |I|^2 exp(-2 Im(k) r) / (6 pi), A = 1 + i / (k r) - 1 / (k r)^2, B = 1 + i / (k r),
+    eta = 1 / n, k = 2 pi f n (E_theta and H_phi of dipole_fields_3d; the integral of sin^3(theta) is 4 / 3). For a
+    real n this is dipole_flux_3d at each r."""
+    f = np.atleast_1d(np.asarray(f, float))
+    n = np.broadcast_to(np.asarray(n, complex), f.shape)
+    k = 2 * np.pi * f * n
+    A, B = 1 + 1j / (k * r) - 1 / (k * r) ** 2, 1 + 1j / (k * r)
+    return np.real(k * np.conj(k) * A * np.conj(B) / n) * np.abs(current) ** 2 * np.exp(-2 * k.imag * r) / (6 * np.pi)
+
+
 def uniform_root(pole, eps_inf: float, dt: float | None = None) -> complex:
     """The complex frequency (1/um) of the free oscillation of a uniform field (k = 0) in a medium with one pole:
     the root of eps_inf + chi(f) = 0 near the longitudinal frequency (D = eps_inf E + P stays constant without a

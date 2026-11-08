@@ -24,6 +24,51 @@ def test_transform_of_exact_fields(dims, component):
         assert r2["jax_vs_numpy"] < 1e-11, r2["jax_vs_numpy"]
 
 
+@pytest.mark.parametrize("dims", [3, 2])
+def test_transform_of_exact_fields_in_a_lossy_medium(dims):
+    """A complex eps (n = 1.5 + 0.05i: the Green's function with a complex k, Im k > 0) in the 3-D (JAX) and 2-D
+    (NumPy, Hankel functions of a complex argument) sums: the exact fields at 3 um come back at second order in the
+    spacing, and close to zero inside. radiate takes eps as one number or as one value per frequency: a real eps as
+    an array of complex numbers gives the result of the float."""
+    from fdtd_gpu.near2far import radiate
+    n = complex(1.5, 0.05)
+    r1 = cases.transform_exact(dims, "Ez", h=0.1, n=n)
+    r2 = cases.transform_exact(dims, "Ez", h=0.05, n=n, compare_backends=True)
+    assert r2["near_E"] < 3e-3 and np.log2(r1["near_E"] / r2["near_E"]) > 1.9, (r1, r2)
+    assert r2["inside"] < 2e-3, r2
+    if dims == 3:
+        assert r2["jax_vs_numpy"] < 1e-11, r2["jax_vs_numpy"]
+    rng = np.random.default_rng(1)
+    src, pts = rng.normal(size=(20, 3)), rng.normal(size=(4, 3)) + 5
+    J, M = (rng.normal(size=(2, 20, 3)) + 1j * rng.normal(size=(2, 20, 3)) for _ in range(2))
+    triv = None if dims == 3 else 2
+    a = radiate(pts, src, J, M, [0.4, 0.6], eps=2.25, trivial_axis=triv)
+    b = radiate(pts, src, J, M, [0.4, 0.6], eps=np.array([2.25, 2.25], complex), trivial_axis=triv)
+    assert all(np.abs(x - y).max() < 1e-12 * np.abs(x).max() for x, y in zip(a, b))
+    with pytest.raises(ValueError, match="one value per frequency"):
+        radiate(pts, src, J, M, [0.4, 0.6], eps=np.ones(3), trivial_axis=triv)
+
+
+@pytest.mark.parametrize("dims", [3, 2])
+def test_radiate_negative_eps_with_signed_zero(dims):
+    """A negative real eps (a metal without loss) gives the same decaying root k = i omega sqrt(|eps|) for the
+    imaginary part +0.0 and -0.0 (the principal root of -4 - 0.0i is -2i, which would make the field grow); the
+    field falls from 1 um to 3 um away."""
+    from fdtd_gpu.near2far import radiate
+    src = np.zeros((1, 3))
+    J = np.zeros((1, 1, 3), complex)
+    J[0, 0, 2] = 1.0
+    M = np.zeros_like(J)
+    pts = np.array([[1.0, 0.0, 0.0], [3.0, 0.0, 0.0]])
+    triv = None if dims == 3 else 2
+    for backend in (("numpy", "jax") if dims == 3 else ("numpy",)):
+        Ep, _ = radiate(pts, src, J, M, [0.5], eps=np.array([complex(-4, 0.0)]), trivial_axis=triv, backend=backend)
+        Em, _ = radiate(pts, src, J, M, [0.5], eps=np.array([complex(-4, -0.0)]), trivial_axis=triv, backend=backend)
+        assert np.allclose(Ep, Em, rtol=1e-12, atol=0), (backend, Ep, Em)
+        a1, a3 = np.abs(Em[0, 0, 2]), np.abs(Em[0, 1, 2])
+        assert np.isfinite(a1) and a3 < 1e-3 * a1, (backend, a1, a3)
+
+
 def test_farfield_grid_and_errors():
     """The points of get_farfields (floor(size x resolution) per axis, ends included, one point at the center below
     2), the trapezoidal weights, and the unsupported cases."""

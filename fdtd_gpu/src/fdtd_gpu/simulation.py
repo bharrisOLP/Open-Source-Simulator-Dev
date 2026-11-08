@@ -40,13 +40,25 @@ TRIVIAL_CELLS = 3            # cells on an axis of size 0 (periodic; fdtdx plane
 
 
 class PML:
-    """A perfectly matched layer inside the cell: PML(thickness, direction=ALL, side=ALL). fdtdx grades its own
-    conductivity profile (not the profile of the MIT package)."""
+    """A perfectly matched layer inside the cell: PML(thickness, direction=ALL, side=ALL, R_asymptotic=None). fdtdx
+    grades its own conductivity profile (cubic; not the profile of the MIT package). R_asymptotic: the round-trip
+    amplitude of the continuous layer in vacuum, R = exp(-2 eta0 integral(sigma)); fdtdx sets its conductivity for
+    R = 1e-6 (None, the default here; the MIT package has 1e-15). In a medium of index n the round trip is
+    R^Re(n) times the loss of the medium in the layer, so a smaller R helps where Re(n) is small (check 14)."""
 
-    def __init__(self, thickness: float, direction: int = ALL, side: int = ALL, **unsupported):
+    def __init__(self, thickness: float, direction: int = ALL, side: int = ALL, R_asymptotic: float | None = None,
+                 **unsupported):
         if unsupported:
             raise NotImplementedError(f"PML: unsupported arguments {sorted(unsupported)}")
+        if R_asymptotic is not None and not 0 < R_asymptotic < 1:
+            raise ValueError(f"R_asymptotic must be between 0 and 1, got {R_asymptotic}")
         self.thickness, self.direction, self.side = float(thickness), direction, side
+        self.R_asymptotic = R_asymptotic
+
+    @property
+    def R(self) -> float:
+        """The round trip of the layer in vacuum (1e-6, the default of fdtdx, if R_asymptotic is None)."""
+        return _disp.PML_R_DEFAULT if self.R_asymptotic is None else float(self.R_asymptotic)
 
 
 class FluxRegion:
@@ -103,10 +115,11 @@ class _Monitor:
 
 @dataclass
 class DftNear2Far(_Monitor):
-    """The DFT fields of the planes of add_near2far. After the run: `eps` (the medium of the far fields) and
+    """The DFT fields of the planes of add_near2far. After the run: `eps` (the medium of the far fields: a float, or
+    for a dispersive or conductive medium an array of the complex eps(f) at each frequency) and
     `flux(direction, where, resolution)`."""
     sim: object = None
-    eps: float = float("nan")
+    eps: float | np.ndarray = float("nan")
 
     def flux(self, direction: int, where, resolution: float) -> list:
         """The flux sum Re(E x conj H) . e_direction of the far fields over the points of get_farfields(self,
@@ -438,11 +451,12 @@ class Simulation:
         """Positions (N, 3) and current elements J = n x H, M = -n x E (nfreq, N, 3; times the area of the cell, the
         trapezoidal weight of the plane and the region weight) of all surface cells. In 2-D the fields do not change
         along the axis of size 0: E and H are averaged over its TRIVIAL_CELLS cells, and each cell of the plane gives
-        one line element of length dx (times the trapezoidal weight). Sets n2f.eps: the staircase material of the
-        surface cells (a warning if they have more than one material: the far fields assume one homogeneous
-        medium)."""
+        one line element of length dx (times the trapezoidal weight). Sets n2f.eps from the staircase material of
+        the surface cells (a warning if they have more than one material: the far fields assume one homogeneous
+        medium): the float eps of a lossless, non-dispersive medium, or for a dispersive or conductive medium its
+        complex eps(f) at each frequency (Medium.permittivity; the Green's function of the lossy medium)."""
         self._need_run()
-        pos, Js, Ms, eps = [], [], [], []
+        pos, Js, Ms, eps, mids = [], [], [], [], []
         nf = len(n2f.freqs)
         triv = tuple(2 + q for q in range(3) if self.trivial[q])         # axes of E (nfreq, 3, nx, ny, nz)
         for j, r in enumerate(n2f.regions):
@@ -464,16 +478,27 @@ class Simulation:
             pos.append(self._colocated_points(rng))
             Js.append(J)
             Ms.append(M)
-            eps.append(self.eps[tuple(slice(*q) for q in rng)].reshape(-1))
-            if not self._plain[tuple(slice(*q) for q in rng)].all():
-                raise NotImplementedError("the near2far surface crosses a dispersive or conductive material: the "
-                                          "transform needs a lossless, non-dispersive medium")
-        eps = np.concatenate(eps)
-        vals, counts = np.unique(eps, return_counts=True)
-        n2f.eps = float(vals[np.argmax(counts)])
-        if len(vals) > 1:
-            warnings.warn(f"the near2far surface crosses {len(vals)} materials (eps {vals.tolist()}); the far fields "
-                          f"use the homogeneous medium eps = {n2f.eps:g} (the material of most surface cells)")
+            sl = tuple(slice(*q) for q in rng)
+            eps.append(self.eps[sl].reshape(-1))
+            mids.append(self._idx[sl].reshape(-1))
+        eps, mids = np.concatenate(eps), np.concatenate(mids)
+        lossy = [k for k in np.unique(mids) if self._mats[k].dispersive or self._mats[k].conductive]
+        if not lossy:                                       # lossless, non-dispersive: as before
+            vals, counts = np.unique(eps, return_counts=True)
+            n2f.eps = float(vals[np.argmax(counts)])
+            if len(vals) > 1:
+                warnings.warn(f"the near2far surface crosses {len(vals)} materials (eps {vals.tolist()}); the far "
+                              f"fields use the homogeneous medium eps = {n2f.eps:g} (the material of most surface "
+                              f"cells)")
+        else:                                               # the complex eps(f) of the medium at each frequency
+            ks, counts = np.unique(mids, return_counts=True)
+            med = self._mats[ks[np.argmax(counts)]]
+            n2f.eps = (np.asarray(med.permittivity(n2f.freqs), complex) if med.dispersive or med.conductive
+                       else med.epsilon)
+            if len(ks) > 1:
+                warnings.warn(f"the near2far surface crosses {len(ks)} materials ({[self._mats[k] for k in ks]}); "
+                              f"the far fields use the homogeneous medium {med} (the material of most surface "
+                              f"cells)")
         return np.concatenate(pos), np.concatenate(Js, axis=1), np.concatenate(Ms, axis=1)
 
     def get_farfields_at(self, near2far, points) -> dict:
@@ -599,6 +624,7 @@ class Simulation:
         idx, mats, eps3 = self._permittivity()
         self.eps = np.array([m.epsilon for m in mats])[idx]
         self.eps3 = eps3
+        self._idx, self._mats = idx, mats          # the staircase material of each cell (near2far media)
         face, self._plain = None, np.ones(idx.shape, bool)     # _plain: cells without poles or conductivity
         lossy = _disp.lossy_media(self.default_material, self.geometry)
         if lossy:                                   # nothing of this for runs without dispersion or conductivity
@@ -619,7 +645,7 @@ class Simulation:
             place(VoxelMaterial.from_index(idx, fmats), (0, 0, 0))
 
         # boundaries
-        kinds, thick = {}, {}
+        kinds, thick, sigma_end, layers = {}, {}, {}, {}
         for a, ax in enumerate("xyz"):
             for side, sname in ((Low, "min"), (High, "max")):
                 key = f"{sname}_{ax}"
@@ -629,10 +655,18 @@ class Simulation:
                 pml = [p for p in self.boundary_layers if p.direction in (ALL, a) and p.side in (ALL, side)]
                 if pml:
                     kinds[key], thick[key] = "pml", max(1, int(round(pml[-1].thickness * self.resolution)))
+                    layers[a, side] = (pml[-1], thick[key])
+                    if pml[-1].R_asymptotic is not None:          # fdtdx: sigma_end = -(m + 1) ln R / (2 eta0 d)
+                        sigma_end[key] = (-(_disp.PML_SIGMA_ORDER + 1) * math.log(pml[-1].R_asymptotic)
+                                          / (2 * _disp.ETA0 * thick[key] * self.dx * UM))
                 else:
                     kinds[key], thick[key] = ("periodic" if self.periodic else "pec"), 1
         bc = fdtdx.BoundaryConfig(**{f"boundary_type_{k.split('_')[0]}{k.split('_')[1]}": v for k, v in kinds.items()},
-                                  **{f"thickness_grid_{k.split('_')[0]}{k.split('_')[1]}": v for k, v in thick.items()})
+                                  **{f"thickness_grid_{k.split('_')[0]}{k.split('_')[1]}": v for k, v in thick.items()},
+                                  **{f"sigma_end_{k.split('_')[0]}{k.split('_')[1]}": v for k, v in sigma_end.items()})
+        if lossy:                                   # a medium with a small Re(n) in the PML: warn (check 14)
+            for msg in _disp.pml_warnings(idx, mats, layers, self.dx, self.sources):
+                warnings.warn(msg)
         bdict, bcons = fdtdx.boundary_objects_from_config(bc, volume)
         objects += list(bdict.values())
         constraints += bcons
@@ -692,6 +726,7 @@ class Simulation:
         arrays, objs, _ = fdtdx.apply_params(arrays, objs, params, key)
         if face is not None:              # after the sources took 1 / eps_inf: see fdtd_gpu._dispersion
             arrays = _disp.material_arrays(arrays, config, face)
+            objs = _disp.correct_sources(objs, arrays, config)       # J / (1 + b) in conductive cells
         return objs, arrays, config, key
 
     def _run(self, harminvs, cond, t_start, t_max):

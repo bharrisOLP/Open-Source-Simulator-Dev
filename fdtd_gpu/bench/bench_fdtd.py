@@ -18,6 +18,10 @@
     python bench/bench_fdtd.py --case film --kind drude --resolution 100,200,400   # dispersive film: R, T (1-D)
     python bench/bench_fdtd.py --case film --kind lorentz --thickness 0.504 --face-rule fill,average,staircase
     python bench/bench_fdtd.py --case uniform --kind conductive --resolution 20   # k = 0: decay or oscillation
+    python bench/bench_fdtd.py --case dipole --sigma-d 0.5 --resolution 10,20 [--no-source-fix]   # conductive
+    python bench/bench_fdtd.py --case halfspace --kind drude --resolution 50 [--pair 0] [--r-asymptotic 1e-15]   # 1-D
+    python bench/bench_fdtd.py --case near2far-medium --kind lorentz --resolution 20,40   # near2far in a medium
+    python bench/bench_fdtd.py --case transform --index-imag 0.05   # transform of exact fields, lossy medium
     python bench/bench_fdtd.py --case all          # bragg, waveguide, ring, dipole, sheet at the default resolutions
     python bench/bench_fdtd.py --case ring --resolution 40,60,80 --both    # a list of resolutions; averaged and not
 Each row has the resolution and the cells. --no-avg: the staircase (eps_averaging=False); default: averaged.
@@ -78,10 +82,20 @@ def setup(resolution: int = 50):
 ap = argparse.ArgumentParser()
 ap.add_argument("--case", choices=["bragg", "waveguide", "ring", "disk", "slab", "dipole", "sheet", "near2far",
                                    "near2far2d", "transform", "distance", "subtract", "setup", "film", "uniform",
-                                   "all"],
+                                   "halfspace", "near2far-medium", "all"],
                 default="all")
 ap.add_argument("--kind", type=str, default=None,
-                help="medium of the film case (drude, lorentz) or of the uniform case (drude, lorentz, conductive)")
+                help="medium of the film case (drude, lorentz), of the uniform and halfspace cases (drude, lorentz, "
+                     "conductive) or of the near2far-medium case (lorentz, conductive)")
+ap.add_argument("--sigma-d", type=float, default=None, help="dipole case: D_conductivity of the medium (1/um)")
+ap.add_argument("--no-source-fix", action="store_true",
+                help="dipole case: the source current of fdtdx alone (fdtd_gpu._dispersion.CORRECT_SOURCES = False)")
+ap.add_argument("--pair", type=float, default=None,
+                help="halfspace case: the distance of the two opposite source sheets (um; default 0.1; 0: one sheet)")
+ap.add_argument("--r-asymptotic", type=float, default=None,
+                help="halfspace case: PML(R_asymptotic) (the round trip in vacuum; default: 1e-6 of fdtdx)")
+ap.add_argument("--index-imag", type=float, default=None,
+                help="transform case: Im n of the medium (n = 1.5 + i x; the far points are not checked then)")
 ap.add_argument("--thickness", type=float, default=None,
                 help="film case: the film thickness (um; default 0.3 Drude, 0.5 Lorentz)")
 ap.add_argument("--fwidth", type=float, default=None, help="film case: the source width (1/um; default 1.6)")
@@ -104,8 +118,12 @@ ap.add_argument("--forward-diagonal", action="store_true",
                 help="keep the diagonal of the forward tensor (fdtd_gpu._averaging.DIAGONAL = \"forward\")")
 a = ap.parse_args()
 _USED_BY = {"index": ("dipole", "sheet", "near2far", "near2far2d", "all"), "component": ("near2far", "near2far2d"),
-            "fcen": ("near2far", "near2far2d"), "df": ("near2far", "near2far2d"), "kind": ("film", "uniform"),
-            "thickness": ("film",), "fwidth": ("film",), "face_rule": ("film",)}
+            "fcen": ("near2far", "near2far2d"), "df": ("near2far", "near2far2d"),
+            "kind": ("film", "uniform", "halfspace", "near2far-medium"), "thickness": ("film",), "fwidth": ("film",),
+            "face_rule": ("film",), "sigma_d": ("dipole",), "index_imag": ("transform",), "pair": ("halfspace",),
+            "r_asymptotic": ("halfspace",)}
+if a.no_source_fix and a.case != "dipole":
+    ap.error("--no-source-fix is used only by --case dipole")
 for opt, used_by in _USED_BY.items():          # an option that the case does not use is an error, not ignored
     if getattr(a, opt) is not None and a.case not in used_by:
         ap.error(f"--{opt} is not used by --case {a.case}")
@@ -119,9 +137,10 @@ rules = [None] if a.face_rule is None else a.face_rule.split(",")
 if any(r not in fdtd_gpu._dispersion.FACE_RULES for r in rules if r is not None):
     ap.error(f"--face-rule: one or more of {fdtd_gpu._dispersion.FACE_RULES}")
 if a.case == "transform":
+    kw = {} if a.index_imag is None else {"n": complex(1.5, a.index_imag)}
     for (dims, comp), h in itertools.product([(3, "Ez"), (3, "Ex"), (2, "Ez"), (2, "Ex")], (0.1, 0.05, 0.025)):
-        print(json.dumps(_clean({"case": "transform", **cases.transform_exact(dims, comp, h, compare_backends=True)})),
-              flush=True)
+        print(json.dumps(_clean({"case": "transform", **cases.transform_exact(dims, comp, h, compare_backends=True,
+                                                                              **kw)})), flush=True)
     sys.exit(0)
 todo = ["bragg", "waveguide", "ring", "dipole", "sheet"] if a.case == "all" else [a.case]
 resolutions = [None] if a.resolution is None else [int(r) for r in a.resolution.split(",")]
@@ -144,6 +163,16 @@ for case, resolution, avg, rule in itertools.product(todo, resolutions, averagin
     if case == "dipole":
         kw["n"] = index
         kw["half"] = a.half
+        if a.sigma_d is not None:
+            kw["sigma_d"] = a.sigma_d
+        if a.no_source_fix:
+            kw["correct_sources"] = False
+    if case in ("halfspace", "near2far-medium"):
+        kw["kind"] = a.kind or "lorentz"
+    if case == "halfspace" and a.pair is not None:
+        kw["pair"] = a.pair
+    if case == "halfspace" and a.r_asymptotic is not None:
+        kw["r_asymptotic"] = a.r_asymptotic
     if case == "sheet":
         kw["n"] = index
     if case in ("near2far", "near2far2d"):
@@ -154,7 +183,7 @@ for case, resolution, avg, rule in itertools.product(todo, resolutions, averagin
         kw["three_d"] = a.three_d
         kw["src_freq"] = a.src_freq
     fn = {"near2far": "near2far_dipole", "near2far2d": "near2far_line", "distance": "near2far_distance",
-          "subtract": "near2far_subtract"}.get(case, case)
+          "subtract": "near2far_subtract", "near2far-medium": "near2far_medium"}.get(case, case)
     res = setup(**kw) if case == "setup" else getattr(cases, fn)(**kw)
     row = {"case": case, **{k: v for k, v in kw.items()}, **res}
     if a.forward_diagonal:

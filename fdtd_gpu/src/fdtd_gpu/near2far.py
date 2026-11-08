@@ -31,6 +31,7 @@ the Hankel functions of SciPy. Both take the points in chunks of about `BUDGET` 
 
 from __future__ import annotations
 
+import cmath
 import functools
 import math
 
@@ -121,10 +122,21 @@ def _jax_chunk():
     return jax.jit(functools.partial(_chunk, jnp))
 
 
-def radiate(points, src, J, M, freqs, eps: float = 1.0, mu: float = 1.0, trivial_axis: int | None = None,
+def _k(om: float, eps, mu: float):
+    """The wave number omega sqrt(eps mu): math.sqrt for a real eps (as before), else the complex root with Im k >= 0
+    (the outgoing wave exp(i k r) decays in a lossy medium). The principal root of a negative real eps with the
+    imaginary part -0.0 is -i sqrt(|eps|): that root, and a root with Im k = 0 and Re k < 0, changes sign."""
+    if isinstance(eps, complex):
+        k = om * cmath.sqrt(eps * mu)
+        return -k if k.imag < 0 or (k.imag == 0 and k.real < 0) else k
+    return om * math.sqrt(eps * mu)
+
+
+def radiate(points, src, J, M, freqs, eps=1.0, mu: float = 1.0, trivial_axis: int | None = None,
             backend: str = "auto", device=None, budget: int = BUDGET):
     """E and H, each (nfreq, P, 3) complex128, at `points` (P, 3) of the surface current elements J and M (nfreq, N, 3:
-    current density x area; in 2-D x length) at `src` (N, 3), in a homogeneous medium (eps, mu).
+    current density x area; in 2-D x length) at `src` (N, 3), in a homogeneous medium (eps, mu). eps: a float, or
+    an array of nfreq (complex) values, the eps(f) of a dispersive or lossy medium at each frequency (Im eps >= 0).
 
     trivial_axis: None (3-D), or the axis of size 0 of a 2-D cell: the currents are line currents along it, and the
     coordinates along it are ignored. backend: "jax" (3-D only: float64, on `device` or the default device), "numpy",
@@ -147,6 +159,12 @@ def radiate(points, src, J, M, freqs, eps: float = 1.0, mu: float = 1.0, trivial
         raise ValueError("the jax backend is 3-D only (the Hankel functions come from SciPy)")
     if backend not in ("jax", "numpy"):
         raise ValueError(f"unknown backend {backend!r}")
+    if np.ndim(eps) == 0:
+        eps_f = [eps] * len(freqs)          # the same Python number as before: identical results
+    else:
+        eps_f = [complex(e) for e in np.asarray(eps, complex).reshape(-1)]
+        if len(eps_f) != len(freqs):
+            raise ValueError(f"eps needs one value per frequency ({len(freqs)}), got {len(eps_f)}")
     P, N = len(pts), len(src)
     E = np.zeros((len(freqs), P, 3), np.complex128)
     H = np.zeros_like(E)
@@ -159,9 +177,9 @@ def radiate(points, src, J, M, freqs, eps: float = 1.0, mu: float = 1.0, trivial
         fn = functools.partial(_chunk, np, perp=perp, two_d=trivial_axis is not None)
         for fi, f in enumerate(freqs):
             om = 2 * math.pi * f
-            k = om * math.sqrt(eps * mu)
+            k = _k(om, eps_f[fi], mu)
             for c0 in range(0, P, chunk):
-                e, h = fn(pad[c0:c0 + chunk], src, J[fi], M[fi], om, k, eps, mu)
+                e, h = fn(pad[c0:c0 + chunk], src, J[fi], M[fi], om, k, eps_f[fi], mu)
                 n = min(chunk, P - c0)
                 E[fi, c0:c0 + n], H[fi, c0:c0 + n] = e[:n], h[:n]
         return E, H
@@ -174,10 +192,10 @@ def radiate(points, src, J, M, freqs, eps: float = 1.0, mu: float = 1.0, trivial
         src_d = jnp.asarray(src, jnp.float64)
         for fi, f in enumerate(freqs):
             om = 2 * math.pi * f
-            k = om * math.sqrt(eps * mu)
+            k = _k(om, eps_f[fi], mu)
             Jd, Md = jnp.asarray(J[fi]), jnp.asarray(M[fi])
             for c0 in range(0, P, chunk):
-                e, h = fn(jnp.asarray(pad[c0:c0 + chunk], jnp.float64), src_d, Jd, Md, om, k, eps, mu)
+                e, h = fn(jnp.asarray(pad[c0:c0 + chunk], jnp.float64), src_d, Jd, Md, om, k, eps_f[fi], mu)
                 n = min(chunk, P - c0)
                 E[fi, c0:c0 + n], H[fi, c0:c0 + n] = np.asarray(e)[:n], np.asarray(h)[:n]
     return E, H

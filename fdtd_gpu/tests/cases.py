@@ -3,12 +3,15 @@ a dict of results and the reference values. Structures are synthetic, with textb
 
 from __future__ import annotations
 
+import warnings
+
 import numpy as np
 
 import fdtd_gpu as fg
-from references import (chi_exact, chi_yee, dipole_fields_3d, dipole_flux_3d, disk_resonance,  # noqa: F401
-                        line_source_fields_2d, line_source_power_2d, ring_resonance, slab_bloch_frequency,
-                        slab_te_neff, slab_tm_neff, tmm_reflectance, tmm_rt, uniform_root, yee_rt)
+from references import (chi_exact, chi_yee, dipole_fields_3d, dipole_flux_3d, dipole_flux_surface,  # noqa: F401
+                        disk_resonance, eps_conductive, line_source_fields_2d, line_source_power_2d, ring_resonance,
+                        slab_bloch_frequency, slab_te_neff, slab_tm_neff, tmm_reflectance, tmm_rt, uniform_root,
+                        yee_halfspace, yee_rt)
 
 SRC_REL_MIN = 1e-3     # waveguide: report T only where the source spectrum is above this fraction of its peak
 
@@ -225,15 +228,48 @@ def slab(resolution: int = 20, e_normal: bool = False, width: float = 0.37, peri
                 cells=int(np.prod(sim.shape)), eps_averaging=eps_averaging)
 
 
-def dipole(resolution: int = 20, n: float = 1.0, nfreq: int = 5, half: float = 1.0):
+def box_rule(lo, hi, n_gl: int = 40):
+    """Gauss-Legendre points (Q, 3), outward normals (Q, 3) and weights (Q,) of the six faces of the box [lo, hi]
+    (n_gl x n_gl points per face)."""
+    x, w = np.polynomial.legendre.leggauss(n_gl)
+    lo, hi = np.asarray(lo, float), np.asarray(hi, float)
+    pts, nrm, wts = [], [], []
+    for a in range(3):
+        b, c = (a + 1) % 3, (a + 2) % 3
+        tb = lo[b] + (hi[b] - lo[b]) * (x + 1) / 2
+        tc = lo[c] + (hi[c] - lo[c]) * (x + 1) / 2
+        wb, wc = w * (hi[b] - lo[b]) / 2, w * (hi[c] - lo[c]) / 2
+        gb, gc = np.meshgrid(tb, tc, indexing="ij")
+        for sign, val in ((-1, lo[a]), (1, hi[a])):
+            p = np.zeros((gb.size, 3))
+            p[:, a], p[:, b], p[:, c] = val, gb.reshape(-1), gc.reshape(-1)
+            nv = np.zeros_like(p)
+            nv[:, a] = sign
+            pts.append(p)
+            nrm.append(nv)
+            wts.append(np.outer(wb, wc).reshape(-1))
+    return np.concatenate(pts), np.concatenate(nrm), np.concatenate(wts)
+
+
+def dipole(resolution: int = 20, n: float = 1.0, nfreq: int = 5, half: float = 1.0, sigma_d: float = 0.0,
+           correct_sources: bool = True):
     """3-D Ez point dipole in a homogeneous medium: the flux through a closed box (half width "half") against the
-    analytic radiated power (Purcell factor 1). The PML is 1 um thick, 0.5 um from the box."""
+    analytic radiated power (Purcell factor 1). The PML is 1 um thick, 0.5 um from the box.
+    sigma_d > 0: the medium has D_conductivity sigma_d (eps(f) = n^2 (1 + i sigma_d / omega); it fills the PML too),
+    and the reference is the flux of the exact fields with the complex index (references.dipole_flux_surface)
+    through the box of the monitor planes (the co-located field points of the planes; the source at its Yee point;
+    Gauss-Legendre, 40 x 40 points per face): in a lossy medium the flux depends on the surface. b = sigma_d dt / 2
+    is the factor of the semi-implicit update; correct_sources=False runs without fdtd_gpu._dispersion.
+    correct_sources (the current of fdtdx alone, 1 + b too strong: the flux (1 + b)^2 too high)."""
+    from fdtd_gpu import _dispersion
+
     pml = 1.0
     s = 2 * (pml + half + 0.5)
     fcen, df = 0.5, 0.2
     gs = fg.GaussianSource(fcen, fwidth=df)
+    medium = fg.Medium(index=n) if sigma_d == 0 else fg.Medium(index=n, D_conductivity=sigma_d)
     sim = fg.Simulation(cell_size=fg.Vector3(s, s, s), resolution=resolution, sources=[fg.Source(gs, fg.Ez)],
-                        boundary_layers=[fg.PML(pml)], default_material=fg.Medium(index=n))
+                        boundary_layers=[fg.PML(pml)], default_material=medium)
     regions = []
     for ax in range(3):
         for sign in (-1, 1):
@@ -243,12 +279,32 @@ def dipole(resolution: int = 20, n: float = 1.0, nfreq: int = 5, half: float = 1
             sz[ax] = 0
             regions.append(fg.FluxRegion(center=fg.Vector3(*c), size=fg.Vector3(*sz), weight=sign))
     box = sim.add_flux(fcen, df, nfreq, *regions)
-    sim.run(until_after_sources=20)                  # the pulse leaves the 1 um box in about 2 um/c
+    old = _dispersion.CORRECT_SOURCES
+    _dispersion.CORRECT_SOURCES = correct_sources
+    try:
+        sim.run(until_after_sources=20)              # the pulse leaves the 1 um box in about 2 um/c
+    finally:
+        _dispersion.CORRECT_SOURCES = old
     freqs = np.array(sim.get_flux_freqs(box))
     flux = np.array(sim.get_fluxes(box))
-    ref = dipole_flux_3d(freqs, n, gs.fourier_transform(freqs))
-    return dict(freqs=freqs, purcell=flux / ref, seconds=sim.run_seconds, device=sim.device, steps=sim.n_steps,
-                resolution=resolution, n=n, half=half, cells=int(np.prod(sim.shape)))
+    out = dict(resolution=resolution, n=n, half=half, cells=int(np.prod(sim.shape)))
+    if sigma_d == 0:
+        ref = dipole_flux_3d(freqs, n, gs.fourier_transform(freqs))
+    else:
+        r0 = yee_point(sim, "Ez", fg.Vector3())
+        lo = np.array([sim._colocated_points([(sim._cell(-half, a), sim._cell(-half, a) + 1)] * 3)[0, a]
+                       for a in range(3)])
+        hi = np.array([sim._colocated_points([(sim._cell(half, a), sim._cell(half, a) + 1)] * 3)[0, a]
+                       for a in range(3)])
+        n_f = np.sqrt(medium.permittivity(freqs))
+        pts, nrm, w = box_rule(lo, hi)
+        ref = dipole_flux_surface(pts, nrm, w, freqs, n_f, gs.fourier_transform(freqs), r0)
+        b = sigma_d * sim.dt / 2
+        out.update(sigma_d=sigma_d, b=b, correct_sources=correct_sources, box_lo=lo - r0, box_hi=hi - r0,
+                   lossless_ref_ratio=ref / dipole_flux_3d(freqs, n, gs.fourier_transform(freqs)))
+        if not correct_sources:
+            out["purcell_over_1b2"] = flux / ref / (1 + b) ** 2
+    return dict(freqs=freqs, purcell=flux / ref, seconds=sim.run_seconds, device=sim.device, steps=sim.n_steps, **out)
 
 
 def sheet(resolution: int = 20, n: float = 1.0):
@@ -804,3 +860,169 @@ def uniform(kind: str = "drude", resolution: int = 20, run_after: float = 100.0)
     return dict(out, f=m.freq, decay=m.decay, Q=m.Q, f_exact=exact.real, decay_exact=exact.imag, f_yee=yee.real,
                 decay_yee=yee.imag, f_err=m.freq / exact.real - 1, f_err_yee=m.freq / yee.real - 1,
                 decay_err=m.decay / exact.imag - 1, decay_err_yee=m.decay / yee.imag - 1, n_modes=len(h.modes))
+
+
+HALF = {"drude": dict(eps_inf=1.0, pole=FILM["drude"]["pole"]),             # plasma edge at f = 1 / um
+        "lorentz": dict(eps_inf=2.25, pole=FILM["lorentz"]["pole"]),         # resonance at f = 1 / um
+        "conductive": dict(eps_inf=2.25, sigma_d=0.2)}
+
+
+def medium_eps(p, f, dt: float | None = None, float32: bool = False):
+    """eps(f) of a medium of HALF (or FILM, UNIFORM): exact (dt None), or of the discrete scheme of the run (chi_yee
+    of the ADE, or the semi-implicit conductivity; float32: the float32 ADE coefficients)."""
+    if "pole" in p:
+        return p["eps_inf"] + (chi_exact(f, p["pole"]) if dt is None else chi_yee(f, p["pole"], dt, float32))
+    return eps_conductive(f, p["eps_inf"], p["sigma_d"], dt)
+
+
+def halfspace(kind: str = "lorentz", resolution: int = 50, nfreq: int = 41, length: float = 2.0,
+              depths=(0.5, 1.5), fwidth: float = 1.6, run_after: float = 200.0, pair: float = 0.1,
+              r_asymptotic: float | None = None):
+    """1-D: a half-space of HALF[kind] that runs through the PML (Ex, normal incidence; the face on a cell face at
+    even resolutions; `length` um of the medium before the PML of 1 um; 41 frequencies from 0.6 to 1.4 / um, the
+    pulse of `film`). The source is two current sheets of opposite sign `pair` um apart, so the pulse has no
+    zero-frequency part, which the PML of fdtdx (with its frequency shift alpha) absorbs poorly; one sheet with
+    pair=0 gives R within 1.3e-5 of the same values in the logged rows. R from a flux plane in vacuum with the
+    incident fields subtracted, as check 1.
+    References: (a) the Fresnel reflectance of the face, |(1 - n) / (1 + n)|^2, n = sqrt(eps(f)); (b) the exact
+    reflectance of the 1-D Yee grid at the face of a half-space with the discrete eps of the run
+    (references.yee_halfspace; float64 and float32 ADE coefficients): a wave that the PML reflects back to the face
+    changes R from (b). Flux planes in the medium at the depths `depths` (the co-located field point is dx deeper):
+    T_in (flux / incident flux) against (1 - R_exact) exp(-4 pi f Im(n) d); the DFT fields Ex of the two planes:
+    their ratio against exp(i theta_m (d2 - d1) / dx) of the forward wave of the grid (yee_halfspace) and against
+    exp(i 2 pi f n (d2 - d1)) (null where the second plane has less than 1e-2 of the field of the first). r_pml: the
+    backward wave over the forward wave at the start of the PML, from the fields of the two planes and theta_m (null
+    where the round trip from the second plane to the PML and back attenuates by more than 1e-2, so that the
+    estimate is float32 noise, or where |sin(theta_m (d2 - d1) / dx)| < 0.3: the planes are near a multiple of half a
+    wavelength apart, and the 2 x 2 system is near singular); r_pml_vacuum: the same in the vacuum run;
+    r_pml_theory: R^Re(n) exp(-4 pi f Im(n) 1 um), the round trip of the stretched coordinate of fdtdx (designed
+    for R = 1e-6 in vacuum, or R = r_asymptotic: PML(R_asymptotic)) in the medium (_dispersion.pml_round_trip).
+    Both runs end run_after um/c after the source (a fixed time). warned: the PML warning of the run with the
+    medium (Simulation._build, _dispersion.pml_warnings)."""
+    p = HALF[kind]
+    pml = 1.0
+    sz = 3.5 + length
+    z0 = -sz / 2 + pml + 0.5                          # source
+    zr = z0 + 0.25                                    # reflection plane
+    zs = z0 + 1.0                                     # the face of the half-space
+    med = dispersive_medium(p["eps_inf"], p.get("pole"), p.get("sigma_d", 0.0))
+    end = sz / 2 + 1.0                                # beyond the end of the cell: through the PML
+    geometry = [fg.Block(size=fg.Vector3(fg.inf, fg.inf, end - zs), center=fg.Vector3(0, 0, (zs + end) / 2),
+                         material=med)]
+    fcen, df = 1.0, 0.8
+    gs = fg.GaussianSource(fcen, fwidth=fwidth)
+    if pair > 0:                                      # two opposite sheets: no zero-frequency part in the pulse
+        src = [fg.Source(gs, component=fg.Ex, center=fg.Vector3(0, 0, z0 + s * pair / 2), amplitude=-s)
+               for s in (-1.0, 1.0)]
+    else:
+        src = [fg.Source(gs, component=fg.Ex, center=fg.Vector3(0, 0, z0))]
+
+    def sim_with(geom):
+        sim = fg.Simulation(cell_size=fg.Vector3(0, 0, sz), resolution=resolution, geometry=geom, sources=src,
+                            boundary_layers=[fg.PML(pml, R_asymptotic=r_asymptotic)])
+        refl = sim.add_flux(fcen, df, nfreq, fg.FluxRegion(center=fg.Vector3(0, 0, zr)))
+        inside = [sim.add_flux(fcen, df, nfreq, fg.FluxRegion(center=fg.Vector3(0, 0, zs + d))) for d in depths]
+        return sim, refl, inside
+
+    stop = run_after
+    sim0, refl0, in0 = sim_with([])
+    sim0.run(until_after_sources=stop)
+    inc = np.array(sim0.get_fluxes(refl0))
+    data = sim0.get_flux_data(refl0)
+    sim1, refl1, in1 = sim_with(geometry)
+    sim1.load_minus_flux_data(refl1, data)
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        sim1.run(until_after_sources=stop)
+    warned = [str(w.message) for w in caught if "fills the PML" in str(w.message)]
+    freqs = np.array(sim1.get_flux_freqs(refl1))
+    dx, dt = sim1.dx, sim1.dt
+    R = -np.array(sim1.get_fluxes(refl1)) / inc
+    n = np.sqrt(medium_eps(p, freqs))
+    R_exact = np.abs((1 - n) / (1 + n)) ** 2
+    R_yee, tm = yee_halfspace(freqs, lambda f: medium_eps(p, f, dt), dx, dt)
+    R_y32 = yee_halfspace(freqs, lambda f: medium_eps(p, f, dt, True), dx, dt)[0] if "pole" in p else R_yee
+    k0 = 2 * np.pi * freqs
+    T_in = np.array([np.array(sim1.get_fluxes(m)) / inc for m in in1])
+    T_exact = np.array([(1 - R_exact) * np.exp(-2 * k0 * n.imag * (d + dx)) for d in depths])
+
+    def dft(sim, mon):
+        return np.array([sim.get_dft_array(mon, fg.Ex, k).mean() for k in range(len(freqs))])
+
+    x1, x2, xp = (depths[0] + dx) / dx, (depths[1] + dx) / dx, length / dx       # node units from the face
+
+    def backward(E1, E2, th):
+        """B / A of E = A exp(i th x) + B exp(-i th x) through the two planes, at the start of the PML."""
+        det = np.exp(1j * th * (x1 - x2)) - np.exp(1j * th * (x2 - x1))
+        A = (E1 * np.exp(-1j * th * x2) - E2 * np.exp(-1j * th * x1)) / det
+        B = (E2 * np.exp(1j * th * x1) - E1 * np.exp(1j * th * x2)) / det
+        return np.abs(B * np.exp(-1j * th * xp) / (A * np.exp(1j * th * xp)))
+
+    E1, E2 = dft(sim1, in1[0]), dft(sim1, in1[1])
+    ratio = E2 / E1
+    seen = (np.exp(-2 * tm.imag * (xp - x2)) > 1e-2)        # the backward wave can be above the float32 noise
+    seen &= np.abs(np.sin(tm * (x2 - x1))) > 0.3             # and the 2 x 2 system is not near singular
+    weak = np.exp(-tm.imag * (x2 - x1)) > 1e-2                # the second plane has at least 1e-2 of the first
+    q = 2 * dx / dt * np.sin(np.pi * freqs * dt)
+    th0 = np.arccos(1 - q**2 / 2)                     # vacuum wave of the grid
+    r_vac = np.where(np.abs(np.sin(th0 * (x2 - x1))) > 0.3, backward(dft(sim0, in0[0]), dft(sim0, in0[1]), th0),
+                     np.nan)
+    # the stretched-coordinate PML of fdtdx is designed for the round-trip amplitude R in vacuum (1e-6, its default
+    # sigma_end, or R_asymptotic); in a medium the stretch multiplies k = k0 n, so it gives R^Re(n), times the loss of
+    # the medium over the 1 um of the PML and back
+    R_pml = 1e-6 if r_asymptotic is None else r_asymptotic
+    r_theory = R_pml ** n.real * np.exp(-2 * k0 * n.imag * pml)
+    ratio_yee = np.abs(ratio / np.exp(1j * tm * (x2 - x1)) - 1)
+    return dict(kind=kind, freqs=freqs, R=R, R_exact=R_exact, R_yee=R_yee, R_y32=R_y32,
+                max_dR=float(np.max(np.abs(R - R_exact))), max_dR_yee=float(np.max(np.abs(R - R_yee))),
+                max_dR_y32=float(np.max(np.abs(R - R_y32))), grid_only=float(np.max(np.abs(R_yee - R_exact))),
+                depths=list(depths), T_in=T_in, T_exact=T_exact, max_dT_in=float(np.max(np.abs(T_in - T_exact))),
+                ratio_err_yee=np.where(weak, ratio_yee, np.nan),
+                max_ratio_err_yee=float(np.max(ratio_yee[weak])) if weak.any() else None,
+                ratio_err_exact=np.where(weak, np.abs(ratio / np.exp(1j * k0 * n * (depths[1] - depths[0])) - 1),
+                                         np.nan),
+                r_pml=np.where(seen, backward(E1, E2, tm), np.nan), r_pml_theory=r_theory, r_pml_vacuum=r_vac,
+                round_trip=np.exp(-2 * tm.imag * (xp - x2)), n_real=n.real, n_imag=n.imag, length=length, pair=pair,
+                r_asymptotic=r_asymptotic, warned=warned,
+                seconds=sim0.run_seconds + sim1.run_seconds, device=sim1.device, steps=sim1.n_steps,
+                resolution=resolution, cells=int(np.prod(sim1.shape)))
+
+
+def near2far_medium(kind: str = "lorentz", resolution: int = 20, nfreq: int = 5, half: float = 1.0,
+                    radii=(2.0, 4.0), n_phi: int = 36, run_after: float = 60.0, fcen: float = 0.5,
+                    df: float = 0.2):
+    """2-D line source (Ez) in a uniform dispersive or conductive medium HALF[kind] that fills the cell and the PML:
+    the near-to-far-field transform of a closed square (half width `half`) against the exact line-source fields
+    with the complex index n(f) = sqrt(eps(f)) (references.line_source_fields_2d) at n_phi points on each circle of
+    `radii` about the source. One global phase per frequency for all points (so a wrong k shows as a phase error
+    between the circles); the phase against -omega dt / 2 (see "Differences"). err_eps_inf: the same transform with
+    the eps_inf of the medium (a lossless medium without dispersion), which the code used before."""
+    from fdtd_gpu.near2far import radiate
+
+    p = HALF[kind]
+    med = dispersive_medium(p["eps_inf"], p.get("pole"), p.get("sigma_d", 0.0))
+    pml = 1.0
+    s = 2 * (pml + half + 0.5)
+    gs = fg.GaussianSource(fcen, fwidth=df)
+    sim = fg.Simulation(cell_size=fg.Vector3(s, s, 0), resolution=resolution, sources=[fg.Source(gs, fg.Ez)],
+                        boundary_layers=[fg.PML(pml)], default_material=med)
+    n2f = sim.add_near2far(fcen, df, nfreq, *box_regions(fg.Near2FarRegion, half, (0, 1)))
+    sim.run(until_after_sources=run_after)
+    freqs = np.array(sim.get_near2far_freqs(n2f))
+    current = gs.fourier_transform(freqs)
+    r0 = yee_point(sim, "Ez", fg.Vector3())
+    phi = 2 * np.pi * np.arange(n_phi) / n_phi
+    u = np.stack([np.cos(phi), np.sin(phi), np.zeros(n_phi)], axis=-1)
+    pts = np.concatenate([r0 + r * u for r in radii])
+    E, _ = _ff_arrays(sim.get_farfields_at(n2f, pts))
+    n = np.sqrt(medium_eps(p, freqs))
+    E_ref = np.concatenate([line_source_fields_2d(pts, [f], nf, c, r0, "Ez")[0] for f, nf, c in
+                            zip(freqs, n, current)])
+    phase, err, pattern = _compare(E, E_ref)
+    src, J, M = sim._near2far_currents(n2f)
+    E_inf, _ = radiate(pts, src, J, M, freqs, eps=med.epsilon, trivial_axis=2)
+    _, err_inf, _ = _compare(E_inf, E_ref)
+    return dict(kind=kind, freqs=freqs, resolution=resolution, radii=list(radii), field_err=err,
+                pattern_err=pattern, phase=phase, omega_dt_half=np.pi * freqs * sim.dt, err_eps_inf=err_inf,
+                eps=np.asarray(n2f.eps), n_real=n.real, n_imag=n.imag, seconds=sim.run_seconds, device=sim.device,
+                steps=sim.n_steps, cells=int(np.prod(sim.shape)))

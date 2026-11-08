@@ -37,13 +37,14 @@ Supported:
   earlier ones. `eps_averaging=True` (the default, as in the MIT package): subpixel averaging of the permittivity at
   each Yee E component (see "Differences"; next to a dispersive or conductive material: the face rule "fill");
   `eps_averaging=False`: the staircase.
-- **Boundaries:** `PML(thickness, direction, side)` inside the cell. Other faces are metal (PEC), or periodic with
-  `k_point=Vector3()` (the objects repeat across periodic faces; a PML on both sides or none).
+- **Boundaries:** `PML(thickness, direction, side, R_asymptotic)` inside the cell (`R_asymptotic`: see "Media in the
+  PML"). Other faces are metal (PEC), or periodic with `k_point=Vector3()` (the objects repeat across periodic
+  faces; a PML on both sides or none).
 - **Sources:** `Source(GaussianSource or ContinuousSource, component, center, size, amplitude)`: a point, line or
   plane current. `EigenModeSource(src, center, size, eig_band, eig_parity, eig_kpoint)`.
 - **Monitors:** `add_flux` (`FluxRegion` with weights; `get_flux_data`, `load_minus_flux_data`), `add_mode_monitor`
   with `get_eigenmode_coefficients(mon, bands, eig_parity)` (alpha and neff), `get_flux_freqs`, `get_dft_array`,
-  `get_epsilon`.
+  `get_epsilon`. Flux and DFT-field planes work in any cell, also in a dispersive or conductive medium (check 14).
 - **Near-to-far-field transform** (2-D and 3-D cells; see "Differences"): `add_near2far(fcen, df, nfreq,
   Near2FarRegion, ...)`, `get_farfield(n2f, x)` (a list of 6 nfreq complex numbers: Ex, Ey, Ez, Hx, Hy, Hz of the
   first frequency, then of the second, ...), `get_farfields(n2f, resolution, where=Volume(center, size))` (a dict of
@@ -56,8 +57,9 @@ Supported:
 Not supported (the option raises NotImplementedError, or the name is not in the package): `geometry_center`,
 `symmetries`, non-uniform grids; anisotropy (`epsilon_diag`, `sigma_diag` with different values, `sigma_offdiag`),
 gain (negative `sigma` or `D_conductivity`), `D_conductivity` together with `E_susceptibilities`, other
-susceptibility types (noisy, gyrotropic), `mu`, `H_susceptibilities`, `B_conductivity`, nonlinearity; mode sources,
-mode monitors and near2far surfaces whose cells hold a dispersive or conductive material; rotated blocks (`e1`, `e2`,
+susceptibility types (noisy, gyrotropic), `mu`, `H_susceptibilities`, `B_conductivity`, nonlinearity; mode sources
+and mode monitors whose planes cross a dispersive or conductive material (the mode solver of fdtdx sees eps_inf
+only; near2far surfaces in such a medium are supported, check 15); rotated blocks (`e1`, `e2`,
 `e3`), tilted axes, sloped prism sidewalls, `MaterialGrid`; Bloch phases (`k_point` other than 0); complex
 amplitudes, `amp_func`, custom source times, `eig_match_freq=False`; field arrays (`get_array`), force, energy and
 LDOS monitors; `add_near2far(..., nperiods)` (the sum over periodic copies), `output_farfields`, `save_near2far` and
@@ -165,9 +167,14 @@ sources or mode monitors.
     at res 400), and a Drude pole keeps c1 + c2 = 1 exactly (a float32 sum above 1 makes a constant polarization grow
     by (c1 + c2 - 1) / (g dt) per step). The sources took 1 / eps_inf at that time, so a current source adds J to
     dD/dt = curl H - J, as in the MIT package (fdtdx alone scales a dipole in a dispersive cell by
-    1 / Re eps(f_source)). In a conductive cell fdtdx adds the source current after the division by (1 + b): a
-    current source inside a conductive medium is 1 + b times the current of the semi-implicit form (b = 0.007 at
-    res 20 for sigma_D = 0.5; not corrected; read from `fdtdx.fdtd.update.update_E`, not measured).
+    1 / Re eps(f_source)). In a conductive cell fdtdx adds the source current after the division by (1 + b)
+    (`fdtdx.fdtd.update.update_E`), so its current alone is 1 + b times the current of the semi-implicit form
+    E^(n+1) (1 + b) = E^n (1 - b) + (dt / eps) (curl H - J) (the loss term averaged over the two time levels, as in
+    J. B. Schneider, Understanding the Finite-Difference Time-Domain Method, Sec. 3.12 "Lossy Material", the reference
+    of the fdtdx code; J stands next to curl H in Ampere's law), with b = sigma_D dt / 2 (0.0071 at res 20 for
+    sigma_D = 0.5). `_dispersion.correct_sources`
+    divides the current of each electric point, line or plane source by 1 + b of its cells (b = 0 in a cell without
+    conductivity: there the source does not change). Check 13 measures the error and the correction.
   - **Stability.** fdtdx runs at 0.99 of the 3-D Courant limit, and the ADE with E^n is explicit. For lossless
     poles the grid is stable only if sum_p v_p / (1 - u_p) < eps - s, with u_p = (w0_p dt / 2)^2,
     v_p = K_p dt^2 / 4, s = dims (c dt / dx)^2 = 0.327, 0.653, 0.980 in 1-D, 2-D, 3-D (`_dispersion.stability_margin`;
@@ -180,7 +187,31 @@ sources or mode monitors.
     that is needed). `test_stability_bound` brackets the bound to 5 % (1-D, lossless Drude: bounded at 0.8 and 0.95
     of the limit, growth without bound at 1.05 and 1.2).
     The MIT package uses Courant 0.5 by default, so it has more margin; `Courant` is still ignored here.
-  - Not tested: dispersive or conductive materials inside a PML; Q of a dispersive resonator.
+  - **Media in the PML.** A dispersive or conductive medium can run into the PML. The PML of fdtdx stretches the
+    coordinate in the curl (a CPML); the ADE and the conductivity update stay the same inside it, so in theory it is
+    matched to any medium that does not change along its normal. Its conductivity is designed for the round trip
+    R = 1e-6 in vacuum (the default `sigma_end` of fdtdx); in a medium the stretch multiplies k = k0 n, so the round
+    trip becomes R^Re(n), times the loss of the medium in the PML (`_dispersion.pml_round_trip`). Check 14 measures
+    this: R of a Lorentz or a conductive half-space agrees with the Yee grid of an infinite half-space to the
+    float32 level (1.6e-5, 5.2e-7), but in a Drude medium just above its plasma frequency (Re n = 0.16 at 1.0 / um)
+    the PML reflects up to 1.4e-2, and R changes by up to 4.4e-4. Limits and remedies:
+    - A thicker PML does not lower R^Re(n): fdtdx makes its conductivity proportional to 1 / thickness (read from
+      its `objects/boundaries/perfectly_matched_layer.py`); only the loss of the medium in the layer grows.
+    - An end of the medium before the PML is worse for a wave that propagates in it: the face of the Drude medium of
+      check 14 reflects 0.53 of the power at 1.0 / um and 0.082 at 1.2 / um (its Fresnel reflectance, in the rows of
+      check 14), against 1.6e-4 (power) from the PML at 1.0 / um. Only a medium that absorbs the wave before its end
+      makes the end harmless, and then the PML reflection is small too.
+    - `PML(thickness, R_asymptotic=R)` (the name of the MIT package, whose default is 1e-15; here the default is
+      1e-6 of fdtdx) sets `sigma_end = -(m + 1) ln R / (2 eta0 d)` (m = 3, d the thickness) of fdtdx, so the round
+      trip is R^Re(n). With R = 1e-15 the test of the Drude half-space (res 50) requires the PML reflection at
+      1.0 / um below 1e-3, R against the Yee half-space below 5e-5 and the vacuum reflection below 1e-5. A much
+      smaller R is expected to need a thicker layer: the discrete layer reflects more when its conductivity changes
+      faster from cell to cell (not measured here beyond R = 1e-15).
+    - `run()` warns when a dispersive or conductive medium fills cells of a PML and its round trip (above, with the
+      R and the thickness of that PML) is above 1e-3 at a frequency where the spectrum of a source is at least 1e-2
+      of its peak (`_dispersion.pml_warnings`). The Drude half-space of check 14 warns; the Lorentz and the
+      conductive half-spaces, and the media of checks 13 and 15, do not (tests).
+  - Not tested: Q of a dispersive resonator.
 - **float32 fields**, and the time step of fdtdx: dt = 0.99 dx / (c sqrt 3) in all dimensions (`Courant` is
   ignored).
 - **One-way mode sources.** `EigenModeSource` is the fdtdx TFSF mode source: the mode is solved at the center
@@ -216,7 +247,9 @@ sources or mode monitors.
     along z (in 3-D). A point source is at its own Yee point (`tests/cases.py`, `yee_point`).
   - The medium of the far fields is the staircase material of the surface cells. If the surface cells have more
     than one material, a warning, and the material of most cells is used. The surface must lie in one homogeneous
-    medium (the transform assumes that medium everywhere outside it).
+    medium (the transform assumes that medium everywhere outside it). In a dispersive or conductive medium the
+    transform uses its complex eps(f) at each frequency (`Medium.permittivity`; `n2f.eps` is then an array of nfreq
+    values), so k = omega sqrt(eps(f)) has Im k > 0 and the fields decay with the distance (check 15).
   - `get_farfields`: each axis of the cell with a size above 0 gets floor(size x resolution) points from the low end
     to the high end of the volume (both included; one point at the center if this is below 2); the arrays have the
     shape (the axes with more than one point, nfreq). `n2f.flux` sums Re(E x conj H) . e_direction over these
@@ -230,8 +263,10 @@ sources or mode monitors.
     tested). The mode source (TFSF) is not checked. Measured (check 9, n = 1, res 20, both boxes, all frequencies):
     the far fields have the phase -omega dt / 2 within 2.14e-3 rad (3-D Ez), 2.26e-3 (3-D Ex), 2.16e-3 (2-D Ez) and
     2.41e-3 (2-D Ex); at res 40 within 5.3e-4 (3-D Ez, 2-D Ez) and 6.0e-4 (2-D Ex). The rest is the phase error of
-    the grid dispersion, which is larger in a medium: at n = 1.5 within 1.08e-2 (3-D) and 1.46e-2 rad (2-D) at res
-    20, 2.65e-3 (3-D) and 3.60e-3 (2-D) at res 40. Ratios of two runs (normalization) cancel the phase.
+    the grid dispersion. It grows with k dx, and in a medium also with the lower Courant number c dt / (n dx) (check
+    9: at the same k, 1.08e-2 rad in n = 1.5 against 6.7e-3 in vacuum, 3-D): at n = 1.5 within 1.08e-2 (3-D) and
+    1.46e-2 rad (2-D) at res 20, 2.65e-3 (3-D) and 3.60e-3 (2-D) at res 40. Ratios of two runs (normalization)
+    cancel the phase.
   - The 3-D sum runs in float64 with JAX on the GPU (chunks of about 2 M point-cell pairs); the 2-D sum in float64
     with NumPy and the Hankel functions of SciPy on the CPU, with one line element per cell (E and H averaged over
     the TRIVIAL_CELLS cells of the axis of size 0). Time of the 3-D case of check 9 at res 20 (1,152 far and 231
@@ -420,14 +455,17 @@ the digits shown. "res" is the resolution in cells per um; times are the FDTD lo
      P_far / exact 0.9943 to 0.9993, field error 3.0e-3, pattern error 5.9e-3, at 3 um 4.0e-3, boxes 5.3e-3. n = 1.5
      (res 20, `--index 1.5`): P_far / flux 0.99738 to 1.00345, P_far / exact 1.0002 to 1.0089 (flux / exact 1.0023
      to 1.0066, as check 4), field error 1.5e-2, pattern error 2.1e-2, at 3 um 1.2e-2, boxes 1.6e-2. The field error
-     is 9.0 times that at n = 1 and the same f, but it depends on k = n omega (at the same dx and box), not on the
-     medium: a vacuum run at the same k (n = 1, f = 0.6 to 0.9 / um, `--fcen 0.75 --df 0.3`) gives the field errors
+     is 9.0 times that at n = 1 and the same f, but it depends mostly on k = n omega (at the same dx and box), not on
+     the medium: a vacuum run at the same k (n = 1, f = 0.6 to 0.9 / um, `--fcen 0.75 --df 0.3`) gives the field errors
      1.8e-3, 4.5e-3, 1.0e-2, 1.5e-2 and 1.6e-2 (box 1.0 um), against 1.5e-3, 4.7e-3, 9.9e-3, 1.4e-2 and 1.5e-2 in
      n = 1.5 at f = 0.4 to 0.6 / um (2-D: 1.1e-3, 4.9e-3, 1.0e-2, 1.3e-2, 1.2e-2 against 9.3e-4, 5.0e-3, 9.8e-3,
      1.2e-2, 1.1e-2). In this band the error grows steeply with k dx: 8.5 to 13 times from n f = 0.6 to 0.825 / um
-     (the cube of the ratio of k is 2.6). The Courant number S = c dt / (n dx), lower in the medium, changes only the
-     global phase rest, which the field error removes: 1.08e-2 rad in n = 1.5, 6.7e-3 in vacuum at the same k (2-D:
-     1.46e-2 and 1.10e-2). It is the FDTD discretization, not the transform: at res 40 (`--resolution 40 --index
+     (the cube of the ratio of k is 2.6). The Courant number S = c dt / (n dx), lower in the medium, changes mainly
+     the global phase rest, which the field error removes: 1.08e-2 rad in n = 1.5, 6.7e-3 in vacuum at the same k
+     (2-D: 1.46e-2 and 1.10e-2). It also changes the other errors a little: at the same k the field errors of the
+     1.0 um box above differ by up to 15 % (2-D: 18 %), and the box differences by up to 9 % (3-D: 3.3e-3 to 1.63e-2
+     in n = 1.5 against 3.1e-3 to 1.50e-2 in vacuum; 2-D: up to 40 %). It is the FDTD discretization, not the
+     transform: at res 40 (`--resolution 40 --index
      1.5`) the field error is 3.8e-3, the boxes 4.1e-3, the phase rest 2.65e-3 rad, P_far / flux 0.99935 to 1.00086
      (second order: the ratios 4.0, 4.0 and 4.1). `n2f.flux` through the six faces of a cube of half width 100 um
      (40 x 40 points per face) / P_far: 0.99968 at all resolutions (the trapezoidal rule of the flux points).
@@ -474,13 +512,17 @@ the digits shown. "res" is the resolution in cells per um; times are the FDTD lo
      points the transform of B - A below 1e-2 and that of B above 0.9 of max abs(field of S2). A Near2FarRegion
      whose normal is an axis of size 0 (for example direction=Z in an x-y cell) raises ValueError (test).
 
-Checks 10 to 12 (`tests/test_dispersion.py`; the cases `film` and `uniform`) use synthetic media with round numbers
-in the textbook forms of the Lorentz and Drude models (Jackson, Classical Electrodynamics, 3rd ed., Sec. 7.5),
-written as (kind, f_n, gamma, sigma) in the units of the MIT package. Two references: the exact eps(f) (the
-transfer matrix, the roots of eps = 0, sigma_D) and the exact discrete scheme (`references.chi_yee`, the exact 1-D
-Yee grid `references.yee_rt`, the root of eps_inf + chi_yee = 0); the second leaves only the float32 arithmetic and
-the end of the DFT. The numbers are from the rows of `benchmarks/2026-11-08/fdtd-gpu-dispersion.jsonl` (the
-commands from `--case film --kind drude` on, under "Tests and bench").
+Checks 10 to 15 (`tests/test_dispersion.py`; the cases `film`, `uniform`, `dipole` with `sigma_d`, `halfspace` and
+`near2far_medium`) use synthetic media with round numbers in the textbook forms of the Lorentz and Drude models
+(Jackson, Classical Electrodynamics, 3rd ed., Sec. 7.5), written as (kind, f_n, gamma, sigma) in the units of the
+MIT package. Two references: the exact eps(f) (the transfer matrix, the roots of eps = 0, sigma_D, the Fresnel
+reflectance, the exact dipole and line-source fields with a complex index) and the exact discrete scheme
+(`references.chi_yee`, the exact 1-D Yee grid `references.yee_rt` and `references.yee_halfspace`, the root of
+eps_inf + chi_yee = 0); the second leaves only the float32 arithmetic and the end of the DFT. The numbers of checks
+10 to 12 are from the rows of `benchmarks/2026-11-08/fdtd-gpu-dispersion.jsonl` (the commands from `--case film
+--kind drude` to `--case uniform`, under "Tests and bench"), except the conductive rows of check 12, which are from
+`benchmarks/2026-11-08/fdtd-gpu-dispersion-2.jsonl` (with the source correction of check 13); the numbers of checks
+13 to 15 are from that second file (the commands from `--case dipole --sigma-d 0.5` on).
 
 10. **Dispersive film: Drude** (eps_inf 1, f_n 1 / um, gamma 0.05 / um, sigma 1: the plasma edge at 1 / um; 0.3 um
     thick, faces on cell faces, in vacuum, normal incidence; 41 frequencies from 0.6 to 1.4 / um; `--case film
@@ -550,17 +592,93 @@ commands from `--case film --kind drude` on, under "Tests and bench").
     The exact roots are 0.4999 - 0.01i and 0.552680 - 0.01i (/ um). The frequency error against the exact root falls
     at second order (orders 2.02 and 2.00); against the root of the discrete chi it is below 1e-6. "decay" is
     the relative error of Im f; at res 40 the float32 c2, which carries the damping, limits it (6e-8 / (g dt) =
-    3.3e-5). Conductive medium, decay rate of Ex / sigma_D - 1:
-    +6.1e-6 (res 20) and +1.5e-5 (res 40); against the semi-implicit update +3.4e-6 and +1.4e-5 (the float32 factors
-    of the update); the fit residual of log abs(Ex) is below 1.9e-6, and Ex keeps its sign.
+    3.3e-5). Conductive medium, decay rate of Ex / sigma_D - 1 (rows of the second file: the source over the whole
+    cell is now divided by 1 + b, check 13; the first file had +6.1e-6, +1.5e-5, +3.4e-6, +1.4e-5 and 1.9e-6):
+    +6.0e-6 (res 20) and +1.4e-5 (res 40); against the semi-implicit update +3.3e-6 and +1.4e-5 (the float32 factors
+    of the update); the fit residual of log abs(Ex) is below 1.5e-6, and Ex keeps its sign.
+13. **Point dipole in a conductive medium** (`--case dipole --sigma-d 0.5`: check 4 with eps_inf 1 and sigma_D 0.5 /
+    um, also in the PML). Reference: the flux of the exact dipole fields with the complex index n(f) = sqrt(1 + i
+    sigma_D / omega) through the box of the monitor planes (the co-located field points, the source at its Yee point;
+    `references.dipole_flux_surface`, Gauss-Legendre with 40 x 40 points per face). In a lossy medium this flux
+    depends on the surface: here it is 0.564 to 0.591 of the power of the same dipole in vacuum. Flux / reference:
+    1.001034 to 1.002586 (res 10), 1.000260 to 1.000675 (res 20), 1.000118 to 1.000298 (res 30): second order (orders
+    1.94 to 2.02 from res 10 to 20, 1.84 to 2.02 from res 20 to 30). Without the correction (`--no-source-fix`, the
+    current of fdtdx alone): 1.0299 to 1.0314 (res 10) and 1.0146 to 1.0150 (res 20), first order (1.03 to 1.07),
+    and the ratio of the two runs is (1 + b)^2 within 4.4e-6 (b = 0.0143 at res 10, 0.0071 at res 20). The test
+    (res 10 and 20) requires the error below 1.5e-3 at res 20, the order above 1.8, the ratio (1 + b)^2 within 1e-5,
+    and the error without the correction above 1.2e-2.
+14. **Half-space through the PML** (`--case halfspace`; 1-D, normal incidence, Ex): the face of the half-space is on
+    a cell face 1 um after the source, the medium fills 2 um before the PML of 1 um and runs through the PML to the
+    end of the cell. The pulse of check 10 comes from two current sheets of opposite sign 0.1 um apart (no
+    zero-frequency part). Media: the Lorentz medium of check 11, the conductive medium of check 12 and the Drude
+    medium of check 10 (R from 0.0022 to 0.463, 0.040 to 0.041 and 0.031 to 0.883 over 0.6 to 1.4 / um). References:
+    the Fresnel reflectance of the face, and the exact reflectance of the 1-D Yee grid at the face of a half-space
+    (`references.yee_halfspace`, with the discrete eps of the run and the float32 ADE coefficients): a wave that the
+    PML sends back changes R from it. Flux planes 0.5 and 1.5 um deep give the flux in the medium (against
+    (1 - R) exp(-4 pi f Im(n) d)), the ratio of their DFT fields (against the forward wave of the grid; where the
+    second plane has at least 1e-2 of the field of the first) and r_pml, the backward wave over the forward wave at
+    the start of the PML (where it is above the float32 noise and the 2 x 2 fit is not near singular). Max abs
+    errors over the band:
 
-Tests: 68 (39 without FDTD runs: geometry, Prism center, 2-D parities, Harminv, the averaged permittivity against
+    | medium | res | R: Fresnel | R: Yee half-space | grid only | flux in the medium | field ratio | r_pml |
+    |---|---|---|---|---|---|---|---|
+    | Lorentz | 50 | 6.74e-3 | 4.7e-6 | 6.74e-3 | 2.68e-3 | 2.1e-4 | 7.4e-3 |
+    | Lorentz | 100 | 1.69e-3 | 1.6e-5 | 1.68e-3 | 6.47e-4 | 5.0e-4 | 1.8e-2 |
+    | conductive | 50 | 9.46e-4 | 4.0e-7 | 9.46e-4 | 2.68e-3 | 5.6e-6 | 8.4e-6 |
+    | conductive | 100 | 2.34e-4 | 5.2e-7 | 2.33e-4 | 6.64e-4 | 2.1e-6 | 3.2e-6 |
+    | Drude | 50 | 2.20e-3 | 3.8e-4 | 2.22e-3 | 1.96e-3 | 6.1e-3 | 2.2e-2 |
+    | Drude | 100 | 6.47e-4 | 4.4e-4 | 5.56e-4 | 9.06e-4 | 6.7e-3 | 2.7e-2 |
+
+    In the vacuum run of the same cell r_pml is below 2.1e-6 (2.5e-6 with one sheet). Lorentz: R agrees with the Yee
+    half-space to the float32 level of check 11 (below 1 / um: 2.1e-6 and 4.6e-6; the largest values are near the
+    resonance, where the wave dies before the PML). The field ratio and r_pml are not resolved near the resonance (the
+    largest r_pml is at 1.1 / um, where the strong absorption between the planes leaves mostly float32 noise); where the
+    second plane has at least 0.1 of the field of the first, r_pml is below 5.6e-4 (res 50) and 2.3e-3 (res 100), not
+    analyzed further. Conductive: the PML sends back at most 8.4e-6 of the wave, and R agrees with the Yee grid to
+    5.2e-7. The flux in the medium falls at second order for both (orders 2.05 and 2.01). Drude: above its plasma
+    edge (1.0 to 1.4 / um, Re n = 0.16 to 0.70) the PML sends back up to 1.25e-2 (res 50) and 1.38e-2 (res 100) at
+    1.0 / um, falling to 2.4e-5 and 4.8e-5 at 1.38 / um; this is 0.42 to 0.81 (res 50) and 0.78 to 0.90 (res 100)
+    of the round trip 1e-6^Re(n) exp(-4 pi f Im(n) 1 um) of the stretched coordinate (see "Media in the PML"), so
+    the reflection does not fall with the resolution. It changes R by up to 4.4e-4 (at 1.04 to 1.16 / um), and the
+    flux in the medium differs from the continuum by 1.96e-3 and 9.1e-4 (order 1.1, not 2). Below the plasma edge the
+    wave is evanescent (the largest r_pml of the table, at 0.68 / um, comes from that weak wave), and R agrees with
+    the Yee grid to 2.5e-5. With one source sheet (`--pair 0`, Lorentz) R changes by at most 7.3e-6 (res 50) and
+    1.27e-5 (res 100).
+    The test (res 50) requires R against the Yee half-space below 2e-5 (Lorentz), 5e-6 (conductive) and 1e-3
+    (Drude), the flux in the medium below 5e-3, for the conductive medium the field ratio below 2e-5 and r_pml below
+    5e-5, and for the Drude medium r_pml between 0.3 and 1.5 times the round trip above (1.0 to 1.4 / um) and the
+    PML warning of run() (only for the Drude medium). `test_correct_sources_per_cell` checks the correction of
+    check 13 in a face cell (b of the component), with eps_inf 2.25 (b = sigma_D dt / 2 in the bulk) and for a
+    source in vacuum (the same to the last bit), from the build of the run.
+15. **Near-to-far-field transform in a dispersive or conductive medium** (`--case near2far-medium`; 2-D, an Ez line
+    source in a uniform medium that fills the cell and the PML, a square of half width 1 um, 36 points on each of
+    the circles of radius 2 and 4 um about the source, 5 frequencies from 0.4 to 0.6 / um). Media: the Lorentz
+    medium of check 11 (in this band n = 1.687 to 1.741, Im n = 4.2e-3 to 1.05e-2) and the conductive medium of
+    check 12. Reference: the exact line-source fields with the complex index (`references.line_source_fields_2d`);
+    one global phase per frequency for all points, so a wrong k gives a phase error between the two circles. Field
+    error (as in check 9), Lorentz: 1.5e-2, 3.7e-3 and 9.1e-4 at res 20, 40 and 80 (orders 1.95 to 2.09), pattern
+    error 2.8e-2, 6.9e-3, 1.7e-3; the global phase is -omega dt / 2 within 2.0e-2, 5.0e-3 and 1.3e-3 rad.
+    Conductive (Re n = 1.50, Im n = 0.040 to 0.060): 1.3e-2 and 3.2e-3 at res 20 and 40 (orders 2.01 to 2.12), pattern
+    error 2.2e-2, 5.5e-3, phase within 1.4e-2 and 3.5e-3 rad. The same transform with eps_inf (the medium of a
+    lossless, non-dispersive run) has the field error 0.55 to 0.95 (Lorentz) and 0.28 to 0.31 (conductive).
+    Transform of exact fields in a lossy medium (no FDTD, `--case transform
+    --index-imag 0.05`: n = 1.5 + 0.05i, the surfaces of the transform of exact fields in check 9): the error of E at
+    3 um is 9.0e-3, 2.2e-3 and 5.6e-4 for h = 0.1, 0.05 and 0.025 (3-D, Ez dipole; 2.9e-4 to 4.5e-4 at h = 0.025 for
+    the 3-D Ex dipole and the 2-D line sources), and each halving of h divides it by 4.00 to 4.03; inside the
+    surface below 6.3e-4; the JAX and NumPy sums agree to 1e-13. The test
+    (res 20, and res 40 for the Lorentz medium; the exact fields at h = 0.1 and 0.05) requires the field error below
+    3e-2, the pattern error below 5e-2, the phase within 4e-2 rad, the error with eps_inf above 0.2, the order above
+    1.8, `n2f.eps` equal to eps(f), and for the exact fields the error at 3 um below 3e-3 (h = 0.05), the order above
+    1.9 and inside below 2e-3.
+
+Tests: 83 (46 without FDTD runs: geometry, Prism center, 2-D parities, Harminv, the averaged permittivity against
 exact fill fractions and the formula of Kottke et al. (2-D and 3-D, both diagonals), periodic faces, NumPy against
-JAX, the transfer to fdtdx, the near-to-far-field transform of exact fields, the points of get_farfields; the units
-of the susceptibilities against the fdtdx poles, the ADE coefficients of fdtdx against chi_yee, the exact Yee
-reference against the transfer matrix, the roots of eps = 0, the float32 coefficients, the three face rules in a
-face cell, the stability check with the values of each cell, the errors of Medium; 29 FDTD checks, some with more
-than one run).
+JAX, the transfer to fdtdx, the near-to-far-field transform of exact fields (also in a lossy medium, and a negative
+eps with a signed zero), the points of get_farfields; the units of the susceptibilities against the fdtdx poles,
+the ADE coefficients of fdtdx against chi_yee, the exact Yee reference against the transfer matrix, the Yee
+half-space reference, the dipole flux through a sphere and a box, the PML round trip and the rule of its warning,
+the roots of eps = 0, the float32 coefficients, the three face rules in a face cell, the stability check with the
+values of each cell, the errors of Medium; 37 GPU checks, some with more than one run, one with the build only).
 
 ## Tests and bench (on the GPU computer)
 
@@ -601,6 +719,16 @@ bash tools/gpu_run.sh fdtd_gpu $B --case film --kind lorentz --thickness 0.504 -
   --face-rule fill,average,staircase                                                 # check 11, a face in a cell
 for k in drude lorentz conductive; do
   bash tools/gpu_run.sh fdtd_gpu $B --case uniform --kind $k --resolution 20,40; done
+bash tools/gpu_run.sh fdtd_gpu $B --case dipole --sigma-d 0.5 --resolution 10,20,30   # check 13 (second file)
+bash tools/gpu_run.sh fdtd_gpu $B --case dipole --sigma-d 0.5 --resolution 10,20 --no-source-fix
+for k in lorentz conductive drude; do
+  bash tools/gpu_run.sh fdtd_gpu $B --case halfspace --kind $k --resolution 50,100; done   # check 14
+bash tools/gpu_run.sh fdtd_gpu $B --case halfspace --kind lorentz --resolution 50,100 --pair 0   # one source sheet
+bash tools/gpu_run.sh fdtd_gpu $B --case halfspace --kind drude --resolution 50,100 --r-asymptotic 1e-15   # not logged
+bash tools/gpu_run.sh fdtd_gpu $B --case near2far-medium --kind lorentz --resolution 20,40,80   # check 15
+bash tools/gpu_run.sh fdtd_gpu $B --case near2far-medium --kind conductive --resolution 20,40
+bash tools/gpu_run.sh fdtd_gpu $B --case transform --index-imag 0.05
+bash tools/gpu_run.sh fdtd_gpu $B --case uniform --kind conductive --resolution 20,40   # check 12 with check 13
 ```
 
 If the package is not installed in `.venv-rocm`, use `PYTHONPATH=src`. It needs fdtdx 0.6.3 (with tidy3d for its mode

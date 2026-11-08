@@ -13,7 +13,12 @@ and sets the arrays itself after the objects are placed (`material_arrays`). Wit
 the poles and the conductivity of the material of its center (a staircase). With eps_averaging the rule FACE_RULE
 sets them per E component (default "fill": the pole strength times the fill fraction of the voxel, see FACE_RULE).
 The sources were applied with 1 / eps_inf at that time, so a current source adds J to
-dD/dt = curl H - J (fdtdx itself would scale it by 1 / Re eps(f_source) in a dispersive cell).
+dD/dt = curl H - J (fdtdx itself would scale it by 1 / Re eps(f_source) in a dispersive cell). In a conductive cell
+fdtdx adds the source current after the division by 1 + b; `correct_sources` divides the current of each electric
+point source by 1 + b, so that J enters the semi-implicit update as curl H does: the loss term sigma E averaged
+over the two time levels (J. B. Schneider, Understanding the Finite-Difference Time-Domain Method, Sec. 3.12
+"Lossy Material", the reference of the fdtdx code), with J next to curl H in Ampere's law, gives the coefficient
+(dt / eps) / (1 + b) for both.
 """
 
 from __future__ import annotations
@@ -244,3 +249,95 @@ def material_arrays(arrays, config, face: Face):
         sigma = EPS0 * (C0 / UM) * face.sigma                                      # S/m
         arrays = arrays.aset("electric_conductivity", jnp.asarray((sigma * spacing).astype(np.float32), dtype))
     return arrays
+
+
+CORRECT_SOURCES = True       # tests set False to measure the current of fdtdx alone (1 + b too strong)
+
+
+def correct_sources(objects, arrays, config):
+    """The ObjectContainer `objects` with the current of each electric point source (fdtdx PointDipoleSource, also a
+    line or plane current) divided by 1 + b in its cells, b = c sigma eta0 inv_eps / 2 (the expression of the
+    semi-implicit update of fdtdx, `fdtdx.fdtd.update.update_E`, with the same float32 arrays). fdtdx adds the
+    source after the division of E by 1 + b, so without this the current is 1 + b times the current of the
+    semi-implicit form E^(n+1) (1 + b) = E^n (1 - b) + (dt / eps) (curl H - J); for sigma_D: b = sigma_D dt / 2.
+    In a cell without conductivity b = 0, and the source stays the same to the last bit. Without a conductivity
+    array, or with CORRECT_SOURCES False, `objects` is returned unchanged. Mode sources (TFSF) on conductive cells
+    are refused before (Simulation._build)."""
+    if not CORRECT_SOURCES or arrays.electric_conductivity is None:
+        return objects
+    from fdtdx.constants import eta0
+    from fdtdx.core.null import Null
+    from fdtdx.fdtd.container import ObjectContainer
+    from fdtdx.objects.sources.dipole import PointDipoleSource
+
+    out, changed = [], False
+    for obj in objects.object_list:
+        if isinstance(obj, PointDipoleSource) and obj.source_type == "electric" \
+                and not isinstance(obj._inv_eps_oriented, Null):
+            sl = obj.grid_slice
+            b = config.courant_number * arrays.electric_conductivity[:, *sl] * eta0 \
+                * arrays.inv_permittivities[:, *sl] / 2                   # (1 or 3, *source cells)
+            obj = obj.aset("_inv_eps_oriented", obj._inv_eps_oriented / (1 + b))
+            changed = True
+        out.append(obj)
+    return ObjectContainer(object_list=out, volume_idx=objects.volume_idx) if changed else objects
+
+
+ETA0 = 4e-7 * math.pi * C0                  # as fdtdx.constants.eta0 = mu0 c (ohm)
+PML_R_DEFAULT = 1e-6                        # the round trip in vacuum of the PML of fdtdx (its default sigma_end)
+PML_SIGMA_ORDER = 3                         # the grading of its conductivity (the default sigma_order of fdtdx)
+PML_WARN = 1e-3                             # pml_warnings: the round trip above which a medium in the PML warns
+
+
+def pml_round_trip(medium: Medium, freqs, thickness: float, R: float = PML_R_DEFAULT) -> np.ndarray:
+    """The round-trip amplitude of a wave that runs into the PML of fdtdx through `medium` and back, at the
+    frequencies freqs (1/um): R^Re(n) exp(-4 pi f Im(n) thickness), n = sqrt(eps(f)) with Im n >= 0, R the round
+    trip in vacuum. The stretched coordinate multiplies k = 2 pi f n, so the layer gives R^Re(n); the medium adds
+    its own loss over the thickness (um) and back. Normal incidence, continuous layer (check 14: the measured
+    reflection of a Drude half-space is 0.42 to 0.90 of this value)."""
+    f = np.asarray(freqs, float)
+    n = np.sqrt(np.asarray(medium.permittivity(f), complex))
+    return R ** n.real * np.exp(-4 * np.pi * f * n.imag * thickness)
+
+
+def source_band(sources, rel: float = 1e-2, n: int = 401) -> np.ndarray:
+    """The frequencies (1/um, n points per Gaussian source) at which the spectrum of a source is at least `rel` of
+    its peak; the frequency of a ContinuousSource. The spectrum of a GaussianSource has the standard deviation
+    fwidth / (2 pi)."""
+    out = []
+    for s in sources:
+        src = s.src
+        if getattr(src, "fwidth", 0.0) > 0:
+            half = src.fwidth / (2 * math.pi) * math.sqrt(2 * math.log(1 / rel))
+            f = np.linspace(src.frequency - half, src.frequency + half, n)
+            out.append(f[f > 0])
+        else:
+            out.append(np.array([src.frequency]))
+    return np.concatenate(out) if out else np.zeros(0)
+
+
+def pml_warnings(idx: np.ndarray, mats, layers: dict, dx: float, sources) -> list:
+    """Messages for each dispersive or conductive medium in the cells of a PML whose round trip (pml_round_trip, with
+    the R and the thickness of that PML) is above PML_WARN at a frequency of the source band (source_band). idx:
+    the staircase material of each cell; layers: {(axis, side): (PML, cells)}, side 0 the high and 1 the low end."""
+    freqs = source_band(sources)
+    if not len(freqs):
+        return []
+    out = []
+    for (a, side), (pml, cells) in sorted(layers.items(), key=lambda q: q[0]):
+        sl = [slice(None)] * 3
+        sl[a] = slice(idx.shape[a] - cells, None) if side == 0 else slice(0, cells)
+        for k in np.unique(idx[tuple(sl)]):
+            m = mats[k]
+            if not (m.dispersive or m.conductive):
+                continue
+            r = pml_round_trip(m, freqs, cells * dx, pml.R)
+            j = int(np.argmax(r))
+            if r[j] > PML_WARN:
+                n = np.sqrt(complex(m.permittivity(freqs[j])))
+                out.append(f"{m} fills the PML at the {'high' if side == 0 else 'low'} {'xyz'[a]} side: at "
+                           f"f = {freqs[j]:.3g} / um (in the source band) n = {n.real:.3g} + {n.imag:.3g}i, and the "
+                           f"PML sends back about {r[j]:.2g} of a wave that reaches it (R^Re(n) with R = {pml.R:g}, "
+                           f"times the loss of the medium in the PML; README 'Media in the PML'). A thicker PML "
+                           f"changes only the loss part; a smaller PML(R_asymptotic=...) lowers R^Re(n)")
+    return out
