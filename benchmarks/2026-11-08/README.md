@@ -1,0 +1,12 @@
+# Benchmark logs, 2026-11-08
+
+Raw rows, one per run, as printed by the bench scripts and examples on the GPU computer (Radeon RX 7900 XT, gfx1100;
+CPU: Ryzen 7 7800X3D, 16 threads; ROCm 10.1 pip wheels, JAX 0.11.1). Another session shared the computer, so every
+run had `OMP_NUM_THREADS=4 OPENBLAS_NUM_THREADS=4 MKL_NUM_THREADS=4` and `XLA_PYTHON_CLIENT_MEM_FRACTION=0.4`.
+Times can be longer than on a free computer.
+
+| File | Script and command | Claims that cite it |
+|---|---|---|
+| `charge-temperature.jsonl`, `charge-temperature-tables.md` | `charge_gpu/examples/temperature_dependence.py --modes` (24 JSON rows, and the tables that the example prints; 00:48 to 00:49 EST) | charge README: the example at 300, 330 and 360 K |
+| `suite-switching.jsonl` | `suite/bench/phase_switching.py --scale-check`, then `--models constant --switches on --thermal-step 0.02` (9 rows; 00:51 to 00:53 EST) | suite README: the switching times, the scale check and the 20 nm grid |
+| `fdtd-gpu-near2far.jsonl` | `fdtd_gpu/bench/bench_fdtd.py` (`env PYTHONPATH=src`), in this order: `--case transform`; `--case near2far --resolution 10,20,30,40`; `--case near2far --resolution 20 --component Ex`; the same with `--index 1.5` (no `--component`); `--case near2far2d --resolution 20,40,80`; the same with `--component Ex`; `--case near2far2d --resolution 20 --index 1.5` (25 rows; 01:09 to 01:12 EST) | fdtd_gpu README: the checks of the near-to-far transform |

@@ -94,3 +94,10 @@ line, then delete it yourself or reject it.
 | 2026-11-08 | GPU computer | `/tmp/rv6_fuzz.py` | a scratch script of a reviewer (tests and checks) | not needed: no result depends on it |
 | 2026-11-08 | GPU computer | `/tmp/rv6_auto.py` | a scratch script of a reviewer (tests and checks) | not needed: no result depends on it |
 | 2026-11-08 | GPU computer | `/tmp/rv6_ties.py` | a scratch script of a reviewer (tests and checks) | not needed: no result depends on it |
+| 2026-11-08 | GPU computer | `/tmp/rvw8_old/ (a folder: old sources)` | scratch files of a reviewer (tests and checks) | not needed: no result depends on them |
+| 2026-11-08 | GPU computer | `/tmp/rvw8_bits.py` | scratch files of a reviewer (tests and checks) | not needed: no result depends on them |
+| 2026-11-08 | GPU computer | `/tmp/rvw8_old.json` | scratch files of a reviewer (tests and checks) | not needed: no result depends on them |
+| 2026-11-08 | GPU computer | `/tmp/rvw8_new.json` | scratch files of a reviewer (tests and checks) | not needed: no result depends on them |
+| 2026-11-08 | GPU computer | `/tmp/rvw8_stress.py` | scratch files of a reviewer (tests and checks) | not needed: no result depends on them |
+| 2026-11-08 | GPU computer | `/tmp/rv_sw_checks.py` | a scratch script of a reviewer (tests and checks) | not needed: no result depends on it |
+| 2026-11-08 | GPU computer | `/tmp/rv_n2f_a2cc.py` | a scratch script of a reviewer (tests and checks) | not needed: no result depends on it |
