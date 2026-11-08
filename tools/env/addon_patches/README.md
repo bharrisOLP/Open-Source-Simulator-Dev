@@ -56,7 +56,33 @@ The patches:
    cases after a run, bulk read against per-point read (0 differing words; `addon_gpu/README.md`). The self-check of
    the bulk read stays active: a disagreement restarts the read one point at a time, with a warning.
 
-**Rule 2 of the add-on (certification ledgers).** The three files are pinned by the certification ledgers of the add-on,
+4. `0004-hip-nan-subtrahend-deposit.patch` (`meep_gpu/host_writes.py`, `meep_gpu/sources.py`). The source deposit
+   forms `real(A) = amp_re * c_re - amp_im * c_im` in float64 (`sources._deposit`), and its door
+   (`host_writes._rounded_difference`) widens each stored float32 word to float64, subtracts `real(A)` once and
+   rounds once: on the host with NumPy, on the GPU with CuPy. IEEE 754 leaves the sign of a NaN result open, and the
+   AMD GPU forms `a - b` as `a + (-b)`: a NaN `b` comes back with its sign bit inverted, where NumPy on the x86 host
+   returns `b` itself (`addon_gpu/nan_words_probe.py`, `benchmarks/2026-11-08/addon-nan-probe.out`: `1.5 - b` for
+   four NaN words of both signs; `+`, `*`, `b - 1.5`, the casts and `inf * 0` give equal words). So both
+   subtractions of the deposit can store a NaN word of the other sign. Without the patch, the amplitude `inf + 0j`
+   (the non-finite table of `meep_gpu/test_source_deposit.py`) stored `0x7fc00000` on the GPU and `0xffc00000` on
+   the host: 400 differing words in 76 of 84 cases, all NaN words (`addon-nan-probe.out`). With the first form of
+   this patch (the door only): `inf + 0j` 0 words, `1 + inf j` 280 words in 70 of 84 cases, `1 + nan j` 336 words in
+   84 of 84 cases (`benchmarks/2026-11-08/addon-nan-probe-0004v1.out`; the review of the change found these counts).
+   With this patch: 0 words in all three tables (`benchmarks/2026-11-08/addon-nan-probe-0004m.out`).
+
+   On a ROCm build of CuPy, `host_writes._subtract_once` subtracts with one elementwise kernel that takes a NaN
+   operand as it is, in the host's order (a NaN minuend first, then a NaN subtrahend), and forms every other word by
+   the one subtraction. The door uses it, and `sources._deposit` uses it for `real(A)` through
+   `host_writes.nan_ordered_subtract`. A subtrahend array of another dtype is widened to float64 first, as the
+   in-place subtraction does. A signalling NaN comes back as it is (x86 sets its quiet bit); the rounding to float32
+   in the door quiets it on both sides. Every other build, and a minuend that is not a float64 array, keeps the
+   in-place subtraction. The patch changes only the source deposit: the other subtractions on the GPU (the array
+   path, the kernels, the `D - P` update of `deposit_repair.py` at its repair cells) keep the NaN sign of the GPU,
+   and no test of the add-on compares NaN words there. `addon_gpu/tests/test_patches.py` checks the door on 81 pairs
+   of a stored word and a subtrahend, a float32 and an int64 subtrahend, and the whole deposit on the 84 cases for
+   each of the three amplitude tables; a control shows the sign inversion of the plain device subtraction.
+
+**Rule 2 of the add-on (certification ledgers).** The five files are pinned by the certification ledgers of the add-on,
 so the patches put entries of those ledgers in drift. On the AMD GPU no identity is certified in any case: the
 kernels run only with `MEEP_GPU_HARDWARE=any`, and each run reports `certified: False`. `addon_gpu/README.md` gives
 the checks that replace the certification on this GPU, and the drift counts of the three weld contracts of the

@@ -1,0 +1,26 @@
+1.5 - b            +qnan           host 7ff8000000000000 device fff8000000000000 DIFFERENT
+1.5 + b            +qnan           host 7ff8000000000000 device 7ff8000000000000 equal
+1.5 * b            +qnan           host 7ff8000000000000 device 7ff8000000000000 equal
+b - 1.5            +qnan           host 7ff8000000000000 device 7ff8000000000000 equal
+float32(1.5 - b)   +qnan           host 7fc00000 device ffc00000 DIFFERENT
+float32(b)         +qnan           host 7fc00000 device 7fc00000 equal
+1.5 - b            -qnan           host fff8000000000000 device 7ff8000000000000 DIFFERENT
+1.5 + b            -qnan           host fff8000000000000 device fff8000000000000 equal
+1.5 * b            -qnan           host fff8000000000000 device fff8000000000000 equal
+b - 1.5            -qnan           host fff8000000000000 device fff8000000000000 equal
+float32(1.5 - b)   -qnan           host ffc00000 device 7fc00000 DIFFERENT
+float32(b)         -qnan           host ffc00000 device ffc00000 equal
+1.5 - b            +qnan payload   host 7ff8000000000123 device fff8000000000123 DIFFERENT
+1.5 + b            +qnan payload   host 7ff8000000000123 device 7ff8000000000123 equal
+1.5 * b            +qnan payload   host 7ff8000000000123 device 7ff8000000000123 equal
+b - 1.5            +qnan payload   host 7ff8000000000123 device 7ff8000000000123 equal
+float32(1.5 - b)   +qnan payload   host 7fc00000 device ffc00000 DIFFERENT
+float32(b)         +qnan payload   host 7fc00000 device 7fc00000 equal
+1.5 - b            -qnan payload   host fff8000000000123 device 7ff8000000000123 DIFFERENT
+1.5 + b            -qnan payload   host fff8000000000123 device fff8000000000123 equal
+1.5 * b            -qnan payload   host fff8000000000123 device fff8000000000123 equal
+b - 1.5            -qnan payload   host fff8000000000123 device fff8000000000123 equal
+float32(1.5 - b)   -qnan payload   host ffc00000 device 7fc00000 DIFFERENT
+float32(b)         -qnan payload   host ffc00000 device ffc00000 equal
+inf * 0            inf, 0          host fff8000000000000 device fff8000000000000 equal
+NAN_JSON {"device": "AMD Radeon RX 7900 XT", "deposit": {"inf + 0j": {"cases": 84, "cases_differ": 0, "words_differ": 0, "differ_all_nan": true}, "1 + inf j": {"cases": 84, "cases_differ": 0, "words_differ": 0, "differ_all_nan": true}, "1 + nan j": {"cases": 84, "cases_differ": 0, "words_differ": 0, "differ_all_nan": true}}}

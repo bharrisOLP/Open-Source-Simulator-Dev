@@ -14,7 +14,8 @@ PATCHES = sorted((REPO / "tools" / "env" / "addon_patches").glob("*.patch"))
 
 def test_there_are_patches_and_a_licence():
     assert [p.name for p in PATCHES] == ["0001-hiprtc-compile-options.patch", "0002-hip-keep-subnormals.patch",
-                                         "0003-bulk-chi1inv-read-double.patch"]
+                                         "0003-bulk-chi1inv-read-double.patch",
+                                         "0004-hip-nan-subtrahend-deposit.patch"]
     assert (REPO / "tools" / "env" / "addon_patches" / "LICENSE").read_text().startswith(
         (PINNED_CLONE / "LICENSE").read_text()[:200])
 
@@ -121,3 +122,108 @@ def test_triton_does_not_flush_under_a_requested_flush():
     rec = run_script(["triton_subnormal_probe.py", "--policy", "flush"], timeout=600)
     assert rec["policy_stamp"]["resolved"] == "flush"
     assert [row["verdict"] for row in rec["rows"]] == ["keep"] * 6, rec["rows"]
+
+
+# Patch 0004: the stored float32 words and the float64 subtrahends of the deposit door, as bit patterns. Normals,
+# both zeros, both infinities, quiet NaN words of both signs and one with a payload. No subnormal stored word: this
+# process installs no subnormal policy, so a ROCm CuPy flushes it (patch 0002 and its tests are about that).
+_STORED_WORDS = (0x3FC00000, 0xC0100000, 0x00000000, 0x80000000, 0x7F800000, 0xFF800000, 0x7FC00000, 0xFFC00000,
+                 0x7FC00123)
+_SUBTRAHEND_WORDS = (0x3FF0000000000000, 0x8000000000000000, 0x0000000000000000, 0x7FF8000000000000,
+                     0xFFF8000000000000, 0x7FF8000000000123, 0x7FF0000000000000, 0xFFF0000000000000,
+                     0x3E45798EE2308C3A)
+
+
+def _door_operands():
+    import numpy as np
+
+    stored = np.array(_STORED_WORDS, dtype=np.uint32).view(np.float32)
+    subtrahends = np.array(_SUBTRAHEND_WORDS, dtype=np.uint64).view(np.float64)
+    return np.repeat(stored, subtrahends.size), np.tile(subtrahends, stored.size)
+
+
+def test_the_deposit_door_stores_the_host_words_on_the_amd_gpu():
+    """Patch 0004: ``host_writes._rounded_difference`` on the GPU equals NumPy on the host word for word, for every
+    pair of a stored word and a subtrahend (81 pairs, real and complex storage), NaN operands included."""
+    import cupy
+    import numpy as np
+
+    from meep_gpu import host_writes
+
+    stored, subtrahends = _door_operands()
+    with np.errstate(all="ignore"):
+        host = host_writes._rounded_difference(stored.copy(), subtrahends, None)  # noqa: SLF001
+    door = host_writes._rounded_difference  # noqa: SLF001
+    device = cupy.asnumpy(door(cupy.asarray(stored), cupy.asarray(subtrahends), None))
+    np.testing.assert_array_equal(device.view(np.uint32), host.view(np.uint32))
+
+    # complex storage: the real words against real(A), the imaginary words (the stored words reversed) against imag(A)
+    parts = np.stack([stored, stored[::-1]], axis=1).copy()
+    pairs = parts.reshape(-1).view(np.complex64)
+    with np.errstate(all="ignore"):
+        host_c = host_writes._rounded_difference(pairs.copy(), subtrahends, subtrahends[::-1].copy())  # noqa: SLF001
+    device_c = cupy.asnumpy(host_writes._rounded_difference(  # noqa: SLF001
+        cupy.asarray(pairs), cupy.asarray(subtrahends), cupy.asarray(subtrahends[::-1].copy())))
+    np.testing.assert_array_equal(device_c.view(np.uint32), host_c.view(np.uint32))
+
+
+def test_without_the_patch_the_gpu_inverts_the_sign_of_a_nan_subtrahend():
+    """The control of patch 0004: the plain device subtraction, widened and rounded as the door does it, differs from
+    the host only where the subtrahend is a NaN and the stored word is not, and there only in the sign bit."""
+    import cupy
+    import numpy as np
+
+    stored, subtrahends = _door_operands()
+    with np.errstate(all="ignore"):
+        host = (stored.astype(np.float64) - subtrahends).astype(np.float32).view(np.uint32)
+    device = cupy.asnumpy((cupy.asarray(stored).astype(cupy.float64) - cupy.asarray(subtrahends))
+                          .astype(cupy.float32)).view(np.uint32)
+    differ = host != device
+    assert np.array_equal(differ, np.isnan(subtrahends) & ~np.isnan(stored)), np.flatnonzero(differ)
+    assert np.all((host ^ device)[differ] == 0x80000000)
+
+
+@pytest.mark.parametrize("amplitude", [complex(float("inf"), 0.0), complex(1.0, float("inf")),
+                                       complex(1.0, float("nan"))], ids=["inf+0j", "1+inf_j", "1+nan_j"])
+def test_the_source_deposit_stores_the_host_words_for_non_finite_amplitudes(amplitude):
+    """Patch 0004, the whole deposit: ``sources._deposit`` on the GPU stores the host's words in every case of the
+    add-on test (each field configuration, Ez and Hz, each current). ``1 + inf j`` and ``1 + nan j`` reach the
+    subtraction that forms ``real(A)`` (``amp_re * c_re - amp_im * c_im``) with a NaN subtrahend, before the door."""
+    import cupy
+    import numpy as np
+
+    from meep_gpu import sources as src
+    from meep_gpu import test_source_deposit as t
+
+    cases = differ = nan_words = 0
+    for configuration in sorted(t.FIELD_CONFIGURATIONS):
+        for component in ("Ez", "Hz"):
+            for current in t.FIELD_CURRENTS.values():
+                got, _, _ = t._device_deposit_words(cupy, src._deposit, configuration, component,  # noqa: SLF001
+                                                    [amplitude], current, t._NORMAL_PLANTS)
+                with np.errstate(all="ignore"):
+                    host, _, _ = t._field_deposit_words(src._deposit, configuration, component,  # noqa: SLF001
+                                                        [amplitude], current, t._NORMAL_PLANTS)
+                cases += 1
+                differ += int(np.count_nonzero(host != got))
+                nan_words += int(np.count_nonzero(np.isnan(host.view(np.float32))))
+    assert cases == 84
+    assert nan_words > 0, "the table must store NaN words, or it does not test the NaN order"
+    assert differ == 0, f"{differ} words differ from the host"
+
+
+@pytest.mark.parametrize("dtype", ["float32", "int64"])
+def test_the_door_widens_a_subtrahend_of_another_dtype_on_the_amd_gpu(dtype):
+    """Patch 0004: the kernel takes float64 operands, so the door widens a float32 or int64 subtrahend first, as the
+    in-place subtraction of the other builds does; the words equal the host's."""
+    import cupy
+    import numpy as np
+
+    from meep_gpu import host_writes
+
+    stored = np.array([1.5, -2.25, 0.0, -0.0, 3.0e5, 7.0], dtype=np.float32)
+    subtrahends = np.array([1, -3, 0, 2, 70000, -1], dtype=dtype)
+    door = host_writes._rounded_difference  # noqa: SLF001
+    host = door(stored.copy(), subtrahends, None)
+    device = cupy.asnumpy(door(cupy.asarray(stored), cupy.asarray(subtrahends), None))
+    np.testing.assert_array_equal(device.view(np.uint32), host.view(np.uint32))

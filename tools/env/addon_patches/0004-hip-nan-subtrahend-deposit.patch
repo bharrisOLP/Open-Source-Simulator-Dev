@@ -1,0 +1,86 @@
+diff --git a/meep_gpu/host_writes.py b/meep_gpu/host_writes.py
+index e4a6add..1eb2bb2 100644
+--- a/meep_gpu/host_writes.py
++++ b/meep_gpu/host_writes.py
+@@ -196,7 +196,7 @@ def _rounded_difference(current: Any, real64: Any, imag64: Any) -> Any:
+         if imag64 is not None:
+             raise ValueError("real float32 storage has no imaginary plane to subtract imag(A) from")
+         wide = current.astype(xp.float64)
+-        wide -= real64
++        wide = _subtract_once(xp, wide, real64)
+         return wide.astype(xp.float32)
+     if current.dtype == xp.complex64:
+         if imag64 is None:
+@@ -204,8 +204,8 @@ def _rounded_difference(current: Any, real64: Any, imag64: Any) -> Any:
+         parts = xp.ascontiguousarray(current).view(xp.float32).reshape(-1, 2)
+         wide_re = parts[:, 0].astype(xp.float64)
+         wide_im = parts[:, 1].astype(xp.float64)
+-        wide_re -= real64
+-        wide_im -= imag64
++        wide_re = _subtract_once(xp, wide_re, real64)
++        wide_im = _subtract_once(xp, wide_im, imag64)
+         out = xp.empty(parts.shape, dtype=xp.float32)
+         out[:, 0] = wide_re.astype(xp.float32)
+         out[:, 1] = wide_im.astype(xp.float32)
+@@ -213,6 +213,48 @@ def _rounded_difference(current: Any, real64: Any, imag64: Any) -> Any:
+     raise ValueError(f"the source deposit writes float32 or complex64 storage, not {current.dtype}")
+ 
+ 
++#: The ROCm subtraction of :func:`_subtract_once`, one elementwise kernel, built at its first use.
++_HIP_NAN_ORDERED_SUBTRACT: Any = None
++
++
++def nan_ordered_subtract(minuend: Any, subtrahend: Any) -> Any:
++    """``minuend -= subtrahend`` in place for the source deposit, with the NaN word of the host's subtraction.
++
++    ``sources._deposit`` forms ``real(A) = amp_re * c_re - amp_im * c_im`` before the door, on the device when the
++    fields are on the device; this is that subtraction (:func:`_subtract_once`). Returns the result, which is
++    ``minuend`` itself for an array.
++    """
++    return _subtract_once(index_module(minuend), minuend, subtrahend)
++
++
++def _subtract_once(xp: Any, wide: Any, subtrahend: Any) -> Any:
++    """``wide - subtrahend`` in float64, in place, one rounding, with the NaN word of the host's subtraction.
++
++    IEEE 754 leaves the sign of a NaN result open. On a ROCm build of CuPy the GPU forms ``a - b`` as
++    ``a + (-b)``, so a NaN ``b`` comes back with its sign bit inverted (measured on an AMD Radeon RX 7900 XT,
++    gfx1100: ``1.5 - b`` for four NaN words of both signs); NumPy on an x86 host returns ``b`` itself. A deposit
++    of a NaN ``real(A)`` (an infinite amplitude and a zero current) therefore stored ``0x7fc00000`` on that GPU
++    and ``0xffc00000`` on the host. On a ROCm build one elementwise kernel takes a NaN operand as it is, in the
++    host's order (a NaN ``wide`` first, then a NaN ``subtrahend``) and forms every other word by the one
++    subtraction, so the deposit launches as many kernels as before. A subtrahend array of another dtype is widened
++    to float64 first, as the in-place subtraction widens it. A signalling NaN comes back as it is, where x86 sets
++    its quiet bit; the rounding to float32 in the door quiets it on both sides. Every other build, and a
++    ``wide`` that is not a float64 array, keeps the in-place subtraction unchanged.
++    """
++    global _HIP_NAN_ORDERED_SUBTRACT
++    runtime = getattr(getattr(xp, "cuda", None), "runtime", None)
++    if not getattr(runtime, "is_hip", False) or getattr(wide, "dtype", None) != xp.float64:
++        wide -= subtrahend
++        return wide
++    if getattr(subtrahend, "dtype", xp.float64) != xp.float64:
++        subtrahend = subtrahend.astype(xp.float64, copy=False)
++    if _HIP_NAN_ORDERED_SUBTRACT is None:
++        _HIP_NAN_ORDERED_SUBTRACT = xp.ElementwiseKernel(
++            "float64 a, float64 b", "float64 out", "out = isnan(a) ? a : (isnan(b) ? b : a - b)",
++            "meep_gpu_hip_nan_ordered_subtract")
++    return _HIP_NAN_ORDERED_SUBTRACT(wide, subtrahend, wide)
++
++
+ def index_module(index: Any) -> Any:
+     """The array module that owns an index array: cupy for a device array, numpy otherwise.
+ 
+diff --git a/meep_gpu/sources.py b/meep_gpu/sources.py
+index 1f5116d..5b8570a 100644
+--- a/meep_gpu/sources.py
++++ b/meep_gpu/sources.py
+@@ -1457,7 +1457,7 @@ def _deposit(array: Any, ix: Any, iy: Any, iz: Any, amps: Any, factor: complex,
+         return
+     amp_re, amp_im = amps.real, amps.imag
+     real_part = amp_re * c_re
+-    real_part -= amp_im * c_im
++    real_part = host_writes.nan_ordered_subtract(real_part, amp_im * c_im)
+     if dt is not None:
+         real_part *= float(dt)
+     scale = None

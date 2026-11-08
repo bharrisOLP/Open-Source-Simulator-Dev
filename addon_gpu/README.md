@@ -7,15 +7,17 @@ simulation, and the add-on time-steps it on the GPU in float32. The add-on suppo
 kernels or hand-written CUDA kernels) and Apple GPUs (Metal). This folder adds the AMD GPU: CuPy for ROCm (hipRTC
 compiles the hand-written kernels) and the AMD backend of Triton.
 
-**Status (2026-11-07): version 0.1 works.** Both kernel tables of the add-on run on the AMD GPU, with three small
-patches (`tools/env/addon_patches/`). On three cases the kernels give the same float32 words as the array path of
+**Status (2026-11-08): version 0.1 works.** Both kernel tables of the add-on run on the AMD GPU, with four small
+patches (`tools/env/addon_patches/`). All 409 test modules of the add-on ran on this GPU, one at a time: with the
+four patches 379 are clean, and each failure of the other 30 is sorted ("The whole test suite of the add-on"); none
+needs a change of a kernel. On three cases the kernels give the same float32 words as the array path of
 the add-on, and they agree with the CPU solver to 8.3e-6 or better (relative L2). On a 3-D case of 2,097,152 cells
 the time loop is 16 times (Triton) to 27 times (hand-written kernels) as fast as the serial CPU solver (float32 on
 the GPU, float64 on the CPU). Patch 0003 lets the lift read the permittivity in bulk on this solver build, so a whole
 run (setup and time loop) is now faster on the GPU route in both bench cases: 2.19 to 2.34 times in 2-D (1,536,000
 cells, 2,400 steps) and 3.12 to 3.37 times in 3-D (2,097,152 cells, 1,280 steps), with the kernel tables. Before
 patch 0003 the setup dominated, and the whole 2-D run was 3.4 to 3.7 times slower than on the CPU solver. Small runs
-are still slower on the GPU ("Timings").
+are still slower on the GPU ("Timings"; measured with patches 0001 to 0003).
 
 ## What runs on the AMD GPU
 
@@ -105,8 +107,9 @@ for bit; "relative" is the relative L2 difference.
     bench case, 2,400 steps; fluxes equal), 0 of 2,097,152 (3-D bench case, 320 steps; flux equal), and 0 on the slab
     and the sphere of `tests/test_parity.py`.
 
-The tests of this folder: 23 of 23 pass (`tests/test_patches.py`, `tests/test_parity.py`; 78 s, 2026-11-07, on
-the pinned clone after `tools/env/addon_gpu.sh` applied the three patches, without `ADDON_GPU_CLONE`).
+The tests of this folder: 41 of 41 pass (`tests/test_patches.py`, `tests/test_parity.py`,
+`tests/test_suite_runner.py`; 78 s, 2026-11-08, on the pinned clone with the four patches, without
+`ADDON_GPU_CLONE`).
 
 The test modules of the add-on, run one at a time (2026-11-07, pinned clone, then the work copy with both patches):
 
@@ -123,15 +126,124 @@ The weld contracts are rule 2 of the add-on: they count the entries of the certi
 digests no longer match the files. The 5 Triton failures of the pinned clone are in the list of the add-on of
 tests that wait for a certification (`tools/ci/pending_certification.txt`). The patches move the counts: Metal 0 to
 7 of 410 pinned paths, Triton raw digests 60 to 91 of 577, Triton code digests 8 to 37 of 432, Triton device digests
-1 to 1 of 80, CUDA no change. With patch 0003 too, the counts are the same (2026-11-07). On the AMD GPU this
+1 to 1 of 80, CUDA no change. With patch 0003 too, the counts are the same (2026-11-07). With patch 0004 too:
+Metal 9 of 410 paths and 9 of 318 code digests, Triton raw digests 96 of 577, code digests 38 of 432, device digests 1
+of 80, CUDA no change (2026-11-08; "The whole test suite of the add-on"). On the AMD GPU this
 changes no dispatch decision (no AMD identity is certified, and
 the kernels dispatched with both patches on every case). On an Apple or NVIDIA host the patched files would put
 those certified entries in drift; the patches are for the AMD route only.
 
-The rest of the suite of the add-on has not run on this GPU: its pytest paths (`testpaths` in its
-`pyproject.toml`: `meep_gpu` and `parity/meep_gpu`) hold 409 test modules (`test_*.py`: 225 in `meep_gpu/`, 66 in
-`meep_gpu/cuda_kernels/`, 113 in `parity/meep_gpu/`, 5 in `parity/meep_gpu/rounds/1.0/`), and the 6 above are the
-only ones that ran.
+### The whole test suite of the add-on (2026-11-08)
+
+The pytest paths of the add-on (`testpaths` in its `pyproject.toml`: `meep_gpu` and `parity/meep_gpu`) hold 409
+test modules (`test_*.py`: 225 in `meep_gpu/`, 66 in `meep_gpu/cuda_kernels/`, 113 in `parity/meep_gpu/`, 5 in
+`parity/meep_gpu/rounds/1.0/`; `tests/test_suite_runner.py` checks the count). `suite_runner.py` runs them one at a
+time on the pinned clone, with `MEEP_GPU_HARDWARE=any` (the kernel tables of the add-on admit this GPU, uncertified)
+and a time limit of 300 s for each module. It sorts the modules into three tiers, in this order: `host` (148
+modules that do not name CuPy, Triton, PyTorch or kernel dispatch), `gpu` (234 modules that do) and `certification`
+(27 modules: the ledger, weld and record contracts of the add-on, and the modules with a test in its
+`tools/ci/pending_certification.txt`). All 409 modules ran twice, one row per module in each file:
+
+- `benchmarks/2026-11-08/addon-suite-any.jsonl` (run `any-2026-11-08`), patches 0001 to 0003. The rows started
+  between 02:54:28 and 08:00:36 EST, with no row between 03:35:49 and 07:58:39 (a pause for another session). The
+  rows do not record the CuPy settings. `CUPY_CACHE_DIR` was `.local/cupy-cache` for every row (it is set by
+  `tools/env/addon_gpu_activate.sh`, which `tools/gpu_run.sh` sources). The 33 rows from 07:58:39 on ran from the
+  script `.local/addon-runs/suite/final-2026-11-08.sh` on the GPU computer, which exports
+  `CUPY_GPU_MEMORY_LIMIT=8589934592`; for the earlier rows the memory limit is not logged.
+- `benchmarks/2026-11-08/addon-suite-any-0004m.jsonl` (run `any-0004m-2026-11-08`), the four patches. The rows
+  started between 09:05:53 and 09:29:32 EST, and each row records `CUPY_GPU_MEMORY_LIMIT=8589934592` and
+  `CUPY_CACHE_DIR=.local/cupy-cache`.
+
+The computer had no problem: in each file the uptime of the rows never decreases (32,048 s to 50,416 s, and
+54,333 s to 55,752 s), and no module reached the time limit. The counts of the rows:
+
+| Patches | Tier | Modules | Clean | Not clean | Passed | Failed | Skipped | Errors |
+|---|---|---|---|---|---|---|---|---|
+| 0001 to 0003 | `host` | 148 | 148 | 0 | 4,479 | 0 | 268 | 0 |
+| 0001 to 0003 | `gpu` | 234 | 227 | 7 | 11,081 | 232 | 817 | 97 |
+| 0001 to 0003 | `certification` | 27 | 4 | 23 | 2,269 | 41 | 28 | 0 |
+| 0001 to 0003 | all | 409 | 379 | 30 | 17,829 | 273 | 1,113 | 97 |
+| four | `host` | 148 | 147 | 1 | 4,478 | 1 | 268 | 0 |
+| four | `gpu` | 234 | 228 | 6 | 11,082 | 231 | 817 | 97 |
+| four | `certification` | 27 | 4 | 23 | 2,269 | 41 | 28 | 0 |
+| four | all | 409 | 379 | 30 | 17,829 | 273 | 1,113 | 97 |
+
+407 of the 409 modules give the same counts and exit code in both files. Patch 0004 makes
+`meep_gpu/test_source_deposit.py` pass (68 passed and 1 failed, now 69 passed), and it puts one weld of
+`meep_gpu/test_triton_cylindrical_composition.py` in drift (6 passed, now 5 passed and 1 failed: "sources.py drifted
+from the bytes this gate executed").
+
+A module is clean when no test failed and no test had an error. Three Metal modules skip at module level by the
+declared resource `mps_device` of the add-on (no Apple GPU), so pytest ran no test and exited with code 5; they
+count as clean. The counts come from the JUnit file of each module, one outcome for each test case; pytest's own
+summary can count one more error where a test also has an error in its teardown (`suite_runner.py`). Whether a
+module is clean does not change.
+
+The failures with the four patches (`addon-suite-any-0004m.jsonl`), sorted (the numbers refer to the notes below):
+
+| Class | Module | Failed | Errors |
+|---|---|---|---|
+| 1. Certification records, listed by the add-on | 22 modules of the `certification` tier | 33 | 0 |
+| 2. Certification records, patch 0002 | `meep_gpu/test_metal_weld_contract.py` | 4 | 0 |
+| 2. Certification records, patch 0002 | `meep_gpu/test_dispatch_contract.py` | 1 | 0 |
+| 2. Certification records, patch 0002 | `meep_gpu/test_triton_complex_conductive_fused_pair.py` | 1 | 0 |
+| 3. Certification records, patch 0004 | `meep_gpu/test_triton_cylindrical_composition.py` | 1 | 0 |
+| 4. Environment: the solver version | `meep_gpu/test_from_meep.py` | 228 | 0 |
+| 5. Environment: the CuPy cache folder | `meep_gpu/test_triton_complex_no_pml_curl.py` | 0 | 83 |
+| 5. Environment: the CuPy cache folder | `meep_gpu/test_triton_complex_offdiag_update_e.py` | 0 | 14 |
+| 6. Environment: `MEEP_GPU_HARDWARE=any` | `meep_gpu/test_dispatch_contract.py` | 2 | 0 |
+| 7. AMD route: Triton 3.8 | `meep_gpu/test_triton_complex_no_pml_conductive.py` | 1 | 0 |
+| 7. AMD route: Triton 3.8 | `meep_gpu/test_triton_kernels.py` | 1 | 0 |
+| 8. Defect of an add-on test: the order | `meep_gpu/test_dispatch_chunk_division.py` | 1 | 0 |
+| 9. AMD GPU: the NaN sign (fixed by patch 0004) | `meep_gpu/test_source_deposit.py` | 0 | 0 |
+
+By class: certification records 40 failed tests (expected); environment 230 failed and 97 errors; AMD route 2
+failed; a defect of a test 1 failed. With patches 0001 to 0003 (`addon-suite-any.jsonl`) class 3 has no failure and
+class 9 has 1.
+
+1. Each failing test is in `tools/ci/pending_certification.txt` of the add-on.
+2. The welds and the dispatch records pin `meep_gpu/subnormal_policy.py`, which patch 0002 changes. The weld of the
+   conductive fused pair records the sha256 `1b1e772c...` of the unpatched file.
+3. The entry `cylindrical_composition_gate` pins `meep_gpu/sources.py`, which patch 0004 changes.
+4. Its case table builds a medium with `D_conductivity_offdiag`, which the solver of this environment (1.35.0)
+   refuses (`NotImplementedError` in its `geom.py`); the table is built for every case. The identity reference of the
+   add-on is 1.33.0.
+5. A module fixture installs `keep` by hand. The add-on then asks for a `CUPY_CACHE_DIR` whose path carries
+   `ftz_stripped` (its `docs/guides/kernel-dispatch.md`), and `tools/env/addon_gpu_activate.sh` sets
+   `.local/cupy-cache`. With `suite_runner.py --cupy-cache-dir <a folder named ...ftz_stripped>` both modules pass
+   (83 and 14 passed, patches 0001 to 0003; `benchmarks/2026-11-08/addon-suite-keepcache.jsonl`).
+6. The two tests expect the refusal of an uncertified Triton version and of an unsupported device; the switch of
+   this run admits both. Without the switch both pass (`benchmarks/2026-11-08/addon-suite-default.jsonl`, 08:16 EST,
+   patches 0001 to 0003 and the first form of patch 0004: 204 passed; the 2 failures are those of notes 1 and 2).
+7. The add-on supports Triton 3.1; the ROCm wheels bring 3.8. One test checks the version ("Triton 3.8.0 is outside
+   the validated set ['3.1.0']"). The other blocks every import of `triton` and imports a kernel module again; that
+   module takes the real Triton from a sibling module, and `@triton.jit` of Triton 3.8 imports
+   `triton.language.core` at that time (`_normalize_ty`), which the block refuses.
+8. The test replaces `triton` with a double without `jit` and plans with the real composers; a kernel module that
+   is imported for the first time under the double fails, and the planner refuses. The same failure occurs without
+   `MEEP_GPU_HARDWARE=any` (`addon-suite-default.jsonl`, 03:28 EST, patches 0001 to 0003). With
+   `preimport_triton_kernels.py` the module passed in a development run (not logged; the command is in the docstring
+   of that file). It is not specific to this GPU.
+9. On this GPU `a - b` with a NaN `b` gives `b` with its sign bit inverted, where NumPy on the x86 host gives `b`
+   (`nan_words_probe.py`, `benchmarks/2026-11-08/addon-nan-probe.out`: 4 NaN words of both signs; `+`, `*`,
+   `b - 1.5`, the casts and `inf * 0` give equal words). The source deposit subtracts twice: `real(A)` is formed
+   as `amp_re * c_re - amp_im * c_im`, and the door subtracts `real(A)` from the stored word. With patches 0001 to
+   0003 the amplitude `inf + 0j` of the add-on test stored `0x7fc00000` on the GPU and `0xffc00000` on the host:
+   400 words in 76 of 84 cases, all NaN (`addon-nan-probe.out`). The first form of patch 0004 (the door only) left
+   `1 + inf j` at 280 words in 70 of 84 cases and `1 + nan j` at 336 words in 84 of 84 cases
+   (`addon-nan-probe-0004v1.out`; the review of the change found these counts). The four patches: 0 words in all
+   three tables (`addon-nan-probe-0004m.out`), and 69 of 69 tests of the module pass.
+
+No failure needs a change of a kernel. Of the failures that are specific to the AMD route, two come from Triton 3.8
+(the only Triton of the ROCm wheels), and one from the NaN sign of the GPU, which patch 0004 fixes in the source
+deposit (`tools/env/addon_patches/README.md`). The drift counts of rule 2 (the failure messages of the three weld
+contracts): with patches 0001 to 0003, Metal 7 of 410 pinned paths and 7 of 318 code digests, Triton raw digests 91
+of 577, code digests 37 of 432 and device digests 1 of 80, CUDA none (`addon-suite-any.jsonl`); with the four
+patches, Metal 9 of 410 and 9 of 318, Triton 96 of 577, 38 of 432 and 1 of 80, CUDA none (36 of 36 pass;
+`addon-suite-any-0004m.jsonl`). Patch 0004 changes `meep_gpu/host_writes.py` and `meep_gpu/sources.py`. Of the pins
+of `meep_gpu/host_writes.py`, only `bit_identity_gate` of the Triton ledger is a raw-tier digest; the
+`driver_dispatch` entries pin it in a provenance map (`array_path_oracle.provenance_code_sha256`) that the add-on
+reports and does not judge. `meep_gpu/sources.py` is pinned by more entries of the Triton and Metal ledgers.
 
 ## Timings
 
@@ -218,14 +330,31 @@ With patch 0003, the setup on the GPU route is the `init_sim` of the solver and 
   `test_cupy_array_path.py`, 2 in `test_subnormal_policy.py`, 5 in the Triton weld contract; with both patches: 4 in
   the Metal weld contract, 5 in the Triton weld contract). The tests, the benches and the example checks of this
   folder followed.
+- 2026-11-08: all 409 test modules of the add-on ran one at a time (`suite_runner.py`; "The whole test suite of
+  the add-on"; `benchmarks/2026-11-08/addon-suite-any.jsonl`). The rows started between 02:54:28 and 08:00:36 EST,
+  with no row between 03:35:49 and 07:58:39 (a pause for another session). The computer had no problem: the uptime
+  of the rows increases from 32,048 s to 50,416 s.
+- 2026-11-08, 09:05:53 to 09:29:32 EST: all 409 modules again, with the four patches
+  (`benchmarks/2026-11-08/addon-suite-any-0004m.jsonl`); the uptime of the rows increases from 54,333 s to 55,752 s.
 
 ## Open items
 
 - Most checks and the first logged bench used a work copy with patches 0001 and 0002 (`ADDON_GPU_CLONE`). Since
-  2026-11-07 22:26 the pinned clone on the GPU computer carries the three patches (`tools/env/addon_gpu.sh`); the
-  tests of this folder and the second logged bench ran on it, the example checks have not run again on it.
-- 403 of the 409 test modules of the add-on have not run on this GPU ("The checks"). Run them one module at a
-  time (see "History").
+  2026-11-07 22:26 the pinned clone on the GPU computer carries the three patches (`tools/env/addon_gpu.sh`), and
+  since 2026-11-08 08:17 also patch 0004; the tests of this folder and the second logged bench ran on it, the example
+  checks have not run again on it.
+- Patch 0004 makes the words of the source deposit equal those of the host for the three amplitude tables of its
+  tests. The other subtractions on the GPU (the array path, the kernels, the `D - P` update of `deposit_repair.py` at
+  its repair cells) keep the NaN sign of the GPU; no test of the add-on compares NaN words there, and a NaN field is
+  a diverged run in any case.
+- `tools/gpu_run.sh` ends a hold with `timeout` and no `-k` (SIGTERM only); `suite_runner.py` gives each module
+  `timeout -k 30`.
+- `tools/env/addon_gpu_activate.sh` sets `CUPY_CACHE_DIR=.local/cupy-cache`. A module that installs `keep` by hand
+  needs a folder whose path carries `ftz_stripped`, and one that installs `flush` by hand needs a folder without it;
+  `suite_runner.py --cupy-cache-dir` sets the folder for one run.
+- `subnormal_policy._clear_triton_jit_caches` of the add-on reads `JITFunction.cache`, which Triton 3.8 does not
+  have, so on this GPU a policy install drops no compiled Triton kernel of the process. No test of the suite
+  failed by it.
 - Most of the setup that remains is the `init_sim` of the solver (11.6 s in 3-D), which the CPU solver also does.
 - Patch 0003 lists one build of the stamp (`1.35.0`, double, Linux x86_64), compared on that one build only; the
   add-on asks for more than one build of a stamp before it lists it.
@@ -251,6 +380,16 @@ bash tools/gpu_run.sh addon_gpu python bench/bench_addon.py --small
 EOF
 ```
 
+The test modules of the add-on run outside the lock, through `suite_runner.py` (each chunk of modules takes the
+lock; `touch .local/addon-runs/suite/STOP` stops a run after the current module):
+
+```bash
+bash tools/remote.sh sh <<'EOF'
+uv run --no-project --python 3.12 addon_gpu/suite_runner.py --run <name> --resume --chunk 200 --chunk-seconds 300
+uv run --no-project --python 3.12 addon_gpu/suite_runner.py --run <name> --summary
+EOF
+```
+
 In a script, a GPU run is `run_on_gpu(sim, until=T)` of the add-on, with `MEEP_GPU_HARDWARE=any` in the
 environment (and `MEEP_GPU_KERNEL_TABLE=cuda` or `triton` to select one table). Read `result.driver.gpu`,
 `result.driver.active_step_path` and `result.driver.fast_path_report()` after the run.
@@ -266,6 +405,13 @@ environment (and `MEEP_GPU_KERNEL_TABLE=cuda` or `triton` to select one table). 
 - `triton_subnormal_probe.py`: keep or flush, bit for bit, for the Triton op classes of the kernels.
 - `keep_key_probe.py`: is the keep token of patch 0002 in the CuPy cache key, before and after the keep install.
 - `profile_setup.py`: where the setup before the first step goes (the lift under the Python profiler).
+- `suite_runner.py`: runs the test modules of the add-on one at a time, each with its own time limit, in chunks of
+  one hold of the GPU lock, and logs one JSON line per module (`--summary`: the totals by tier; a stop file stops a
+  run after the current module).
+- `nan_words_probe.py`: the NaN words of the GPU against those of the host (the failure of
+  `meep_gpu/test_source_deposit.py`).
+- `preimport_triton_kernels.py`: a pytest plugin that imports the Triton kernel modules of the add-on before the
+  tests (the order dependence of `meep_gpu/test_dispatch_chunk_division.py`).
 - `tests/`: the pytest tests (GPU computer only).
 - `bench/bench_addon.py`: the bench, one JSON line per leg (the CPU solver with 1 and 4 OpenMP threads, both
   kernel tables, the array path).
