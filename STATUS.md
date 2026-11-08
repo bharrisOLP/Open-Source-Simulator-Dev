@@ -4,8 +4,29 @@ Updated: 2026-11-08.
 
 ## In work
 
-**Now (2026-11-08; the fourth to eighth waves, one agent per package).** Each change gets one review before its
-commit. The eighth wave is done (below); the ninth wave is in planning.
+**Now (2026-11-08; the fourth to tenth waves, one agent per package).** Each change gets one review before its
+commit. In work (tenth wave): photonsuite, a PIN injection phase shifter with self-heating (in review); meow_gpu,
+the modes that its solver misses (below).
+- Tenth wave, done: the add-on route, the GNU timeout in the suite runner and a CuPy cache folder per policy (the two
+  modules with 83 and 14 errors pass; the other 58 modules that name the cache give the same counts), and no patch
+  0005 (the repair must equal the whole-volume update of the same device bit for bit) (2e48a3c, 49c6849).
+- Ninth wave (new features), done: optics_gpu, the image-quality analyses of lens-design tools on the GPU: the OPD map,
+  the Zernike fit (Fringe and Noll), the FFT PSF, the MTF and a Huygens PSF (603ae68, 66da5d3; a perfect lens against
+  the Airy pattern and the diffraction-limited MTF to 3.5e-4, a pure defocus against the exact form to 1.4e-11 waves, a
+  singlet against Optiland to 3.2e-11 (1e-11 on the GPU path); slower than Optiland up to a pupil of 256 (a fixed cost
+  of about 42 ms), 1.23x to 12.0x faster from 512 to 2048; the Optiland notice in THIRD_PARTY_NOTICES.md); fdtd_gpu,
+  current sources in conductive cells (they were (1 + b) too strong), dispersive media in the PML (a Drude medium near
+  its plasma edge gets up to 1.4e-2 back: a run-time warning and `PML(R_asymptotic=...)`), and near2far in lossy media
+  (5ab6e9a); meow_gpu, an EME interface that conserves power and a star-product cascade (505c4c5; 5.45 GiB instead of
+  28.3 GiB at 80 modes; on the taper 0.0005 below to 0.0090 above the 3-D FDTD at 40 to 80 modes, not converged in the
+  mode count; the double step stays 0.004 to 0.010 above the FDTD at 40 to 120 modes, not explained). Found by that
+  work: the meow-gpu solver gives true eigenpairs but misses about 10 of the 40 nearest eigenvalues (all above cutoff),
+  so the EME rows that `meow_gpu/README.md` lists (one window and grid checked) use incomplete mode sets; the effect on
+  T00 is not known (the tenth wave works on it). Four of the five reviews of this paragraph failed and were fixed (the
+  first optics review passed; the review of its follow-up failed): the README advised to end a Drude medium before the
+  PML (that reflects more); the post-processing removed valid modes (complex pairs, the wrong branch); the README
+  described the image-space index of Optiland wrongly; the uutils timeout of the GPU computer sent SIGKILL only to the
+  direct child (tools/gpu_run.sh now uses GNU timeout, 7202be9).
 - Eighth wave (new features), done: fdtd_gpu, Drude and Lorentz dispersion on the ADE of fdtdx 0.6.3 and
   D_conductivity on its semi-implicit conductivity update (0a4c4b0; fdtdx needed no patch; a fill-fraction face
   rule, second order for E parallel to a face on the exact Yee grid (the FDTD follows it to res 200, then the
@@ -29,8 +50,8 @@ commit. The eighth wave is done (below); the ninth wave is in planning.
   derivative; 17.94 us with constant kappa, 17.61 us (on) and 17.87 us (off) with Si and SiO2 kappa(T)); fdtd_gpu,
   a near-to-far-field transform with exact Green's functions (c17cb93; second order against the analytic dipole
   and line-source fields; far-field power equal to the box flux to 0.3 %; fdtdx applies the source current half a
-  time step late, documented). Its review follow-ups are done (63b31de, 1e801bc), except two optional wording notes
-  of review b6be8c2f2946 (the near-to-far text of `fdtd_gpu/README.md`; in the ninth wave).
+  time step late, documented). Its review follow-ups are done (63b31de, 1e801bc; the two wording notes of review
+  b6be8c2f2946 in 5ab6e9a).
 - Sixth wave (new features), done: thermal_gpu, transients with kappa(T) and rho c_p(T) (486b1d5; second order
   in dt against solve_ivp; timings a47f265: a second run costs 1.8x to 2.6x the constant-kappa transient with Si
   and SiO2 kappa(T)); optics_gpu, a type-1 non-uniform FFT for the image sum (ab60025; at tol 1e-12, 1.3x to about

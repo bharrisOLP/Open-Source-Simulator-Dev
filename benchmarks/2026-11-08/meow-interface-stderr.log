@@ -1,0 +1,78 @@
+W1108 13:53:33.185546 1013229 bfc_allocator.cc:598] Allocator (GPU_0_bfc) ran out of memory trying to allocate 4.37GiB (rounded to 4696473600) from the lower end requested by op 
+If this is caused by memory fragmentation, the environment variable 'TF_GPU_ALLOCATOR=cuda_malloc_async' may improve the situation.
+Current allocation summary follows.
+W1108 13:53:33.185659 1013229 bfc_allocator.cc:609] *_****************************____***************************************************************___
+Traceback (most recent call last):
+  File "<repo>/meow_gpu/bench/bench_interface.py", line 133, in main
+    one_row(a, wl, n_modes, cells, css, window)
+  File "<repo>/meow_gpu/bench/bench_interface.py", line 178, in one_row
+    r = compute_modes_gpu(cs, num_modes=n_modes, solver=solver, post_process=lambda ms: ms)
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "<repo>/meow_gpu/src/meow_gpu/meow_backend.py", line 379, in compute_modes_gpu
+    neff, e, h = solver.solve(_problem(cs), num_modes, target_neff)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "<repo>/meow_gpu/src/meow_gpu/meow_backend.py", line 146, in solve
+    res = davidson(op, pc, num_modes, target, x0, tol=tol, max_iter=self.max_iter, precision=self.precision,
+          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "<repo>/meow_gpu/src/meow_gpu/fde/eigensolver.py", line 617, in davidson
+    hi = _refine_with_fallback(op32, op64, pc, k, target, lo.vectors, tol, left, inner, verbose,
+         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "<repo>/meow_gpu/src/meow_gpu/fde/eigensolver.py", line 647, in _refine_with_fallback
+    hi = refine(op32, op64, pc, k, target, lo_vectors, tol, left, inner, verbose)
+         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "<repo>/meow_gpu/src/meow_gpu/fde/eigensolver.py", line 559, in refine
+    beta = np.asarray(beta, dtype=np.float64)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "<repo>/.venv-rocm/lib/python3.12/site-packages/jax/_src/array.py", line 414, in __array__
+    return np.asarray(self._value, dtype=dtype, **kwds)  # pyrefly: ignore[no-matching-overload]
+                      ^^^^^^^^^^^
+  File "<repo>/.venv-rocm/lib/python3.12/site-packages/jax/_src/profiler.py", line 420, in wrapper
+    return func(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^
+  File "<repo>/.venv-rocm/lib/python3.12/site-packages/jax/_src/array.py", line 642, in _value
+    npy_value, did_copy = self._single_device_array_to_np_array_did_copy()
+                          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+jax.errors.JaxRuntimeError: RESOURCE_EXHAUSTED: Out of memory while trying to allocate 4.37GiB with allocator GPU_0_bfc on device 0. [executable_name='jit__correction_krylov'] [tf-allocator-allocation-error='']
+usage: bench_interface.py [-h] [--modes MODES] [--wavelengths WAVELENGTHS]
+                          [--length LENGTH] [--segments SEGMENTS] [--w0 W0]
+                          [--w1 W1] [--step STEP] [--window WINDOW]
+                          [--interfaces INTERFACES]
+                          [--max-imag-neff MAX_IMAG_NEFF] [--diag]
+bench_interface.py: error: argument --window: expected one argument
+W1108 14:08:57.350516 1023942 bfc_allocator.cc:598] Allocator (GPU_0_bfc) ran out of memory trying to allocate 2.29GiB (rounded to 2464358400) from the lower end requested by op 
+If this is caused by memory fragmentation, the environment variable 'TF_GPU_ALLOCATOR=cuda_malloc_async' may improve the situation.
+Current allocation summary follows.
+W1108 14:08:57.350629 1023942 bfc_allocator.cc:609] *******_**********************************________********************************************______
+Traceback (most recent call last):
+  File "<repo>/meow_gpu/bench/bench_interface.py", line 167, in main
+    one_row(a, wl, n_modes, cells, css, window)
+  File "<repo>/meow_gpu/bench/bench_interface.py", line 218, in one_row
+    r = compute_modes_gpu(cs, num_modes=n_modes, solver=solver, post_process=lambda ms: ms)
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "<repo>/meow_gpu/src/meow_gpu/meow_backend.py", line 379, in compute_modes_gpu
+    neff, e, h = solver.solve(_problem(cs), num_modes, target_neff)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "<repo>/meow_gpu/src/meow_gpu/meow_backend.py", line 146, in solve
+    res = davidson(op, pc, num_modes, target, x0, tol=tol, max_iter=self.max_iter, precision=self.precision,
+          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "<repo>/meow_gpu/src/meow_gpu/fde/eigensolver.py", line 617, in davidson
+    hi = _refine_with_fallback(op32, op64, pc, k, target, lo.vectors, tol, left, inner, verbose,
+         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "<repo>/meow_gpu/src/meow_gpu/fde/eigensolver.py", line 647, in _refine_with_fallback
+    hi = refine(op32, op64, pc, k, target, lo_vectors, tol, left, inner, verbose)
+         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "<repo>/meow_gpu/src/meow_gpu/fde/eigensolver.py", line 559, in refine
+    beta = np.asarray(beta, dtype=np.float64)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "<repo>/.venv-rocm/lib/python3.12/site-packages/jax/_src/array.py", line 414, in __array__
+    return np.asarray(self._value, dtype=dtype, **kwds)  # pyrefly: ignore[no-matching-overload]
+                      ^^^^^^^^^^^
+  File "<repo>/.venv-rocm/lib/python3.12/site-packages/jax/_src/profiler.py", line 420, in wrapper
+    return func(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^
+  File "<repo>/.venv-rocm/lib/python3.12/site-packages/jax/_src/array.py", line 642, in _value
+    npy_value, did_copy = self._single_device_array_to_np_array_did_copy()
+                          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+jax.errors.JaxRuntimeError: RESOURCE_EXHAUSTED: Out of memory while trying to allocate 2.29GiB with allocator GPU_0_bfc on device 0. [executable_name='jit__correction_krylov'] [tf-allocator-allocation-error='']
+<repo>/meow_gpu/src/meow_gpu/meow_backend.py:379: UserWarning: meow_gpu: the eigensolver did not converge (residual 4.9e-06)
+  neff, e, h = solver.solve(_problem(cs), num_modes, target_neff)
