@@ -4,7 +4,8 @@
 # Environment .local/envs/addon-gpu on the AMD GPU computer (Radeon RX 7900 XT, gfx1100), without a system ROCm:
 #   - Meep (conda-forge pymeep, serial "nompi" build, double precision) and Python 3.12, with micromamba;
 #   - PyTorch for ROCm 7.2 (its wheel brings the HIP runtime and the AMD build of Triton);
-#   - CuPy for ROCm 7 (cupy-rocm-7-0); it needs versioned ROCm 7 library names (links to the PyTorch libraries in
+#   - CuPy for ROCm 7 (cupy-rocm-7-0, pinned at 14.2.0: patch 0002 wraps its _compile_with_cache_hip, which has
+#     changed between CuPy versions); it needs versioned ROCm 7 library names (links to the PyTorch libraries in
 #     .local/rocm7-compat) and hipcc for its built-in kernels (from the ROCm 10.1 pip SDK, .venv-hipcc);
 #   - the GPU time-stepping add-on of Erised (GPL-2.0-or-later), cloned at a fixed commit into .local/upstream,
 #     installed editable without dependencies, with the ROCm patches of tools/env/addon_patches/ applied.
@@ -25,7 +26,7 @@ if [[ ! -x $PY ]]; then
   micromamba create -y -q -p "$ENV" -c conda-forge "python=3.12" "pymeep=1.35.0=nompi_*" "numpy>=2" >/dev/null
 fi
 uv pip install --quiet --python "$PY" --index-url "$TORCH_INDEX" torch
-uv pip install --quiet --python "$PY" cupy-rocm-7-0 pytest
+uv pip install --quiet --python "$PY" "cupy-rocm-7-0==14.2.0" pytest
 
 # hipcc from the ROCm pip SDK (only the compiler is used; the runtime is the one of the PyTorch wheel)
 [[ -x .venv-hipcc/bin/python ]] || uv venv --quiet --python 3.12 .venv-hipcc

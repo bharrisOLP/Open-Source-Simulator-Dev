@@ -21,6 +21,13 @@ import pytest
 from conftest import differing_words, rel_l2, run_leg
 
 BAND = 1e-4          # the band of the add-on examples for a run against the CPU solver (relative L2)
+# The resonances of the ring, against the CPU solver. Measured on 2026-11-07 (both tables, the same modes):
+# |delta(f + i decay)| / f at most 7.7e-6, and Q at most 0.67 % (the mode with Q near 1700). The bands are the
+# tightest that keep a margin over these logged values: 2.6 times for the complex frequency, 1.5 times for Q (the
+# float32 NumPy reference of the add-on is at 4.4e-7 of f and 0.14 % of Q, so the floor of float32 against float64
+# stepping is below both bands).
+RESONANCE_BAND = 2e-5
+Q_BAND = 1e-2
 TABLES = ("triton", "cuda")
 
 
@@ -79,15 +86,14 @@ def test_ring_point_series_and_resonances_against_the_cpu_solver(ring, table):
     assert rec["active_step_path"] == "fused"
     assert rec["steps"] == crec["steps"] and len(gpu["series"]) == len(cpu["series"]) > 1000
     assert rel_l2(gpu["series"], cpu["series"]) < BAND
-    # The resonances: the complex frequency f + i decay of each mode against the CPU solver, in the same band. On
-    # 2026-11-07 the largest difference was 7.7e-6 of f; Q (f / 2|decay|) differed by up to 0.67 % on the mode
-    # with Q near 1700, and the float32 NumPy reference of the add-on by up to 0.14 % (README, "The checks").
+    # The resonances: the complex frequency f + i decay and Q of each mode against the CPU solver.
     modes, cmodes = rec["harminv"], crec["harminv"]
     resonances = [m for m in cmodes if m["Q"] > 50]
     assert len(resonances) >= 3, cmodes
     for m in resonances:
         match = min(modes, key=lambda g: abs(g["freq"] - m["freq"]))
-        assert abs(complex(match["freq"] - m["freq"], match["decay"] - m["decay"])) / m["freq"] < BAND
+        assert abs(complex(match["freq"] - m["freq"], match["decay"] - m["decay"])) / m["freq"] < RESONANCE_BAND
+        assert abs(match["Q"] - m["Q"]) / m["Q"] < Q_BAND
 
 
 @pytest.fixture(scope="module")

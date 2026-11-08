@@ -29,13 +29,21 @@ The patches:
    float32 subnormal policy `keep`. The add-on attains it in CuPy when it removes `-ftz=true` from each compile. A
    ROCm CuPy adds `-fcuda-flush-denormals-to-zero` instead, so under `keep` every CuPy executor still flushed
    subnormal values, without a message (the gate of the add-on: 23 of the 29 CuPy cells flushed; the other 6 are a
-   negation and a select, which keep subnormal values under both policies on this GPU). The patch
-   removes the clang spellings too. It also folds the keep token into the cache key of a ROCm CuPy
-   (`_compile_with_cache_hip`); the add-on wrapped only `_compile_with_cache_cuda`, which a ROCm CuPy does not
-   call. After the patch, the gate passes under `keep` on the host and CuPy legs (37 of 37 cells).
+   negation and a select, which keep subnormal values under both policies on this GPU). The patch removes the clang
+   spellings too. After the patch, the gate passes under `keep` on the host and CuPy legs (37 of 37 cells).
+
+   The patch also folds the keep token into the cache key of a ROCm CuPy (`_compile_with_cache_hip`); the add-on
+   wrapped only `_compile_with_cache_cuda`, which a ROCm CuPy does not call. On CuPy 14 this token is the only
+   barrier against a stale binary: CuPy 14 reads `CUPY_CACHE_DIR` once, when `cupy.cuda.compiler` is imported, so
+   the keep cache folder that the add-on names later is not the folder that CuPy uses. Without the token, a keep
+   compile reads back a binary that a flush compile wrote under the same key. The wrapper finds the parameter
+   `extra_source` by name (`inspect.signature`), because its position has changed between CuPy versions; when the
+   parameter is not there, the install of `keep` reports that the token could not be folded in.
+   `tools/env/addon_gpu.sh` pins `cupy-rocm-7-0==14.2.0`, and `addon_gpu/tests/test_patches.py` checks that the
+   token reaches the key of a keep compile and not the key of a compile before the install.
 
 **Rule 2 of the add-on (certification ledgers).** Both files are pinned by the certification ledgers of the add-on,
 so the patches put entries of those ledgers in drift. On the AMD GPU no identity is certified in any case: the
 kernels run only with `MEEP_GPU_HARDWARE=any`, and each run reports `certified: False`. `addon_gpu/README.md` gives
-the checks that replace the certification on this GPU, and the open drift measurement (the three weld contracts of
-the add-on, before and after the patches).
+the checks that replace the certification on this GPU, and the drift counts of the three weld contracts of the
+add-on, before and after the patches.

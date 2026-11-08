@@ -50,23 +50,42 @@ def test_guard_wraps_the_rocm_compile_path_once():
     assert getattr(first, backends._HIP_OPTIONS_MARK, False)
 
 
-def test_rawkernel_with_the_fmad_option_compiles_and_runs_on_the_amd_gpu():
+def test_fmad_false_turns_off_the_fused_multiply_add_on_the_amd_gpu():
+    """a * b + c with a = b = 1 + 2^-12 and c = -(1 + 2^-11), in float32.
+
+    The exact a * b is 1 + 2^-11 + 2^-24. Rounded to float32 first (no fused multiply-add) it is 1 + 2^-11 (a tie,
+    to even), and the sum is 0. Fused, the sum is 2^-24. hipRTC fuses by default, so the operands show whether the
+    translated option (-ffp-contract=off) reaches the compiler.
+    """
     import cupy
     import numpy as np
 
     from meep_gpu import backends
 
     backends.guard_kernel_compilation(cupy)
-    code = r'''extern "C" __global__ void axpy(const float* x, const float* y, float* out, float a, int n) {
+    code = r'''extern "C" __global__ void muladd(const float* a, const float* b, const float* c, float* out, int n) {
         int i = blockDim.x * blockIdx.x + threadIdx.x;
-        if (i < n) out[i] = a * x[i] + y[i];
+        if (i < n) out[i] = a[i] * b[i] + c[i];
     }'''
-    kernel = cupy.RawKernel(code, "axpy", options=("--fmad=false",))
-    x = cupy.arange(1000, dtype=cupy.float32)
-    y = cupy.ones(1000, dtype=cupy.float32)
-    out = cupy.empty_like(x)
-    kernel((4,), (256,), (x, y, out, np.float32(0.5), np.int32(1000)))
-    np.testing.assert_array_equal(cupy.asnumpy(out), 0.5 * np.arange(1000, dtype=np.float32) + 1)
+    n = 256
+    a = cupy.full(n, 1 + 2.0 ** -12, dtype=cupy.float32)
+    c = cupy.full(n, -(1 + 2.0 ** -11), dtype=cupy.float32)
+    results = {}
+    for options in ((), ("--fmad=false",), ("--fmad=true",)):
+        out = cupy.empty(n, dtype=cupy.float32)
+        cupy.RawKernel(code, "muladd", options=options)((1,), (n,), (a, a, c, out, np.int32(n)))
+        results[options] = cupy.asnumpy(out)
+    np.testing.assert_array_equal(results[("--fmad=false",)], np.zeros(n, dtype=np.float32))
+    np.testing.assert_array_equal(results[()], np.full(n, 2.0 ** -24, dtype=np.float32))
+    np.testing.assert_array_equal(results[("--fmad=true",)], np.full(n, 2.0 ** -24, dtype=np.float32))
+
+
+def test_the_keep_token_reaches_the_cache_key():
+    """Patch 0002: on CuPy 14 the keep token in the cache key is the only barrier against a stale flush binary."""
+    rec = run_script(["keep_key_probe.py"], timeout=600)
+    assert rec["is_hip"] and rec["policy"] == "keep", rec
+    assert rec["before_keys"] >= 1 and rec["before_with_token"] == 0, rec
+    assert rec["after_keys"] >= 1 and rec["after_with_token"] == rec["after_keys"], rec
 
 
 def test_keep_policy_holds_on_every_cupy_executor(tmp_path):

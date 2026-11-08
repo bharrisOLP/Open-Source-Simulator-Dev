@@ -4,10 +4,13 @@
     python subnormal_gate.py <clone folder> --policy keep --legs host,cupy_ufunc --out FILE.json
 
 The gate measures, bit for bit, whether each executor (host NumPy, CuPy ufunc, ElementwiseKernel, RawKernel,
-reductions, Triton) obeys a float32 subnormal policy. Under ``keep`` CuPy needs a kernel cache folder whose name
-carries ``ftz_stripped``; the run-time variables of ``tools/env/addon_gpu_activate.sh`` name another folder, so this
-wrapper points the cache at the keep folder of the add-on first, as kernel dispatch does. The CuPy compiler front
-ends are also guarded (``backends.guard_kernel_compilation``), as ``resolve_backend`` does before a run, so that the
+reductions, Triton) obeys a float32 subnormal policy. Under ``keep`` the add-on refuses to install the policy unless
+``CUPY_CACHE_DIR`` names a folder that carries ``ftz_stripped``, so this wrapper first calls
+``point_cupy_cache_at_keep_policy()``, as kernel dispatch does. That only satisfies the check of the add-on: CuPy 14
+reads ``CUPY_CACHE_DIR`` once, when ``cupy.cuda.compiler`` is imported, and keeps the folder that it read then. What
+separates the keep binaries from the flush binaries in the cache is the keep token that patch 0002 puts into the
+cache key (tests/test_patches.py, ``test_the_keep_token_reaches_the_cache_key``). The CuPy compiler front ends are
+also guarded (``backends.guard_kernel_compilation``), as ``resolve_backend`` does before a run, so that the
 RawKernel leg compiles with the options of the hipRTC patch (tools/env/addon_patches/0001).
 """
 

@@ -1,8 +1,16 @@
 diff --git a/meep_gpu/subnormal_policy.py b/meep_gpu/subnormal_policy.py
-index 227baec..17ce9e5 100644
+index 227baec..d89fd9b 100644
 --- a/meep_gpu/subnormal_policy.py
 +++ b/meep_gpu/subnormal_policy.py
-@@ -384,8 +384,28 @@ CUPY_CACHE_KEY_ENTRY_POINT = "_compile_with_cache_cuda"
+@@ -146,6 +146,7 @@ import functools
+ import hashlib
+ import importlib
+ import importlib.util
++import inspect
+ import json
+ import os
+ import platform
+@@ -384,8 +385,30 @@ CUPY_CACHE_KEY_ENTRY_POINT = "_compile_with_cache_cuda"
  #: entry a compile reads and writes and nothing about the binary it builds.
  CUPY_KEEP_CACHE_KEY_TOKEN = "meep_gpu subnormal policy: keep (-ftz=true stripped)"
  
@@ -14,14 +22,16 @@ index 227baec..17ce9e5 100644
 +#: ("HIP's equivalent of -ftz=true"). Measured on one AMD Radeon RX 7900 XT
 +#: (gfx1100, CuPy 14.2.0 for ROCm 7): without the clang spellings here, every
 +#: CuPy executor (ufunc, ElementwiseKernel, RawKernel, reductions) flushed under
-+#: a requested "keep" (gate_subnormal_policy.py, 23 of 23 governed cells).
++#: a requested "keep" (gate_subnormal_policy.py: 23 of the 29 CuPy cells).
 +_CUPY_FTZ_OPTIONS = ("-ftz=true", "--ftz=true",
 +                     "-fcuda-flush-denormals-to-zero", "-fgpu-flush-denormals-to-zero")
 +
 +#: Where a ROCm build of CuPy computes the key of its kernel cache: the same
-+#: role as :data:`CUPY_CACHE_KEY_ENTRY_POINT`, with ``extra_source`` as its fourth
-+#: positional parameter (``source, options, arch, extra_source, backend, ...``).
-+#: On a ROCm build ``_compile_with_cache_cuda`` exists and is never called.
++#: role as :data:`CUPY_CACHE_KEY_ENTRY_POINT`. Its parameter ``extra_source`` is
++#: found by name (``inspect.signature``), not by position: CuPy 14.2.0 has
++#: ``source, options, arch, extra_source, backend, ...``, and an older CuPy had
++#: ``cache_dir`` in the fourth place. On a ROCm build ``_compile_with_cache_cuda``
++#: exists and is never called.
 +CUPY_HIP_CACHE_KEY_ENTRY_POINT = "_compile_with_cache_hip"
 +
 +
@@ -33,26 +43,44 @@ index 227baec..17ce9e5 100644
  
  #: The LLVM per-function attribute that makes f32 arithmetic lower to ``.ftz``
  #: PTX. Triton 3.1.0's ``CUDAOptions`` carries no ftz field, so this is the knob.
-@@ -1225,6 +1245,27 @@ def _wrap_cache_key_entry_point(original: Callable, state: Dict[str, Any]) -> Ca
+@@ -1225,6 +1248,45 @@ def _wrap_cache_key_entry_point(original: Callable, state: Dict[str, Any]) -> Ca
      return keyed
  
  
-+def _wrap_hip_cache_key_entry_point(original: Callable, state: Dict[str, Any]) -> Callable:
++def _wrap_hip_cache_key_entry_point(original: Callable, state: Dict[str, Any]) -> Optional[Callable]:
 +    """The ROCm form of :func:`_wrap_cache_key_entry_point` (``_compile_with_cache_hip``).
 +
 +    The same token, folded into ``extra_source``, which a ROCm CuPy also hashes
 +    into its key (``key_src = env, base, source, extra_source``). From ROCm 4.4
 +    on, ``_convert_to_hip_source`` returns the source unchanged and reads no
-+    ``extra_source``, so the token changes the key and not the binary. Here it is
-+    the fourth positional parameter, as there is no ``cache_dir`` parameter.
++    ``extra_source``, so the token changes the key and not the binary.
++
++    THE TOKEN IS THE ONLY BARRIER on CuPy 14: its disk cache back end reads
++    ``CUPY_CACHE_DIR`` once, when ``cupy.cuda.compiler`` is imported, so the
++    policy-suffixed directory that :func:`point_cupy_cache_at_keep_policy` names
++    later is not the directory that CuPy writes. Without the token, a keep
++    compile would read back a binary that a flush compile wrote under the same key.
++
++    The parameter is found BY NAME (``inspect.signature``, which follows the
++    ``__wrapped__`` of a wrapper that ``functools.wraps`` made). Returns ``None``
++    when the function has no ``extra_source`` parameter; the caller then records
++    that the token could not be folded in.
 +    """
++    try:
++        signature = inspect.signature(original)
++    except (TypeError, ValueError):
++        return None
++    if "extra_source" not in signature.parameters:
++        return None
 +
 +    @functools.wraps(original)
-+    def keyed(source, options, arch, extra_source=None, *args, **kwargs):
++    def keyed(*args, **kwargs):
 +        state["keyed"] = state.get("keyed", 0) + 1
-+        folded = (CUPY_KEEP_CACHE_KEY_TOKEN if extra_source is None
-+                  else f"{extra_source}\n{CUPY_KEEP_CACHE_KEY_TOKEN}")
-+        return original(source, options, arch, folded, *args, **kwargs)
++        bound = signature.bind(*args, **kwargs)
++        extra_source = bound.arguments.get("extra_source")
++        bound.arguments["extra_source"] = (CUPY_KEEP_CACHE_KEY_TOKEN if extra_source is None
++                                           else f"{extra_source}\n{CUPY_KEEP_CACHE_KEY_TOKEN}")
++        return original(*bound.args, **bound.kwargs)
 +
 +    setattr(keyed, _POLICY_MARK, KEEP)
 +    return keyed
@@ -61,7 +89,7 @@ index 227baec..17ce9e5 100644
  def _cupy_compiler(cupy: Any) -> Any:  # ``cupy.cuda.compiler``, however it is reachable.
      compiler = getattr(getattr(cupy, "cuda", None), "compiler", None)
      if compiler is not None:
-@@ -1611,19 +1652,23 @@ def install_cupy_policy(policy: str, cupy: Any = None, *, strict: bool = True) -
+@@ -1611,19 +1673,32 @@ def install_cupy_policy(policy: str, cupy: Any = None, *, strict: bool = True) -
          reasons.append(
              "this CuPy exposes none of the compiler entry points the strip "
              f"installs at ({', '.join(_COMPILER_ENTRY_POINTS)}): the seam has moved")
@@ -74,12 +102,22 @@ index 227baec..17ce9e5 100644
 +    keyer = getattr(compiler, key_entry_point, None)
      if keyer is not None:
          if getattr(keyer, _POLICY_MARK, None) is None:
-             _STATE.setdefault("_cupy_originals", {}).setdefault(
+-            _STATE.setdefault("_cupy_originals", {}).setdefault(
 -                CUPY_CACHE_KEY_ENTRY_POINT, (compiler, keyer))
 -            setattr(compiler, CUPY_CACHE_KEY_ENTRY_POINT,
 -                    _wrap_cache_key_entry_point(keyer, state))
-+                key_entry_point, (compiler, keyer))
-+            setattr(compiler, key_entry_point, key_wrapper(keyer, state))
++            keyed = key_wrapper(keyer, state)
++            if keyed is None:
++                keyer = None
++                reasons.append(
++                    f"cupy.cuda.compiler.{key_entry_point} has no parameter "
++                    f"extra_source, so the keep token cannot be folded into CuPy's "
++                    f"cache key and a binary compiled before this install with "
++                    f"CuPy's own flush option stays reachable on disk")
++            else:
++                _STATE.setdefault("_cupy_originals", {}).setdefault(
++                    key_entry_point, (compiler, keyer))
++                setattr(compiler, key_entry_point, keyed)
      elif isinstance(compiler, type(sys)) and compiler.__name__ == "cupy.cuda.compiler":
          # The real module, without the function that computes the key: the token
          # cannot be folded in, so a native binary already written under a keep
@@ -90,7 +128,7 @@ index 227baec..17ce9e5 100644
              f"token cannot be folded into CuPy's cache key and a binary compiled "
              f"before this install with CuPy's own -ftz=true stays reachable on disk")
      report.update(
-@@ -1636,7 +1681,7 @@ def install_cupy_policy(policy: str, cupy: Any = None, *, strict: bool = True) -
+@@ -1636,7 +1711,7 @@ def install_cupy_policy(policy: str, cupy: Any = None, *, strict: bool = True) -
                    "by '-ftz=false': NVRTC rejects a duplicate -ftz option); "
                    "policy-suffixed private CUPY_CACHE_DIR because the cache key "
                    "is computed above the seam"

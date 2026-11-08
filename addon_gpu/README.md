@@ -9,9 +9,11 @@ compiles the hand-written kernels) and the AMD backend of Triton.
 
 **Status (2026-11-07): version 0.1 works.** Both kernel tables of the add-on run on the AMD GPU, with two small
 patches (`tools/env/addon_patches/`). On three cases the kernels give the same float32 words as the array path of
-the add-on, and they agree with the CPU solver to 8.3e-6 or better (relative L2). On a 3-D case of 2,097,152 cells
-the time stepping is 16 times (Triton) to 28 times (hand-written kernels) as fast as the serial CPU solver; the
-setup before the first step is longer than on the CPU solver ("Timings").
+the add-on, and they agree with the CPU solver to 8.3e-6 or better (relative L2). The speed-up is for the time
+loop: on a 3-D case of 2,097,152 cells the loop is 16 times (Triton) to 28 times (hand-written kernels) as fast as the
+serial CPU solver (float32 on the GPU, float64 on the CPU). The setup before the first step is much longer on the GPU
+route, and it dominates small and 2-D runs: the whole 2-D bench run (1,536,000 cells, 2,400 steps) is 3.4 to 3.7
+times slower than on the CPU solver, and the whole 3-D run is 1.15 to 1.18 times faster ("Timings").
 
 ## What runs on the AMD GPU
 
@@ -73,6 +75,10 @@ for bit; "relative" is the relative L2 difference.
 5. **The subnormal gate of the add-on**, `keep`, host and CuPy legs, each cell against its exact keep word. Without
    patch 0002: FAIL, 23 of the 29 CuPy cells flushed. With patch 0002: PASS, 37 of 37 cells (8 host, 29 CuPy).
 6. `triton_subnormal_probe.py` under no policy, `keep` and `flush`: keep in 6 of 6 op classes under each of them.
+   Two tests check the patches themselves (`tests/test_patches.py`). A RawKernel computes a * b + c with
+   a = b = 1 + 2^-12 and c = -(1 + 2^-11): 2^-24 with no option and with `--fmad=true` (fused), 0 with `--fmad=false`
+   (patch 0001 turns the fusion off). The keep token of patch 0002 is in the cache key of each compile after the
+   keep install, and in no key before it (`keep_key_probe.py`).
 7. **Install check of the add-on** (`tools/check_install.py --require-gpu`, a sphere of 24 x 24 x 24 cells, 240
    steps, 2026-10-30, no patch): the NumPy reference against the CPU solver 7.1e-7 (field) and 8.6e-8 (flux); the
    Triton table with `MEEP_GPU_HARDWARE=any` against the NumPy reference 0.000e+00; the check ends "OK: ... work
@@ -83,11 +89,13 @@ for bit; "relative" is the relative L2 difference.
    on the line); the GPU leg equals the array leg byte for byte in 3 of 3 compared examples, the dispersive slab
    included; the NumPy reference against the CPU solver 2.2e-6 (sphere), 2.7e-6 (slab) and 3.0e-4 (dispersive slab,
    band 2e-3; reported, not judged, with a double-precision solver).
-9. The source of the 145 hand-written kernel modules contains no warp intrinsic (`__shfl`, `warpSize`, `__ballot`,
-   `__syncwarp`, `__activemask`, `__ldg`), so the kernels do not assume a wave size of 32 or 64.
+9. The folder of the hand-written kernels (`meep_gpu/cuda_kernels/` of the pinned clone) holds 145 Python files: 66
+   test modules, `__init__.py` and 78 other modules, of which 59 hold `__global__` kernel source. No file contains a
+   warp intrinsic (`__shfl`, `warpSize`, `__ballot`, `__syncwarp`, `__activemask`, `__ldg`), and no non-test module
+   uses `__shared__`: the kernels are elementwise and do not assume a wave size of 32 or 64.
 
-The tests of this folder: 19 of 19 pass (`tests/test_patches.py`, `tests/test_parity.py`; 72 s, 2026-11-07, with
-`ADDON_GPU_CLONE` set to a work copy with both patches).
+The tests of this folder: 20 of 20 pass (`tests/test_patches.py`, `tests/test_parity.py`; 73 s, 2026-11-07, on
+the pinned clone after `tools/env/addon_gpu.sh` applied both patches, without `ADDON_GPU_CLONE`).
 
 The test modules of the add-on, run one at a time (2026-11-07, pinned clone, then the work copy with both patches):
 
@@ -108,43 +116,60 @@ tests that wait for a certification (`tools/ci/pending_certification.txt`). The 
 the kernels dispatched with both patches on every case). On an Apple or NVIDIA host the patched files would put
 those certified entries in drift; the patches are for the AMD route only.
 
-The rest of the suite of the add-on (about 250 test modules) has not run on this GPU.
+The rest of the suite of the add-on has not run on this GPU: its pytest paths (`testpaths` in its
+`pyproject.toml`: `meep_gpu` and `parity/meep_gpu`) hold 409 test modules (`test_*.py`: 225 in `meep_gpu/`, 66 in
+`meep_gpu/cuda_kernels/`, 113 in `parity/meep_gpu/`, 5 in `parity/meep_gpu/rounds/1.0/`), and the 6 above are the
+only ones that ran.
 
 ## Timings
 
 `bench/bench_addon.py`, 2026-11-07, one RX 7900 XT, both patches, the computer shared with CPU jobs of another
-session (`OMP_NUM_THREADS=4`). Time of the step loop (after a warm-up run in the same process, so kernel
-compilation is not timed); CPU solver serial (1 and 4 OpenMP threads gave the same time):
+session (`OMP_NUM_THREADS=4`); rows in `benchmarks/2026-11-07/addon-bench-full.jsonl`. The add-on steps in float32 on
+the GPU; the CPU solver steps in float64, serially (1 and 4 OpenMP threads gave the same time). "Step loop" is the
+time of the time loop, after a warm-up run in the same process (so kernel compilation is not timed); "whole run" adds
+the setup before the first step (`setup_s` of the rows: the lift of the add-on, or `init_sim` of the CPU solver). The
+factor is the time of the CPU solver divided by the time of the leg.
 
-| Case | Cells, steps | CPU solver | Array path | Triton table | Hand-written table |
+| Case | Time | CPU solver | Array path | Triton table | Hand-written table |
 |---|---|---|---|---|---|
-| 2-D slab waveguide | 1,536,000, 2,400 | 5.11 s | 2.78 s (1.8x) | 1.03 s (5.0x) | 0.82 s (6.2x) |
-| 3-D dielectric sphere | 2,097,152, 1,280 | 37.7 s | 5.34 s (7.1x) | 2.35 s (16x) | 1.34 s (28x) |
+| 2-D slab, 1,536,000 cells, 2,400 steps | step loop | 5.11 s | 2.78 s (1.8x) | 1.03 s (5.0x) | 0.82 s (6.2x) |
+| | whole run | 6.43 s | 23.9 s (0.27x) | 23.7 s (0.27x) | 22.0 s (0.29x) |
+| 3-D sphere, 2,097,152 cells, 1,280 steps | step loop | 37.7 s | 5.34 s (7.1x) | 2.35 s (16x) | 1.34 s (28x) |
+| | whole run | 49.2 s | 45.3 s (1.09x) | 41.6 s (1.18x) | 43.0 s (1.15x) |
 
 - Rate: 2-D 721 (CPU) against 3,580 (Triton) and 4,489 (hand-written) million cell updates per second; 3-D 71 against
   1,141 and 1,999. Between progress callbacks (from step 100 on), both tables step the 3-D case at about 2,650.
 - Setup before the first step: 2-D 21 to 23 s on the GPU route against 1.3 s for the CPU solver; 3-D 39 to 42 s
   against 11.5 s. The lift of the add-on reads the permittivity of a solver build that it has not compared ("1.35.0
   double precision ... not a build the bulk read was compared on") one point at a time: its log gives about 0.1 s
-  for 24,000 points of each component. For the 3-D case, the whole run (setup and steps) takes 41.6 s (Triton) and
-  43.0 s (hand-written) on the GPU route against 49.2 s on the CPU solver; the gain grows with the step count.
+  for 24,000 points of each component. Thus the setup dominates small and 2-D runs; the gain of the whole run grows
+  with the step count.
 - Small cases are slower on the GPU: the 2-D slab of 24,000 cells steps at 54 to 65 million cell updates per second
   on the GPU against 211 on the CPU solver (bench `--small`).
 
 ## History
 
-- 2026-10-30, 16:49: the GPU computer stopped about one minute after the start of a run of 6 test modules of the
-  add-on (pinned clone; kernel 7.0.0-38). Its kernel dump shows an Oops in the amdgpu/TTM memory manager (list
-  corruption, then a NULL pointer in `ttm_resource_move_to_lru_tail`) during a GPU memory allocation of a Python
-  process, about 80 s after the GPU resumed from runtime suspend. The cause is not proven. On kernel 7.0.0-42, from
-  2026-11-07 19:24, each of the 6 modules ran alone without a problem, followed by the tests, the benches and the
-  example check of this folder.
+- 2026-11-07, about 16:49:53 EST: the GPU computer stopped (kernel 7.0.0-38). The kernel dump shows an Oops in the
+  amdgpu/TTM memory manager (list corruption, then a NULL pointer in `ttm_resource_move_to_lru_tail`) during a GPU
+  memory allocation (a KFD ioctl) of a Python process. By the kernel time stamps, the Oops came at about 16:49:52.8,
+  81 s after the GPU resumed from runtime suspend (16:48:31.65). The three Triton subnormal probes of this folder
+  ended at 16:48:33. The last journal entries (16:49:44.59 to 16:49:44.67) are one short login session, which made
+  the empty log file of a run of 6 test modules of the add-on (pinned clone) at 16:49:44.64. The Python process of
+  the Oops started after that session (its process number is higher), so the module run had started about 8 s
+  before the Oops. The other session on the computer used no GPU at that time, so the trigger was very probably
+  that module run; the cause is not proven. The computer now runs kernel 7.0.0-42.
+- 2026-11-07, 19:24 to 19:38: the same 6 modules ran one at a time, with a short time limit, without a problem of
+  the computer. They gave the known failures of the table in "The checks" (pinned clone: 20 in
+  `test_cupy_array_path.py`, 2 in `test_subnormal_policy.py`, 5 in the Triton weld contract; with both patches: 4 in
+  the Metal weld contract, 5 in the Triton weld contract). The tests, the benches and the example checks of this
+  folder followed.
 
 ## Open items
 
-- The pinned clone on the GPU computer has no patch yet. The runs above used a work copy with both patches
-  (`ADDON_GPU_CLONE`). After `tools/env/addon_gpu.sh` applies the patches, run the tests without that variable.
-- The rest of the suite of the add-on (about 250 test modules) has not run on this GPU. Run it one module at a
+- The checks and benches above used a work copy with both patches (`ADDON_GPU_CLONE`). Since 2026-11-07 21:30
+  the pinned clone on the GPU computer carries both patches (`tools/env/addon_gpu.sh`), and the tests of this folder
+  pass on it; the benches and the example checks have not run again on it.
+- 403 of the 409 test modules of the add-on have not run on this GPU ("The checks"). Run them one module at a
   time (see "History").
 - The setup time: the lift reads the permittivity one point at a time for this solver build. A bulk read that the
   add-on has compared for this build would shorten it.
@@ -183,6 +208,7 @@ environment (and `MEEP_GPU_KERNEL_TABLE=cuda` or `triton` to select one table). 
 - `compare_legs.py`: the relative L2 difference and the differing float32 words of two saved legs.
 - `subnormal_gate.py`: runs the subnormal gate of the add-on with the keep cache folder and the hipRTC options.
 - `triton_subnormal_probe.py`: keep or flush, bit for bit, for the Triton op classes of the kernels.
+- `keep_key_probe.py`: is the keep token of patch 0002 in the CuPy cache key, before and after the keep install.
 - `tests/`: the pytest tests (GPU computer only).
 - `bench/bench_addon.py`: the bench, one JSON line per leg (the CPU solver with 1 and 4 OpenMP threads, both
   kernel tables, the array path).
