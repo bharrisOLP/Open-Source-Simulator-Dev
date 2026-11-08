@@ -7,7 +7,8 @@ ideal lenses (f 2 mm and 5 mm, 4f) onto SMF-28 (MFD 10.4 um, w = 5.2 um).
 
 - The rays are traced one time (trace_bundle). The focus scan computes all planes in one pass over the rays, with
   the plane-wave phase k N' dz per ray and plane (image_planes); the output also gives the time and the result of
-  one image sum per plane (the method before image_planes) and of the complex64 option. Each lateral point is one
+  one image sum per plane (the method before image_planes), of the complex64 option and of the non-uniform FFT
+  (image_planes with method "nufft", the default tol 1e-12; the grid is uniform). Each lateral point is one
   overlap with the moved fiber mode (lateral_scan: all points of the 2-D scan in two matrix products). Only the
   efficiencies come back to the host. The efficiencies use p0, the power on the image grid at the image surface,
   for all planes (see the comment at p0); the output also gives the power on the grid of each plane and the
@@ -207,9 +208,9 @@ E0 = image_sum(bundle, xi, xi)
 p0 = torch.vdot(E0.ravel(), E0.ravel()).real
 
 
-def focus_scan(dtype=torch.complex128):
+def focus_scan(dtype=torch.complex128, method="direct"):
     """All planes in one pass over the rays (image_planes), then one eta per plane."""
-    return overlap_efficiency_device(image_planes(bundle, xi, xi, dzs, dtype=dtype), fiber, power=p0)
+    return overlap_efficiency_device(image_planes(bundle, xi, xi, dzs, dtype=dtype, method=method), fiber, power=p0)
 
 
 def focus_scan_per_plane():
@@ -218,11 +219,12 @@ def focus_scan_per_plane():
                         for dz in dzs])
 
 
-focus_scan(), focus_scan(torch.complex64), focus_scan_per_plane()             # warm-up
+focus_scan(), focus_scan(torch.complex64), focus_scan_per_plane(), focus_scan(method="nufft")   # warm-up
 eta_z, t_focus = best_of(focus_scan)
 eta_pp, t_pp = best_of(focus_scan_per_plane)
 eta_32, t_32 = best_of(lambda: focus_scan(torch.complex64))
-eta_z, eta_pp, eta_32 = (v.cpu().numpy() for v in (eta_z, eta_pp, eta_32))
+eta_nu, t_nu = best_of(lambda: focus_scan(method="nufft"))
+eta_z, eta_pp, eta_32, eta_nu = (v.cpu().numpy() for v in (eta_z, eta_pp, eta_32, eta_nu))
 i_best = int(np.argmax(eta_z))
 E_best = image_sum(bundle, xi, xi, dz=float(dzs[i_best]))
 lat, t_lat = best_of(lambda: lateral_scan(E_best, xi, xi, W_FIBER, shifts, shifts, power=p0))
@@ -287,6 +289,8 @@ print(json.dumps({
     "focus_per_plane_s_per_point": round(t_pp / dzs.size, 5), "focus_c64_s_per_point": round(t_32 / dzs.size, 6),
     "max_d_eta_focus_batched_vs_per_plane": float(np.max(np.abs(eta_z - eta_pp))),
     "max_d_eta_focus_c64_vs_c128": float(np.max(np.abs(eta_32 - eta_z))),
+    "focus_nufft_s_per_point": round(t_nu / dzs.size, 6),
+    "max_d_eta_focus_nufft_vs_c128": float(np.max(np.abs(eta_nu - eta_z))),
     "lateral_points": int(lat.size), "lateral_s_per_point": round(t_lat / lat.size, 8),
     "eta_at_focus": round(float(eta_z[dzs.size // 2]), 4), "best_dz_um": float(dzs[i_best]),
     "eta_best": round(float(eta_z[i_best]), 4),

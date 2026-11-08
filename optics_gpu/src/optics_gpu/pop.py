@@ -39,11 +39,17 @@ its product with the y factors sums groups of GROUP_RAYS rays (one batched produ
 are added in complex128.
 The groups give the GPU parallel work also for a small image (one 128 x 128 plane), and they keep the float32 sums
 short for the complex64 option.
+
+image_planes(..., method="nufft") computes the same sum on a uniform image grid by a type-1 non-uniform FFT
+(_image_planes_nufft): each ray spreads its weight with an "exponential of semicircle" kernel onto w x w points of
+a fine grid (2x oversampled), one FFT per plane, then a division by the transform of the kernel. The error is at
+most tol sum_r |a_r| in the tests (nufft_width sets w by tol). The default stays the direct sum.
 """
 
 from __future__ import annotations
 
 import contextlib
+import warnings
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
 
@@ -59,6 +65,12 @@ PHASE32_MAX = 256.0      # rad: the largest grid phase k L' (x - xc) of the comp
 TRACE_RAYS = 1 << 21     # rays per block of the device trace, Jacobian and weights (see trace_bundle)
 COPY_TOL = 1e-9          # mm and direction cosines: the PyTorch copy of an optic against the original (check rays)
 N_CHECK = 25             # check rays of the PyTorch copy of an optic
+NUFFT_SIGMA = 2          # the non-uniform FFT: the fine grid has at least NUFFT_SIGMA x the image points per axis
+NUFFT_BETA = 2.30        # beta / w of its "exponential of semicircle" kernel for NUFFT_SIGMA 2 (Barnett et al. 2019)
+NUFFT_QUAD = 128         # Gauss-Legendre nodes of the Fourier transform of the kernel (the deconvolution)
+NUFFT_COPIES = 16        # at most this many copies of the fine grid in the spread (fewer atomic adds to one value)
+NUFFT_MIN_CHUNK = 4096   # rays per chunk of the spread, at least, when one plane of the fine grid fills the budget
+UNIFORM_TOL = 64 * float(np.finfo(float).eps)   # a uniform image axis: |x_i - (x_0 + i h)| <= UNIFORM_TOL max|x|
 
 
 def gaussian(x: np.ndarray, y: np.ndarray, w: float) -> np.ndarray:
@@ -460,22 +472,31 @@ def _grid(v, dev: torch.device, name: str) -> torch.Tensor:
 
 
 def image_sum(bundle: RayBundle, x_img, y_img, dz: float = 0.0, ray_chunk: int | None = None,
-              dtype: torch.dtype = torch.complex128) -> torch.Tensor:
+              dtype: torch.dtype = torch.complex128, method: str = "direct", tol: float = 1e-12) -> torch.Tensor:
     """The field E (Nx, Ny), complex128 on the device of the bundle, on the grid (x_img, y_img) in um (NumPy
     arrays or tensors) in the plane at dz um after the image surface (dz < 0: before it):
     E(x, y) = sum_r a_r exp(i k (L'_r x + M'_r y + N'_r dz)). A plane wave per ray: this is the angular-spectrum
-    propagation of the field in image space (air). One plane of image_planes (ray_chunk and dtype: see there)."""
+    propagation of the field in image space (air). One plane of image_planes (ray_chunk, dtype, method and tol:
+    see there)."""
     one = dz.reshape(1) if isinstance(dz, torch.Tensor) else [float(dz)]
-    return image_planes(bundle, x_img, y_img, one, ray_chunk=ray_chunk, dtype=dtype)[0]
+    return image_planes(bundle, x_img, y_img, one, ray_chunk=ray_chunk, dtype=dtype, method=method, tol=tol)[0]
 
 
 def image_planes(bundle: RayBundle, x_img, y_img, dz, ray_chunk: int | None = None,
-                 dtype: torch.dtype = torch.complex128) -> torch.Tensor:
+                 dtype: torch.dtype = torch.complex128, method: str = "direct", tol: float = 1e-12) -> torch.Tensor:
     """The fields E (Z, Nx, Ny), complex128 on the device of the bundle, on the grid (x_img, y_img) in um in the Z
     planes dz (um after the image surface; a number or a 1-D array or tensor):
     E_z(x, y) = sum_r a_r exp(i k (L'_r x + M'_r y + N'_r dz_z)), the same sum as image_sum for each plane.
 
-    One pass over the rays for all planes. For each chunk of rays:
+    method "direct" (the default): the sum below, 8 Nx Ny floating-point operations per ray and plane.
+    method "nufft": a type-1 non-uniform FFT (_image_planes_nufft), w^2 complex additions per ray and plane (w = 15
+    for the default tol) plus one FFT per plane, with an error of at most tol sum_r |a_r| in the tested cases (tol
+    from 1e-12 to 1e-2 sets the kernel width w; see nufft_width). It needs a uniform grid on each axis
+    (x_i = x_0 + i h within UNIFORM_TOL max|x|; for example np.arange or np.linspace); for another grid it warns and
+    uses the direct sum. It computes in complex128 only (dtype complex64 with method "nufft" gives a ValueError).
+    The default stays "direct" (README, "The non-uniform FFT").
+
+    The direct sum: one pass over the rays for all planes. For each chunk of rays:
     1. the weights of each plane, w_zr = a_r exp(i (k L'_r xc + k M'_r yc + k N'_r dz_z)), in float64 (the phase
        reference: xc and yc are the centers of the grid axes; the large phases k N' dz stay in float64);
     2. the grid factors exp(i k L'_r (x - xc)) (Nx, chunk) and exp(i k M'_r (y - yc)) (Ny, chunk) in dtype;
@@ -495,12 +516,28 @@ def image_planes(bundle: RayBundle, x_img, y_img, dz, ray_chunk: int | None = No
 
     ray_chunk: rays per chunk, at least 1. None: _planes_step, the chunk whose temporaries (weights, factors,
     products) are at most SUM_ELEMENTS complex128 values, a multiple of GROUP_RAYS when it is larger than
-    GROUP_RAYS. The result E (Z Nx Ny complex128 values) is outside that budget."""
+    GROUP_RAYS. The result E (Z Nx Ny complex128 values) is outside that budget. For method "nufft", ray_chunk
+    is the rays per chunk of the spread (None: _nufft_steps)."""
     if dtype not in (torch.complex128, torch.complex64):
         raise ValueError(f"dtype {dtype}: use torch.complex128 or torch.complex64")
+    if method not in ("direct", "nufft"):
+        raise ValueError(f"method {method!r}: use 'direct' or 'nufft'")
     dev = bundle.device
     xi, yi, dzs = _grid(x_img, dev, "x_img"), _grid(y_img, dev, "y_img"), _grid(dz, dev, "dz")
     nz, nx, ny = dzs.numel(), xi.numel(), yi.numel()
+    if method == "nufft":
+        if dtype != torch.complex128:
+            raise ValueError("the non-uniform FFT computes in complex128 only: use dtype=torch.complex128")
+        w, beta = nufft_width(tol)
+        if ray_chunk is not None and ray_chunk < 1:
+            raise ValueError(f"ray_chunk {ray_chunk}: use an integer of at least 1, or None")
+        if nz * nx * ny == 0 or bundle.n_rays == 0:
+            return torch.zeros((nz, nx, ny), dtype=torch.complex128, device=dev)
+        ax, ay = _uniform_axis(xi), _uniform_axis(yi)
+        if ax is not None and ay is not None:
+            return _image_planes_nufft(bundle, ax, ay, nx, ny, dzs, w, beta, ray_chunk)
+        warnings.warn("image_planes: the image grid is not uniform on each axis, so the non-uniform FFT cannot be "
+                      "used; the direct sum computes the field", stacklevel=2)
     step = _planes_step(ray_chunk, nz, nx, ny, dtype)
     E = torch.zeros((nz * nx, ny), dtype=torch.complex128, device=dev)
     if E.numel() == 0 or bundle.n_rays == 0:
@@ -607,6 +644,175 @@ def _check_phase32(bundle: RayBundle, xr: torch.Tensor, yr: torch.Tensor) -> Non
     if not worst <= PHASE32_MAX:
         raise ValueError(f"the largest grid phase of the complex64 image sum is {worst:.0f} rad (limit "
                          f"{PHASE32_MAX:.0f}): use dtype=torch.complex128, or a smaller image grid")
+
+
+# ---------------------------------------------------------------------------------------------------------------
+# The non-uniform FFT of the image sum (image_planes, method "nufft")
+# ---------------------------------------------------------------------------------------------------------------
+
+def nufft_width(tol: float) -> tuple[int, float]:
+    """The kernel width w (fine-grid points per axis) and the shape beta of the "exponential of semicircle" (ES)
+    kernel phi(z) = exp(beta (sqrt(1 - z^2) - 1)), |z| <= 1, for the tolerance tol (1e-12 to 1e-2) with a fine grid
+    of NUFFT_SIGMA = 2 x the image points: w = ceil(log10(1 / tol)) + 3 and beta = NUFFT_BETA w. The kernel and
+    beta are those of A. H. Barnett, J. Magland and L. af Klinteberg, "A parallel nonuniform fast Fourier transform
+    library based on an 'exponential of semicircle' kernel", SIAM J. Sci. Comput. 41 (2019) C479. Their width,
+    ceil(log10(1 / tol)) + 1, is for a relative l2 error of about tol. Here tol is a bound of the largest error
+    relative to sum_r |a_r|: the worst case is one ray at the worst position on both axes of a grid with the fine
+    grid exactly 2 Nx (the x and y errors add). tests/test_nufft.py (test_nufft_of_one_ray_at_the_worst_position)
+    shows that the width of the paper and that width plus 1 are above tol there, and that plus 2 (this width) is
+    below tol. The range stops at 1e-12, near the float64 rounding of the sum."""
+    if not 1e-12 <= tol <= 1e-2:
+        raise ValueError(f"tol {tol}: use a tolerance from 1e-12 to 1e-2")
+    w = int(np.ceil(-np.log10(tol) - 1e-9)) + 3
+    return w, NUFFT_BETA * w
+
+
+def _uniform_axis(v: torch.Tensor) -> tuple[float, float] | None:
+    """(x_0, h) of a uniform grid axis v (a 1-D tensor; Nx values come to the host): v_i = x_0 + i h within
+    UNIFORM_TOL max|v|, h = (v_last - v_0) / (N - 1) not 0. One point: (v_0, 1.0) (any step gives its one value).
+    None for a non-uniform axis."""
+    a = v.detach().cpu().numpy().astype(float)
+    if a.size == 1:
+        return float(a[0]), 1.0
+    h = (a[-1] - a[0]) / (a.size - 1)
+    if not (np.isfinite(h) and h != 0):
+        return None
+    worst = np.max(np.abs(a - (a[0] + np.arange(a.size) * h)))
+    return (float(a[0]), float(h)) if worst <= UNIFORM_TOL * np.max(np.abs(a)) else None
+
+
+def _fine_size(n: int, w: int) -> int:
+    """The points of the fine grid on one axis: the smallest even 2^a 3^b 5^c at least NUFFT_SIGMA n and 2 w."""
+    m = max(NUFFT_SIGMA * n, 2 * w)
+    while True:
+        r = m
+        for p in (2, 3, 5):
+            while r % p == 0:
+                r //= p
+        if r == 1 and m % 2 == 0:
+            return m
+        m += 1
+
+
+def _es_transform(m: np.ndarray, n_fine: int, w: int, beta: float) -> np.ndarray:
+    """psi(m) = integral of phi(2 s / w) exp(i 2 pi m s / n_fine) ds (s in fine-grid cells), the Fourier transform
+    of the ES kernel at the modes m (phi is even and real): (w / 2) integral over z in [-1, 1] of
+    phi(z) cos(xi w z / 2) dz, xi = 2 pi m / n_fine. With z = sin(t), t in [-pi/2, pi/2], phi(sin t) =
+    exp(beta (cos t - 1)) and the integrand exp(beta (cos t - 1)) cos(xi w sin(t) / 2) cos(t) are smooth (in z, phi
+    has square-root ends, so a Gauss-Legendre rule in z converges slowly); NUFFT_QUAD Gauss-Legendre nodes in t."""
+    u, wq = np.polynomial.legendre.leggauss(NUFFT_QUAD)
+    t, wt = 0.5 * np.pi * u, 0.5 * np.pi * wq
+    weight = wt * np.exp(beta * (np.cos(t) - 1.0)) * np.cos(t)
+    xi = 2 * np.pi * np.asarray(m, float) / n_fine
+    return 0.5 * w * (np.cos(np.outer(xi, 0.5 * w * np.sin(t))) @ weight)
+
+
+def _es_spread_1d(f: torch.Tensor, n_fine: int, w: int, beta: float) -> tuple[torch.Tensor, torch.Tensor]:
+    """The ES kernel values (c, w) and their fine-grid indices (c, w) on one axis for the c rays with f = cycles
+    per image grid step (L' h / lambda). Only f mod 1 matters (the field on the grid is periodic in f), so u =
+    (f - round(f)) n_fine is in [-n_fine / 2, n_fine / 2]; the kernel covers the w points l0 .. l0 + w - 1,
+    l0 = ceil(u - w / 2) (indices mod n_fine), at z = (l - u) 2 / w in [-1, 1]."""
+    u = (f - torch.round(f)) * n_fine
+    l0 = torch.ceil(u - 0.5 * w)
+    j = torch.arange(w, dtype=torch.float64, device=f.device)
+    z = (l0[:, None] - u[:, None] + j) * (2.0 / w)
+    phi = torch.exp(beta * (torch.sqrt(torch.clamp(1.0 - z * z, min=0.0)) - 1.0))
+    idx = torch.remainder(l0.to(torch.int64)[:, None] + j.to(torch.int64), n_fine)
+    return phi, idx
+
+
+def _nufft_steps(ray_chunk: int | None, nz: int, n1: int, n2: int, w: int) -> tuple[int, int, int]:
+    """(planes per batch zb, copies of the fine grid K, rays per chunk) of _image_planes_nufft, in complex128
+    values. A batch of zb planes keeps the fine grids (n1 n2 zb); the FFT step (the fine grids, the output of the
+    FFT and its work arrays) needs a few times that: zb is the most planes with 6 n1 n2 zb at most SUM_ELEMENTS (at
+    least 1; tests/test_nufft.py checks the peak against the budget). The spread adds into K copies of the fine
+    grids (the rays in turn): K n1 n2 zb is at most SUM_ELEMENTS / 8, K from 1 to NUFFT_COPIES. A chunk of the
+    spread keeps per ray the values (w^2 zb), the indices and the products of the kernels (2 w^2) and small vectors
+    (6 w + 3 zb): the chunk is the most rays whose temporaries, with the K copies, are at most SUM_ELEMENTS (at
+    least 1), or ray_chunk.
+    Exception: if 6 n1 n2 is above SUM_ELEMENTS (with the default, an image grid above about 1150 x 1150 points),
+    a batch is one plane, the chunk is at least NUFFT_MIN_CHUNK rays (from about 2800 x 2800 points the fine grid
+    alone fills the budget), and the peak is above the budget: the fine grid, its FFT step, and NUFFT_MIN_CHUNK
+    times the values per ray."""
+    zb = max(1, min(nz, SUM_ELEMENTS // (6 * n1 * n2)))
+    copies = max(1, min(NUFFT_COPIES, SUM_ELEMENTS // (8 * n1 * n2 * zb)))
+    if ray_chunk is not None:
+        return zb, copies, ray_chunk
+    per_ray = w * w * (zb + 2) + 6 * w + 3 * zb
+    step = (SUM_ELEMENTS - copies * n1 * n2 * zb - ALLOC_SLACK) // per_ray
+    return zb, copies, max(NUFFT_MIN_CHUNK if 6 * n1 * n2 > SUM_ELEMENTS else 1, step)
+
+
+def _golden_stride(n: int) -> int:
+    """A step coprime with n near 0.618 n (1 for n <= 2): the rays r * step mod n (r = 0 .. n - 1) are all rays,
+    and rays next to each other in that order are far apart in the order of the direction grid."""
+    if n <= 2:
+        return 1
+    s = max(1, round(0.6180339887498949 * n))
+    while np.gcd(s, n) != 1:
+        s += 1
+    return s
+
+
+def _image_planes_nufft(bundle: RayBundle, ax: tuple[float, float], ay: tuple[float, float], nx: int, ny: int,
+                        dzs: torch.Tensor, w: int, beta: float, ray_chunk: int | None) -> torch.Tensor:
+    """image_planes by a type-1 non-uniform FFT on the uniform grid x_i = x0 + i hx (i < nx), y_j = y0 + j hy
+    (j < ny) (ax = (x0, hx), ay = (y0, hy)): (Z, Nx, Ny) complex128 on the device of the bundle.
+
+    With the modes m = i - Nx // 2 and n = j - Ny // 2 and the grid point (x_ref, y_ref) of m = n = 0,
+    E_z(m, n) = sum_r c_zr exp(i 2 pi (m f_r + n g_r)), c_zr = a_r exp(i k (L'_r x_ref + M'_r y_ref + N'_r dz_z))
+    (in float64, as the phase reference of the direct sum), f_r = L'_r hx / lambda and g_r = M'_r hy / lambda.
+    1. Spread: each ray adds c_zr phi_x phi_y to w x w points of a periodic fine grid of n1 x n2 points (n1 at
+       least 2 Nx; index_add_, complex128), at its position (f_r mod 1) n1, (g_r mod 1) n2 in fine-grid cells.
+    2. One inverse FFT per plane (unnormalized): sum_l b_l exp(+i 2 pi m l / n1) (and the same in y).
+    3. Deconvolution: the modes m, n of the FFT divided by psi_x(m) psi_y(n) (_es_transform). Errors: the kernel
+       is cut at |z| = 1 and the fine grid aliases; both fall with w (nufft_width).
+    The planes go in batches of zb planes, the rays in chunks (_nufft_steps); each batch computes the kernel values
+    again (2 w per ray), and the spread of a batch adds w^2 zb values per ray."""
+    dev, k = bundle.device, bundle.k
+    nz = dzs.numel()
+    (x0, hx), (y0, hy) = ax, ay
+    n1, n2 = _fine_size(nx, w), _fine_size(ny, w)
+    mx, my = np.arange(nx) - nx // 2, np.arange(ny) - ny // 2
+    x_ref, y_ref = x0 + (nx // 2) * hx, y0 + (ny // 2) * hy
+    corr = 1.0 / np.outer(_es_transform(mx, n1, w, beta), _es_transform(my, n2, w, beta))
+    corr = torch.as_tensor(corr, dtype=torch.float64, device=dev)[:, :, None]
+    rows = torch.as_tensor(np.remainder(mx, n1), device=dev)
+    cols = torch.as_tensor(np.remainder(my, n2), device=dev)
+    zb, copies, step = _nufft_steps(ray_chunk, nz, n1, n2, w)
+    E = torch.empty((nz, nx, ny), dtype=torch.complex128, device=dev)
+    for z0 in range(0, nz, zb):
+        kdz = k * dzs[z0:z0 + zb]
+        nb = kdz.numel()
+        b = torch.zeros((copies * n1 * n2, nb), dtype=torch.complex128, device=dev)
+        for Lo, Mo, No, ao in bundle.blocks:
+            n = ao.numel()
+            stride = _golden_stride(n)
+            for s in range(0, n, step):
+                sel = torch.arange(s, min(s + step, n), device=dev).mul_(stride).remainder_(n)
+                L, M = Lo[sel], Mo[sel]
+                px, ix = _es_spread_1d(L * (hx / bundle.wavelength), n1, w, beta)
+                py, iy = _es_spread_1d(M * (hy / bundle.wavelength), n2, w, beta)
+                ph = No[sel, None] * kdz[None, :]                              # (c, zb) float64
+                ph += ((k * x_ref) * L + (k * y_ref) * M)[:, None]
+                c = (1j * ph).exp_().mul_(ao[sel, None])                       # (c, zb), the weights
+                del sel, ph
+                ix += (torch.arange(ix.shape[0], device=dev) % copies)[:, None] * n1   # the copy of each ray
+                idx = (ix[:, :, None] * n2 + iy[:, None, :]).reshape(-1)       # (c w^2)
+                del ix, iy
+                pxy = px[:, :, None] * py[:, None, :]                           # (c, w, w)
+                del px, py
+                vals = pxy[:, :, :, None] * c[:, None, None, :]                 # (c, w, w, zb)
+                del pxy, c
+                b.index_add_(0, idx, vals.reshape(-1, nb))
+                del idx, vals
+        if copies > 1:
+            b = b.reshape(copies, n1 * n2, nb).sum(0)
+        F = torch.fft.ifft2(b.reshape(n1, n2, nb), dim=(0, 1), norm="forward")
+        del b
+        E[z0:z0 + nb] = (F.index_select(0, rows).index_select(1, cols) * corr).permute(2, 0, 1)
+        del F
+    return E
 
 
 def _image_sum_direct(bundle: RayBundle, x_img, y_img, dz: float = 0.0,
