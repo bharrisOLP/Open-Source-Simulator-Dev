@@ -4,22 +4,24 @@ Updated: 2026-11-08.
 
 ## In work
 
-**Now (2026-11-08; the fourth to seventh waves, one agent per package).** Each change gets one review before its
-commit.
+**Now (2026-11-08; the fourth to eighth waves, one agent per package).** Each change gets one review before its
+commit. In work (eighth wave): the add-on route, more of the add-on's 409 test modules on the AMD GPU (one at a
+time); fdtd_gpu, dispersive materials (Drude and Lorentz); photonsuite, EME against FDTD with subpixel averaging on
+a taper. Done after the seventh wave: the near-to-far follow-ups (63b31de, 1e801bc).
 - Seventh wave (new features), done: charge_gpu, temperature dependence from 250 to 500 K (42e1e84; n_i(T) of
   Misiakos and Tsamakis, the Arora mobility(T), tau ~ T^-1/2; bit-identical at 300 K; the long-base diode within
-  0.5 % of Shockley(T); at 360 K the depletion modulator has 19.6 % more series resistance and 17.0 to 20.6 % less
-  intrinsic bandwidth); photonsuite, the switching time of a thermo-optic phase shifter (a24b9c6; the phase from
-  the thermal transient and one mode solve, the exact first-order derivative; 17.94 us with constant kappa, 17.61
+  0.5 % of Shockley(T); at 360 K the depletion modulator has 19.6 to 19.7 % more series resistance and 17.0 to
+  20.6 % less intrinsic bandwidth, at 0 to 4 V reverse bias); photonsuite, the switching time of a thermo-optic
+  phase shifter (a24b9c6; the phase from the thermal transient and one mode solve, the exact first-order derivative; 17.94 us with constant kappa, 17.61
   us (on) and 17.87 us (off) with Si and SiO2 kappa(T)); fdtd_gpu, a near-to-far-field transform with exact
   Green's functions (c17cb93; second order against the analytic dipole and line-source fields; far-field power
   equal to the box flux to 0.3 %; fdtdx applies the source current half a time step late, documented). In work:
   the minor review findings of the near-to-far change.
 - Sixth wave (new features), done: thermal_gpu, transients with kappa(T) and rho c_p(T) (486b1d5; second order
   in dt against solve_ivp; timings a47f265: a second run costs 1.8x to 2.6x the constant-kappa transient with Si
-  and SiO2 kappa(T)); optics_gpu, a type-1 non-uniform FFT for the image sum (ab60025; 1.3x to about 190x faster
-  than the direct complex128 sum, where the upper end has a direct time estimated from a subset of the rays; error
-  at most 1.8e-14 of sum|a|; the default stays "direct"); bands_gpu, the eps sampling on the GPU
+  and SiO2 kappa(T)); optics_gpu, a type-1 non-uniform FFT for the image sum (ab60025; at tol 1e-12, 1.3x to about
+  194x faster than the direct complex128 sum, where the upper end has a direct time estimated from a subset of
+  the rays; error at most 1.8e-14 of sum|a|; the default stays "direct"); bands_gpu, the eps sampling on the GPU
   (2ce1bdd; 16.5x to 404x faster after the first call, equal to the CPU path; 3-D checks against an exact slab and
   an independent supercell; no published gap value was found without WebFetch). All three reviews failed first
   and were fixed: a label array in the wrong layout was reshaped silently (thermal); the NUFFT tolerance was not a

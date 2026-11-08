@@ -101,3 +101,7 @@ line, then delete it yourself or reject it.
 | 2026-11-08 | GPU computer | `/tmp/rvw8_stress.py` | scratch files of a reviewer (tests and checks) | not needed: no result depends on them |
 | 2026-11-08 | GPU computer | `/tmp/rv_sw_checks.py` | a scratch script of a reviewer (tests and checks) | not needed: no result depends on it |
 | 2026-11-08 | GPU computer | `/tmp/rv_n2f_a2cc.py` | a scratch script of a reviewer (tests and checks) | not needed: no result depends on it |
+| 2026-11-08 | GPU computer | `/dev/shm/n2f_2d_check.json` | the output of one bench row of an agent | not needed: the logged rows are in benchmarks/ |
+| 2026-11-08 | GPU computer | `/tmp/rv_n2f_302c.py` | a scratch script of a reviewer (tests and checks) | not needed: no result depends on it |
+| 2026-11-08 | GPU computer | `/tmp/rvw_chk.py` | a scratch file of a reviewer (tests and checks) | not needed: no result depends on it |
+| 2026-11-08 | GPU computer | `/tmp/rvw_out.txt` | a scratch file of a reviewer (tests and checks) | not needed: no result depends on it |
