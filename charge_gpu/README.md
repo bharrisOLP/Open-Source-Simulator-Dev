@@ -6,6 +6,8 @@ Carrier distributions of PN and PIN junctions on the GPU (JAX; AMD ROCm first), 
 - forward and reverse bias with currents (injection phase shifters, diodes): drift-diffusion, the van Roosbroeck
   system (`drift_diffusion.py`);
 - then the plasma dispersion effect and, with meow-gpu, the change of the mode index, V_pi L or L_pi, and the loss.
+- at one device temperature from 250 to 500 K (`Device.T`; `temperature.py`): V_T, n_i(T), the mobility and the SRH
+  lifetimes.
 
 ```python
 import jax; jax.config.update("jax_enable_x64", True)   # float64 (in float32 the solve cannot reach its tolerance)
@@ -29,6 +31,9 @@ g = dd.solve(pin, 0.0, 0.95, guess=sols[1], method="gummel", linear="device", ta
 g.converged, g.linear_error, g.linear_fallbacks          # Gummel with all steps on the JAX device (continuity.py)
 d = dd.solve(pin, 0.0, 0.95, guess=sols[1], linear="device", tau_n=1e-9, tau_p=1e-9)
 d.krylov_iterations, d.linear_fallbacks, d.timings      # Newton, the linear solves on the JAX device (coupled.py)
+
+pin.T = 330.0                                             # K: V_T, n_i(T), mobility, lifetimes (temperature.py)
+hot = dd.sweep(pin, [0.9], tau_n=1e-9, tau_p=1e-9)        # tau_n, tau_p: the 300 K values (scaled to 330 K)
 ```
 
 ## Method
@@ -83,9 +88,11 @@ and the results of `poisson.py` and `rc.py` do not change):
 - Ohmic contacts: the contact node, half a cell from the cell center, has the charge-neutral equilibrium values
   (psi as in `poisson.py`, both quasi-Fermi levels at the contact voltage). The contact current is the sum of the
   Scharfetter-Gummel currents of the contact faces.
-- Mobility: the Masetti mobility of `rc.py` (Si, 300 K, from |N_D - N_A|). It is constant in the field: no velocity
+- Mobility: the Masetti mobility of `rc.py` (Si, 300 K, from |N_D - N_A|; at another `Device.T` times the ratio of
+  Arora et al., below). It is constant in the field: no velocity
   saturation and no carrier-carrier scattering. A user mobility (per cell or scalar) is an option.
-- Recombination: Shockley-Read-Hall with a midgap trap and constant lifetimes. Default tau_n = tau_p = 1 us (a
+- Recombination: Shockley-Read-Hall with a midgap trap and lifetimes constant in space (the 300 K values, scaled
+  with temperature, below). Default tau_n = tau_p = 1 us (a
   usual value for moderately doped bulk Si). The checks and the use case give their own lifetimes: 100 us for the
   Shockley check (see there), 1 ns and 10 ns for the SOI rib (effective lifetime of SOI rib waveguides about 1 ns:
   Dimitropoulos et al., Appl. Phys. Lett. 86, 071115 (2005)).
@@ -211,6 +218,37 @@ unknowns.
   0.005 s with SuperLU (test prints of the run of 2026-11-07). It also adds the compile time per mesh. Use
   `linear="device"` for 2-D meshes like the rib of the bench (36 600 cells and more).
 
+### Temperature (`temperature.py`)
+
+`Device.T` (one scalar in K, 250 to 500 K; default 300 K) sets the temperature of all solvers: `poisson.solve`,
+`rc.small_signal`, and `drift_diffusion.solve` and `sweep` with both methods and both linear solvers.
+
+- V_T = k T / q.
+- n_i(T) = `Device.n_i` x f(T) / f(300 K), f(T) = 5.29e19 (T / 300)^2.54 exp(-6726 / T) cm^-3: the fit of Misiakos and
+  Tsamakis, J. Appl. Phys. 74, 3293 (1993), to their measurements from 78 to 340 K. `Device.n_i` stays the 300 K
+  value (default 1.00e10 cm^-3, Sproul and Green, J. Appl. Phys. 70, 846 (1991); the fit itself gives 9.70e9 cm^-3
+  at 300 K), so the fit gives only the temperature dependence. `Device.n_i_t` is the value at T. Above 340 K the fit
+  is an extrapolation (the check below compares it with the band-gap form up to 400 K).
+- Mobility: the Masetti mobility (300 K) times mu_Arora(N, T) / mu_Arora(N, 300 K), with the model of Arora, Hauser
+  and Roulston, IEEE Trans. Electron Devices ED-29, 292 (1982), fitted to measurements from 250 to 500 K:
+  - electrons: 88 Tn^-0.57 + 7.4e8 T^-2.33 / (1 + (N / (1.26e17 Tn^2.4))^(0.88 Tn^-0.146)),
+  - holes: 54.3 Tn^-0.57 + 1.36e8 T^-2.23 / (1 + (N / (2.35e17 Tn^2.4))^(0.88 Tn^-0.146)),
+  - Tn = T / 300, N in cm^-3, mu in cm^2/(V s). So the doping dependence at 300 K stays that of Masetti, and the
+    published temperature dependence is added. A user mobility (`mobility=`) is used as given (the value at T).
+- SRH lifetimes: `tau_n` and `tau_p` are the values at 300 K. The solver uses tau (T / 300)^tau_exponent, default
+  tau_exponent = -1/2: tau = 1 / (sigma v_th N_t) with a constant capture cross section and trap density and the
+  thermal velocity v_th ~ sqrt(T) (Sze and Ng, Physics of Semiconductor Devices, 3rd ed., Ch. 1). The trap stays at
+  midgap (n_1 = p_1 = n_i(T)). `tau_exponent=0` keeps the lifetimes constant. `DDSolution.tau_n` and `tau_p` are
+  the values used.
+- At exactly 300 K each model returns its 300 K input unchanged: the results are those of the code before this
+  change, bit for bit (below).
+- One temperature per device. `temperature.mean_temperature(dev, t_field)` gives the area mean and the spread
+  (max - min) of a field of thermal-gpu on the device cells (for example `thermal_gpu.solver.solve_steady` on the
+  edges `dev.x`, `dev.y`): set `dev.T` to the mean. A field that changes from cell to cell is not modeled: a
+  temperature gradient needs the thermoelectric terms in the current equations and the band offsets of E_g(T).
+- Not modeled: the temperature dependence of eps_r and of the plasma dispersion coefficients (Soref and Bennett,
+  300 K), the thermo-optic effect, band-gap narrowing.
+
 ## Checks (`tests/test_junction.py`, `tests/test_rc.py`)
 
 | Case | Reference | Agreement |
@@ -323,6 +361,25 @@ far starts also the number of Newton steps, see that row).
 | In `sweep()`: every solve after 0 V raises a RuntimeError that is not from the device solve (as a singular LU factor of SuperLU) | | the step is halved down to `min_step` (0.1 V, then 0.05 V), then RuntimeError "did not converge ... (last error: RuntimeError: Factor is exactly singular)", with that error as its cause (test) |
 | Solution info | | `linear`, `device`, `linear_error` (above 0, at most 1e-6; None when no device solve was used), `timings` (assembly, setup, krylov, linear); SuperLU: `linear_error` None |
 
+## Checks of the temperature models (`tests/test_temperature.py`)
+
+All values from the GPU computer (run of 2026-11-08, 88 passed; the measured values are the test prints of
+`pytest -q -s`). Hand values: `bc -l` from the published formulas, not this code.
+
+| Case | Reference | Agreement |
+|---|---|---|
+| n_i(T) at 250, 275, 325, 350, 375, 400 K (1.00e10 cm^-3 at 300 K) | the Misiakos and Tsamakis fit, hand values: 7.104e7, 1.044e9, 6.875e10, 3.639e11, 1.561e12, 5.644e12 cm^-3 | 1e-9 (test); the fit at 300 K: 9.70e9 cm^-3, within the measured (9.7 +- 0.1)e9 of the paper |
+| the same | an independent form: n_i ~ T^1.5 exp(-E_g(T) / 2 k T), Varshni E_g = 1.170 - 4.73e-4 T^2 / (T + 636) eV (Thurmond, J. Electrochem. Soc. 122, 1133 (1975)), constant effective masses | hand values: +4.4 % (250 K) to -6.5 % (400 K) of the ratio n_i(T) / n_i(300 K); test 7 %. The fit includes the temperature dependence of the effective masses |
+| Mobility at 250, 300, 350, 400 K, 1e16 and 1e18 cm^-3 | the Arora formula, hand values (for example electrons at 1e16 cm^-3: 1761.73, 1218.24, 888.27, 675.51 cm^2/(V s)); lattice values at 300 K 1339.81 and 461.27 | 1e-6 cm^2/(V s); `mobility` = Masetti x the Arora ratio to 1e-9, exactly Masetti at 300 K |
+| 1-D junction (1e18 cm^-3, 0.5 nm cells) at 250, 350, 400 K, 0 V | built-in potential V_T ln(N_A N_D / n_i(T)^2); n p = n_i(T)^2 | tests 1e-4 V; 1e-6 |
+| the same, 0, 1, 3 V reverse | depletion width with the Debye term (Sze) at T; C = eps / W | W: -3.3e-5 to -4.2e-5 at 0 V, -8.1e-6 to -8.6e-6 at 3 V (test 1 %); C: 8.7e-5, 1.10e-4, 1.16e-4 at 0 V (250, 350, 400 K), 1.1e-5 to 1.2e-5 at 3 V (test 3e-4, as at 300 K, where 0 V gives 9.7e-5) |
+| the same | R'_n, R'_p = neutral length / (q mu(T) N t); charge neutrality | tests 1e-4; 1e-3 and 1e-8 |
+| Long-base diode of the Shockley check at 250, 350, 400 K (tau 100 us at 300 K, contacts 6 L(T) away); the biases with the injection levels of 0.60, 0.65, 0.70 V at 300 K | J0(T) (exp(V/V_T) - 1) with n_i(T), D = mu(T) V_T, L = sqrt(D tau(T)) | J / J_Shockley = 1.00378, 1.00141, 0.99930 (250 K: 0.713, 0.755, 0.797 V); 1.00443, 1.00169, 0.99941 (350 K: 0.483, 0.542, 0.600 V); 1.00476, 1.00183, 0.99947 (400 K: 0.363, 0.430, 0.497 V); at 300 K 1.0041, 1.0015, 0.9994. Test 1 % |
+| 1-D junction (2.5 nm cells) at 350 K, 0 V | `poisson.solve`; n p = n_i(350 K)^2; flat quasi-Fermi levels | tests 1e-11 V; 1e-9; 1e-11 V |
+| the same, 0.5 V forward and 1 V reverse | Newton with SuperLU against Gummel (SuperLU), Gummel (device continuity), Newton (device FGMRES) | psi 5.0e-15, 1.2e-14, 3.1e-16 V (0.5 V) and 1.1e-14, 4.9e-15, 1.1e-15 V (1 V); n and p 7.9e-13 or better; current at 0.5 V (8.485e-4 A/m) -1.6e-10, -2.4e-16, 7.6e-19 A/m; no fallback. Tests 1e-11 V, 1e-8, 5e-9 A/m |
+| Device.T = 300 K | the code before this change (commit f3f2f39), CPU JAX on the GPU computer: a script with hashes of psi, n, p and repr values of C', R', currents (`poisson.solve`, `rc.small_signal`, Newton and Gummel, the long-base diode, the PIN rib, the depletion rib) | the same bits (two runs before, one after). The test keeps the repr values at 1e-9 (other BLAS builds) |
+| `mean_temperature`, `lifetime`, the range of T | a linear field 300 to 340 K; a field with 1000 K in the oxide; (4/3)^-1/2 at 400 K | mean 320 K and 330 K; exact at 300 K; ValueError for 240 K, 510 K and an array `Device.T` |
+
 ## Example: depletion modulator (`examples/pn_modulator.py`)
 
 The synthetic rib of `modulator.rib_pn` (3e17 cm^-3 on both sides, contacts 3 um from the rib center), charge-gpu
@@ -434,6 +491,76 @@ GPU computer (the Newton solves on its CPU; `benchmarks/2026-10-30/charge-dd.jso
   250 nm half width need cells of 10 nm or a divisor of it (`rib_pin` raises ValueError otherwise; an earlier
   20 nm comparison had an 80 nm slab, so it measured a change of geometry, not a grid error).
 
+## Example: the two phase shifters at 300, 330 and 360 K (`examples/temperature_dependence.py`)
+
+The depletion rib of `examples/pn_modulator_rc.py` (3e17 cm^-3, 10 nm cells; 0 to 4 V reverse: C', R', f_3dB and,
+with `--modes`, V_pi L and the loss of the mode) and the PIN rib of `examples/pin_phase_shifter.py` (0 to 0.9 V
+forward, lifetimes 1 ns at 300 K: the current, the rib carriers and index change and, with `--modes`, L_pi and
+P_pi), each at 300, 330 and 360 K (`Device.T`). The temperature changes V_T, n_i, the mobility and the lifetimes
+(above). It does not change eps_r, the Soref and Bennett coefficients or the base index of Si and SiO2 (no
+thermo-optic effect): V_pi L and L_pi come from index differences at one temperature. At 300 K the rows equal
+those of `examples/pn_modulator_rc.py` and `examples/pin_phase_shifter.py` (tau 1 ns) to the printed digits.
+
+```
+bash tools/remote.sh sh <<'EOF'
+export OMP_NUM_THREADS=4 OPENBLAS_NUM_THREADS=4 MKL_NUM_THREADS=4 XLA_PYTHON_CLIENT_MEM_FRACTION=0.4
+bash tools/gpu_run.sh charge_gpu python examples/temperature_dependence.py --modes
+EOF
+```
+
+All values below come from the logged rows of this command: `benchmarks/2026-11-08/charge-temperature.jsonl` (24
+rows, all converged; the run of 2026-11-08, 00:48 to 00:49 EST, on the RX 7900 XT with the limits of the shared
+computer), with the printed tables in `benchmarks/2026-11-08/charge-temperature-tables.md`. The values are rounded
+from the rows, and the percentages are ratios of rows at the same bias.
+
+Depletion rib (3e17 cm^-3):
+
+| T (K) | Reverse bias (V) | C' (fF/um) | R' (Ohm mm) | f_3dB, R_s = 0 (GHz) | f_3dB, 0.5 mm, 50 Ohm (GHz) | V_pi L (V cm) | Loss (dB/cm) |
+|---|---|---|---|---|---|---|---|
+| 300 | 0 | 0.334 | 40.0 | 11.9 | 7.34 | - | 7.18 |
+| 300 | 1 | 0.238 | 39.7 | 16.9 | 10.4 | 1.39 | 6.20 |
+| 300 | 2 | 0.197 | 39.4 | 20.4 | 12.5 | 1.60 | 5.49 |
+| 300 | 4 | 0.157 | 39.1 | 25.8 | 15.8 | 1.96 | 4.42 |
+| 330 | 0 | 0.342 | 43.7 | 10.6 | 6.78 | - | 7.23 |
+| 330 | 1 | 0.240 | 43.4 | 15.3 | 9.70 | 1.36 | 6.24 |
+| 330 | 2 | 0.199 | 43.1 | 18.6 | 11.8 | 1.57 | 5.51 |
+| 330 | 4 | 0.158 | 42.8 | 23.5 | 14.9 | 1.93 | 4.44 |
+| 360 | 0 | 0.351 | 47.9 | 9.48 | 6.22 | - | 7.29 |
+| 360 | 1 | 0.243 | 47.4 | 13.8 | 9.05 | 1.33 | 6.28 |
+| 360 | 2 | 0.200 | 47.2 | 16.9 | 11.0 | 1.55 | 5.54 |
+| 360 | 4 | 0.159 | 46.8 | 21.4 | 14.0 | 1.90 | 4.46 |
+
+- From 300 K to 330 K and to 360 K, R' increases by 9.3 % and by 19.6 to 19.7 % at all biases (the mobility falls
+  with T). C' increases by 0.4 to 2.5 % and by 0.8 to 5.2 %, most at 0 V (the built-in potential falls with T).
+- So f_3dB (R_s = 0) falls by 8.9 to 10.8 % and by 17.0 to 20.6 %. With the 50 Ohm source and 0.5 mm it falls by
+  5.7 to 7.7 % and by 11.4 to 15.2 %.
+- V_pi L falls by 1.3 to 1.9 % and by 2.6 to 4.0 % (most at 1 V): with the lower built-in potential the same bias
+  moves the depletion edges more. The loss of the mode increases by 0.5 to 0.8 % and by 0.9 to 1.6 %.
+
+PIN rib (lifetimes used: 1.00, 0.953 and 0.913 ns at 300, 330 and 360 K):
+
+| T (K) | Bias (V) | I (mA/mm) | n rib (cm^-3) | dn rib | dneff | L_pi (mm) | P_pi (mW) | Loss of the mode (dB/cm) | Loss in L_pi (dB) |
+|---|---|---|---|---|---|---|---|---|---|
+| 300 | 0.80 | 0.591 | 4.04e16 | -2.02e-4 | -1.97e-4 | 3.94 | 1.86 | 2.62 | 1.03 |
+| 300 | 0.85 | 1.55 | 9.43e16 | -4.08e-4 | -3.97e-4 | 1.95 | 2.56 | 5.93 | 1.16 |
+| 300 | 0.90 | 3.83 | 1.92e17 | -7.43e-4 | -7.23e-4 | 1.07 | 3.69 | 12.0 | 1.28 |
+| 330 | 0.80 | 1.45 | 8.51e16 | -3.75e-4 | -3.64e-4 | 2.13 | 2.46 | 5.37 | 1.14 |
+| 330 | 0.85 | 3.34 | 1.66e17 | -6.57e-4 | -6.39e-4 | 1.21 | 3.44 | 10.4 | 1.26 |
+| 330 | 0.90 | 7.03 | 2.83e17 | -1.03e-3 | -1.00e-3 | 0.774 | 4.90 | 17.5 | 1.36 |
+| 360 | 0.80 | 3.01 | 1.48e17 | -5.94e-4 | -5.78e-4 | 1.34 | 3.23 | 9.22 | 1.24 |
+| 360 | 0.85 | 6.07 | 2.47e17 | -9.15e-4 | -8.91e-4 | 0.870 | 4.49 | 15.3 | 1.33 |
+| 360 | 0.90 | 11.1 | 3.67e17 | -1.28e-3 | -1.25e-3 | 0.620 | 6.20 | 22.7 | 1.41 |
+
+- At the same bias, from 300 K to 330 K and to 360 K, the current increases by a factor of 1.84 to 2.45 and of 2.90
+  to 5.09 (the largest factor at 0.80 V). |dneff| increases by a factor of 1.38 to 1.85 and of 1.73 to 2.94. So
+  L_pi is shorter (a factor of 0.54 to 0.72 and of 0.34 to 0.58), and P_pi = I V L_pi increases by 32 to 34 % and by
+  68 to 75 %.
+- The loss in L_pi (the loss of the mode times L_pi) is 1.03 to 1.28 dB at 300 K, 1.14 to 1.36 dB at 330 K and 1.24 to
+  1.41 dB at 360 K. At 0 V the loss of the mode is 0.122, 0.123 and 0.125 dB/cm.
+- The current is the same through every column to 1.6e-12 of I or better (0.80 to 0.90 V).
+- Time of the charge part per temperature: 3.73, 2.24 and 2.22 s for the depletion rib (the first with the compile),
+  15.2, 14.2 and 14.0 s for the PIN sweep (Newton with SuperLU).
+
 ## Drift-diffusion bench (`bench/bench_dd.py`)
 
 One JSON line per case:
@@ -526,7 +653,7 @@ GPU (10 and 5 nm), and to 3.3e-10 (10 nm) and 5.6e-10 (5 nm) with it on the CPU.
   threads (`benchmarks/2026-10-30/run-20261030-0626.jsonl`). With multigrid (the RC example, 12 solves per
   doping): 2.6 to 4.4 s per doping for 73k cells on the RX 7900 XT against 2.6 to 3.4 s on the Mac CPU, and 5.3 s
   against 8.6 s for 293k cells (`benchmarks/2026-10-30/charge-rc.jsonl`): no GPU gain at 73k cells.
-- No 3-D, no temperature dependence.
+- No 3-D. One temperature per device (below).
 - Drift-diffusion solvers: both methods can run their linear solves on the device (`linear="device"`). On the SOI
   rib (the bench above) the device Newton is the fastest path: 0.44 to 0.50 s at 10 nm and 0.81 to 0.83 s at 5 nm,
   against 0.76 to 0.77 s and 4.8 s with SuperLU and 1.08 to 20.5 s for the device Gummel path. SuperLU stays the
@@ -554,7 +681,8 @@ GPU (10 and 5 nm), and to 3.3e-10 (10 nm) and 5.6e-10 (5 nm) with it on the CPU.
   choice of the linear solver from the mesh size.
 - Drift-diffusion physics: Boltzmann statistics, SRH with constant lifetimes and a midgap trap, the Masetti
   mobility constant in the field (no velocity saturation, no carrier-carrier scattering), no Auger recombination,
-  no band-gap narrowing, no surface recombination at the oxide, 300 K only, ideal ohmic contacts, steady state only
+  no band-gap narrowing, no surface recombination at the oxide, one temperature per device (250 to 500 K), ideal
+  ohmic contacts, steady state only
   (no transient, no small-signal AC), 2-D only.
 - Current resolution: the face currents are differences of large drift and diffusion terms. In cells of 1 nm at
   1e18 cm^-3 these terms are up to about 1e8 A/m, and the measured floor of a face current is about 2.5e-10 A/m
@@ -570,6 +698,6 @@ GPU (10 and 5 nm), and to 3.3e-10 (10 nm) and 5.6e-10 (5 nm) with it on the CPU.
   grid has 0.5 um of oxide and closed (zero-flux) outer sides).
 - Series resistance: a 1-D path (each column equipotential in y; no current spreading between the slab and the
   rib), one lateral junction only (no PIN, vertical or L-shaped junctions), no contact or metal resistance, the net
-  doping only (no compensation), the Masetti mobility at 300 K only.
+  doping only (no compensation), the Masetti mobility (300 K) times the temperature ratio of Arora et al.
 - Bandwidth: a lumped RC only. A long device needs a traveling-wave model (electrode impedance, velocity match,
   RF loss).

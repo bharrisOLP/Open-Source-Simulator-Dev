@@ -56,6 +56,8 @@ def shockley_j0(n_a: float, n_d: float, mu_n_p: float, mu_p_n: float, tau_n: flo
         J0 = q n_i^2 (D_n / (L_n N_A) coth(W_p / L_n) + D_p / (L_p N_D) coth(W_n / L_p)),
     D = mu V_T, L = sqrt(D tau), mu_n_p: the electron mobility in the p side, mu_p_n: the hole mobility in the n
     side. W_p, W_n: the neutral lengths from the depletion edges to the contacts (inf: the long-base diode, coth = 1).
+    All inputs are the values at T: n_i at T (Device.n_i_t), the mobilities and lifetimes at T (temperature.mobility,
+    temperature.lifetime); this function applies no temperature model.
     """
     vt = thermal_voltage(T)
     d_n, d_p = mu_n_p * vt, mu_p_n * vt

@@ -12,6 +12,10 @@ default) or Jacobi. Steps are damped
 Discretization: cell-centered finite volumes on a 2-D rectilinear grid (x, y cell edges in m), face coefficient
 L / (d1/eps1 + d2/eps2). Ohmic contacts: Dirichlet psi = V + V_T asinh(N_net / (2 n_i)) on a boundary side, on a
 mask of boundary cells. SI units throughout (doping in m^-3; 1e18 cm^-3 = 1e24 m^-3).
+
+Temperature: Device.T (one scalar, K) sets V_T = k T / q and n_i(T) = Device.n_i (the 300 K value) times the ratio
+of the fit of Misiakos and Tsamakis (1993) (temperature.py). At 300 K the results are those of the code before the
+temperature models, bit for bit.
 """
 
 from __future__ import annotations
@@ -22,6 +26,8 @@ from dataclasses import dataclass
 import jax
 import jax.numpy as jnp
 import numpy as np
+
+from charge_gpu.temperature import intrinsic_density
 
 Q = 1.602176634e-19
 KB = 1.380649e-23
@@ -58,8 +64,14 @@ class Device:
     n_net: np.ndarray                # (nx, ny) N_D - N_A (m^-3); 0 in insulators
     semiconductor: np.ndarray        # (nx, ny) bool: carriers exist here
     contacts: list[Contact]
-    n_i: float = 1.0e16              # Si at 300 K (m^-3), about 1e10 cm^-3
-    T: float = 300.0
+    n_i: float = 1.0e16              # n_i of Si at 300 K (m^-3), 1.00e10 cm^-3 (Sproul and Green 1991)
+    T: float = 300.0                 # the temperature of the device (K), 250 to 500 K (temperature.py)
+
+    @property
+    def n_i_t(self) -> float:
+        """n_i (m^-3) at the temperature T: n_i (the 300 K value) times the ratio of the Misiakos and Tsamakis fit
+        (temperature.intrinsic_density). Exactly n_i at 300 K."""
+        return intrinsic_density(self.T, self.n_i)
 
 
 @jax.tree_util.register_dataclass
@@ -92,18 +104,18 @@ def _operators(dev: Device, phi_n: float, phi_p: float, dtype):
     diag[:, 1:] += gy
     gc = np.zeros((nx, ny))                                     # contact conductances (the extra diagonal)
     bc = np.zeros((nx, ny))
-    vt = thermal_voltage(dev.T)
+    vt, n_i = thermal_voltage(dev.T), dev.n_i_t
     for c in dev.contacts:
         if c.side in ("xmin", "xmax"):
             i = 0 if c.side == "xmin" else nx - 1
             g = dy * eps[i, :] / hx[i]
-            psi_b = c.voltage + vt * np.arcsinh(dev.n_net[i, :] / (2 * dev.n_i))
+            psi_b = c.voltage + vt * np.arcsinh(dev.n_net[i, :] / (2 * n_i))
             gc[i, c.mask] += g[c.mask]
             bc[i, c.mask] += (g * psi_b)[c.mask]
         else:
             j = 0 if c.side == "ymin" else ny - 1
             g = dx * eps[:, j] / hy[j]
-            psi_b = c.voltage + vt * np.arcsinh(dev.n_net[:, j] / (2 * dev.n_i))
+            psi_b = c.voltage + vt * np.arcsinh(dev.n_net[:, j] / (2 * n_i))
             gc[c.mask, j] += g[c.mask]
             bc[c.mask, j] += (g * psi_b)[c.mask]
     diag += gc
@@ -221,6 +233,7 @@ def solve(dev: Device, v_n: float, v_p: float, psi0: np.ndarray | None = None, t
     bias is given once). precond: "mg" (aggregation multigrid) or "jacobi"."""
     if precond not in ("mg", "jacobi"):
         raise ValueError(f"precond must be 'mg' or 'jacobi', not {precond!r}")
+    n_i = dev.n_i_t                                             # n_i at dev.T (checks the range of T)
     vt = thermal_voltage(dev.T)
     nx, ny = dev.n_net.shape
     for c in dev.contacts:
@@ -229,7 +242,7 @@ def solve(dev: Device, v_n: float, v_p: float, psi0: np.ndarray | None = None, t
         c.voltage = v_n if under.size and np.mean(under) > 0 else v_p
     o, (gx_h, gy_h, extra0) = _operators(dev, v_n, v_p, dtype)
     if psi0 is None:
-        psi0 = np.where(dev.semiconductor, vt * np.arcsinh(dev.n_net / (2 * dev.n_i)), 0.0)
+        psi0 = np.where(dev.semiconductor, vt * np.arcsinh(dev.n_net / (2 * n_i)), 0.0)
         psi0 = psi0 + np.where(dev.n_net > 0, v_n, v_p)
     psi = jax.device_put(jnp.asarray(psi0, dtype), solver_device())
     cg_total, conv, k = 0, False, 0
@@ -237,17 +250,17 @@ def solve(dev: Device, v_n: float, v_p: float, psi0: np.ndarray | None = None, t
         from thermal_gpu.multigrid import build_hierarchy
     for k in range(1, max_newton + 1):
         if precond == "mg":
-            f, jdiag = _residual_and_jdiag(o, psi, dev.n_i, vt)
+            f, jdiag = _residual_and_jdiag(o, psi, n_i, vt)
             # the Newton term changes the diagonal: a new hierarchy per step (host coarsening, small arrays)
             levels, cinv = build_hierarchy(gx_h, gy_h, extra0 + np.asarray(jdiag), solver_device(), dtype)
             delta, it = _cg_mg(o, jdiag, f, levels, cinv, cg_tol, 2000)
             psi = psi + vt * jnp.sign(delta) * jnp.log1p(jnp.abs(delta) / vt)
             step = jnp.max(jnp.abs(delta))
         else:
-            psi, step, _, it = _newton_step(o, psi, dev.n_i, vt, cg_tol, 20000)
+            psi, step, _, it = _newton_step(o, psi, n_i, vt, cg_tol, 20000)
         cg_total += int(it)
         if float(step) < tol:
             conv = True
             break
-    n, p = _carriers(o, psi, dev.n_i, vt)
+    n, p = _carriers(o, psi, n_i, vt)
     return Solution(np.asarray(psi), np.asarray(n), np.asarray(p), k, cg_total, conv, str(solver_device()))

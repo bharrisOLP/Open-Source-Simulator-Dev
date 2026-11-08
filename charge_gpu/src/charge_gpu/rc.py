@@ -34,7 +34,8 @@ Series resistance R'(V) of the doped silicon between the contacts and the deplet
   frequency -> 0, of this distributed RC path). So the undepleted region at each bias sets R', and the depletion
   edge needs no threshold. R'_n and R'_p come from the n and the p columns; R' = R'_n + R'_p.
 - Mobility: Masetti et al. (1983), Si at 300 K, phosphorus (electrons) and boron (holes), as a function of
-  |N_D - N_A| (the model knows only the net doping, so compensation is not included).
+  |N_D - N_A| (the model knows only the net doping, so compensation is not included). At another Device.T: times
+  the temperature ratio of Arora et al. (1982) (temperature.mobility).
 - Not included: the contact and metal resistance, velocity saturation (no effect on the small signal), the
   frequency dependence of R' (the skin depth in silicon at these frequencies is much larger than the slab), a PIN
   junction (each column must have net doping).
@@ -80,11 +81,12 @@ def side_charges(dev: Device, sol: Solution) -> tuple[float, float]:
 
 
 def column_conductance(dev: Device, sol: Solution) -> np.ndarray:
-    """G(x) in S (per unit length in z) of each grid column: sum_y q (mu_n n + mu_p p) dy over the silicon cells."""
-    if abs(dev.T - 300.0) > 1.0:
-        raise ValueError("the Masetti mobility is for 300 K")
+    """G(x) in S (per unit length in z) of each grid column: sum_y q (mu_n n + mu_p p) dy over the silicon cells,
+    with the mobility at dev.T (temperature.mobility: Masetti at 300 K times the ratio of Arora et al.)."""
+    from charge_gpu.temperature import mobility
+
     doping = np.abs(dev.n_net)
-    sigma = Q * (masetti_mobility(doping, "n") * sol.n + masetti_mobility(doping, "p") * sol.p) * dev.semiconductor
+    sigma = Q * (mobility(doping, "n", dev.T) * sol.n + mobility(doping, "p", dev.T) * sol.p) * dev.semiconductor
     return np.sum(sigma * np.diff(dev.y)[None, :], axis=1)
 
 

@@ -23,12 +23,16 @@ Discretization:
   same through every cross-section, to the tolerance of the solve.
 
 Models:
+- Temperature: Device.T (one scalar, K) sets V_T, n_i(T), the mobility and the lifetimes (temperature.py). At 300 K
+  the results are those of the code before the temperature models, bit for bit.
 - Mobility: the Masetti mobility of rc.py (Si, 300 K, from |N_D - N_A|; phosphorus parameters for electrons, boron
-  parameters for holes). It is constant in the field: no velocity saturation, no carrier-carrier scattering.
-- Recombination: Shockley-Read-Hall only, with constant lifetimes. The default tau_n = tau_p = 1 us is a usual
-  value for moderately doped bulk Si; SOI rib waveguides have much shorter effective lifetimes (surface
-  recombination), so the use cases give their lifetime. No Auger recombination, no band-gap narrowing, no
-  Fermi-Dirac statistics (Boltzmann only), no surface recombination at the oxide.
+  parameters for holes), times the temperature ratio of Arora et al. (1982) (temperature.mobility). It is constant
+  in the field: no velocity saturation, no carrier-carrier scattering.
+- Recombination: Shockley-Read-Hall only, with lifetimes that are constant in space. tau_n and tau_p are the values
+  at 300 K; at T the solver uses tau (T / 300)^tau_exponent (default -1/2, temperature.lifetime). The default
+  tau_n = tau_p = 1 us is a usual value for moderately doped bulk Si; SOI rib waveguides have much shorter effective
+  lifetimes (surface recombination), so the use cases give their lifetime. No Auger recombination, no band-gap
+  narrowing, no Fermi-Dirac statistics (Boltzmann only), no surface recombination at the oxide.
 
 Solvers:
 - "newton": the coupled Newton method on (psi, n, p). The Jacobian is assembled on the host (scipy). The columns of
@@ -68,8 +72,9 @@ import scipy.sparse.linalg as spl
 
 from charge_gpu import poisson
 from charge_gpu.poisson import Q, Device, thermal_voltage
+from charge_gpu.temperature import TAU_EXPONENT, lifetime, mobility
 
-TAU_SI = 1.0e-6          # s: the default SRH lifetimes (moderately doped bulk Si)
+TAU_SI = 1.0e-6          # s: the default SRH lifetimes at 300 K (moderately doped bulk Si)
 CARRIER_FLOOR = 1.0e6    # m^-3 (1 cm^-3): relative changes of smaller densities do not count for convergence
 CARRIER_MIN = 1.0e-100   # m^-3: the lower limit of n and p in the Newton method (keeps the column scaling finite)
 
@@ -153,18 +158,15 @@ class _Mesh:
 
 
 def default_mobility(dev: Device):
-    """(mu_n, mu_p) per cell in m^2/(V s): the Masetti mobility of rc.py from |N_D - N_A| (Si, 300 K)."""
-    from charge_gpu.rc import masetti_mobility
-
-    if abs(dev.T - 300.0) > 1.0:
-        raise ValueError("the Masetti mobility is for 300 K: give the mobility")
+    """(mu_n, mu_p) per cell in m^2/(V s) at dev.T: the Masetti mobility of rc.py from |N_D - N_A| (Si, 300 K) times
+    the temperature ratio of Arora et al. (temperature.mobility); exactly the Masetti mobility at 300 K."""
     doping = np.abs(dev.n_net)
-    return masetti_mobility(doping, "n"), masetti_mobility(doping, "p")
+    return mobility(doping, "n", dev.T), mobility(doping, "p", dev.T)
 
 
 def _mesh(dev: Device, v_n: float, v_p: float, mobility=None) -> _Mesh:
     kinds = _set_contact_voltages(dev, v_n, v_p)
-    vt = thermal_voltage(dev.T)
+    vt, n_i = thermal_voltage(dev.T), dev.n_i_t
     nx, ny = dev.n_net.shape
     dx, dy = np.diff(np.asarray(dev.x, float)), np.diff(np.asarray(dev.y, float))
     semi = np.asarray(dev.semiconductor, bool)
@@ -210,7 +212,7 @@ def _mesh(dev: Device, v_n: float, v_p: float, mobility=None) -> _Mesh:
             ii = np.flatnonzero(np.asarray(c.mask, bool) & semi[:, jj])
             jj = np.full(ii.size, jj)
             h, length = dy[jj] / 2, dx[ii]
-        z = np.arcsinh(dev.n_net[ii, jj] / (2 * dev.n_i))
+        z = np.arcsinh(dev.n_net[ii, jj] / (2 * n_i))
         cl["flat"].append(flat[ii, jj])
         cl["psi"].append(c.voltage + vt * z)
         cl["cn"].append(d_n[ii, jj] * length / h)
@@ -221,13 +223,13 @@ def _mesh(dev: Device, v_n: float, v_p: float, mobility=None) -> _Mesh:
     zc = (cat["psi"] - np.array([dev.contacts[k].voltage for k in cat["id"].astype(int)])) / vt
     vol = (dx[:, None] * dy[None, :]).ravel()
     sflat = flat[semi]
-    return _Mesh(shape=(nx, ny), vt=vt, n_i=dev.n_i, sflat=sflat, svol=vol[sflat], vol=vol,
+    return _Mesh(shape=(nx, ny), vt=vt, n_i=n_i, sflat=sflat, svol=vol[sflat], vol=vol,
                  nnet=(dev.n_net * semi).ravel(), a_mat=a_mat, bc=np.asarray(ops.bc).ravel(),
                  fa=fa, fb=fb, sa=sidx.ravel()[fa], sb=sidx.ravel()[fb],
                  fcn=np.concatenate([cn_x, cn_y]), fcp=np.concatenate([cp_x, cp_y]),
                  fcol=np.concatenate([col_x, np.full(fa_y.size, -1)]),
-                 cflat=cflat, cs=sidx.ravel()[cflat], cpsi=cat["psi"], cn=dev.n_i * np.exp(zc),
-                 cp=dev.n_i * np.exp(-zc), ccn=cat["cn"], ccp=cat["cp"], cid=cat["id"].astype(int), kinds=kinds,
+                 cflat=cflat, cs=sidx.ravel()[cflat], cpsi=cat["psi"], cn=n_i * np.exp(zc),
+                 cp=n_i * np.exp(-zc), ccn=cat["cn"], ccp=cat["cp"], cid=cat["id"].astype(int), kinds=kinds,
                  ops=ops, host=host)
 
 
@@ -443,7 +445,7 @@ def _poisson_qf(dev: Device, m: _Mesh, psi, phi_n, phi_p, tol, cg_tol, max_newto
     x = put(psi.reshape(m.shape))
     cg = 0
     for _ in range(max_newton):
-        f, jdiag = poisson._residual_and_jdiag(o, x, dev.n_i, vt)
+        f, jdiag = poisson._residual_and_jdiag(o, x, m.n_i, vt)
         levels, cinv = build_hierarchy(gx_h, gy_h, extra0 + np.asarray(jdiag), d, jnp.float64)
         delta, it = poisson._cg_mg(o, jdiag, f, levels, cinv, cg_tol, 2000)
         x = x + vt * jnp.sign(delta) * jnp.log1p(jnp.abs(delta) / vt)
@@ -540,7 +542,7 @@ class DDSolution:
     error: float             # the last convergence metric (relative update)
     method: str
     device: str              # where the solves ran
-    tau_n: float
+    tau_n: float             # the SRH lifetimes used (s): the 300 K values of solve() scaled to dev.T
     tau_p: float
     mesh: _Mesh = field(repr=False)
     linear: str = "superlu"        # the linear solver of the continuity steps (gummel) or of the Newton steps
@@ -603,7 +605,7 @@ class DDSolution:
 
 def solve(dev: Device, v_n: float, v_p: float, guess=None, method: str = "newton", tau_n: float = TAU_SI,
           tau_p: float = TAU_SI, mobility=None, tol: float = 1e-10, max_iter: int | None = None,
-          dpsi_max: float | None = None, linear: str = "superlu") -> DDSolution:
+          dpsi_max: float | None = None, linear: str = "superlu", tau_exponent: float = TAU_EXPONENT) -> DDSolution:
     """Drift-diffusion at one bias: the n contacts at v_n, the p contacts at v_p (forward bias: v_p > v_n). Each
     contact takes v_n when the net doping under it is positive, else v_p (as poisson.solve).
 
@@ -615,13 +617,16 @@ def solve(dev: Device, v_n: float, v_p: float, guess=None, method: str = "newton
     is not converged, or that raises continuity.SpanError (the span limit), jax.errors.JaxRuntimeError (for example a
     device out of memory) or MemoryError, is replaced by SuperLU for that step (DDSolution.linear_fallbacks; the
     errors counted by type in DDSolution.linear_errors, all but SpanError also as a RuntimeWarning); other errors
-    propagate. mobility: (mu_n, mu_p) in m^2/(V s), per cell or scalar; None: Masetti. tol: convergence on the
-    relative update (psi / V_T, n / n, p / p).
+    propagate. mobility: (mu_n, mu_p) in m^2/(V s) at dev.T, per cell or scalar; None: Masetti at 300 K times the
+    temperature ratio of Arora et al. (temperature.mobility). tol: convergence on the relative update (psi / V_T,
+    n / n, p / p). Temperature: dev.T (K); tau_n and tau_p are the lifetimes at 300 K, the solver uses
+    tau (dev.T / 300)^tau_exponent (temperature.lifetime; DDSolution.tau_n and tau_p hold the values used).
     """
     if method not in ("newton", "gummel"):
         raise ValueError(f"method must be 'newton' or 'gummel', not {method!r}")
     if linear not in ("superlu", "device"):
         raise ValueError(f"linear must be 'superlu' or 'device', not {linear!r}")
+    tau_n, tau_p = lifetime(tau_n, dev.T, tau_exponent), lifetime(tau_p, dev.T, tau_exponent)
     if guess is None:
         guess = poisson.solve(dev, v_n, v_p)
     m = _mesh(dev, v_n, v_p, mobility)
