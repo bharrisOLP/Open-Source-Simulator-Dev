@@ -47,30 +47,48 @@ def _centers(e):
     return 0.5 * (e[1:] + e[:-1])
 
 
-def mode_index(xs: CrossSection, win: Window, wavelength: float, num_modes: int = 1, dn=None,
-               precision: str = "mixed", solver=None):
-    """Complex mode indices (sorted by real part) of the cross-section, with an optional index change dn(X, Y)
-    (complex: dn + i dk). Uses the meow-gpu FDE solver (the tidy3d mode operator)."""
-    from meow_gpu.fde.operator import make_problem
-    from meow_gpu.meow_backend import GPUModeSolver
-
-    _require_x64()
+def yee_points(win: Window):
+    """The (X, Y) sample points (um) of Ex, Ey and Ez on the Yee grid of the mode solver: the solver samples each
+    permittivity component, and gives each field component, at these points."""
     x, y = win.edges()
     xc, yc = _centers(x), _centers(y)
+    return [np.meshgrid(xx, yy, indexing="ij") for xx, yy in ((xc, y[:-1]), (x[:-1], yc), (x[:-1], y[:-1]))]
+
+
+def mode_problem(xs: CrossSection, win: Window, wavelength: float, dn=None):
+    """The meow-gpu FDEProblem of the cross-section on the window, with an optional index change dn(X, Y)."""
+    from meow_gpu.fde.operator import make_problem
+
+    x, y = win.edges()
     eps = []
-    for xx, yy in ((xc, y[:-1]), (x[:-1], yc), (x[:-1], y[:-1])):        # Ex, Ey, Ez positions of the Yee cell
-        X, Y = np.meshgrid(xx, yy, indexing="ij")
+    for X, Y in yee_points(win):
         _, _, prop = xs.sample(X, Y)
         n = prop["n"].astype(complex)
         if dn is not None:
             n = n + dn(X, Y)
         eps.append(n**2)
+    return make_problem(*eps, x, y, wavelength)
+
+
+def mode_solve(xs: CrossSection, win: Window, wavelength: float, num_modes: int = 1, dn=None,
+               precision: str = "mixed", solver=None):
+    """(neff, E, H) of the cross-section (see mode_index); E and H: (num_modes, 3, Nx, Ny) at the Yee points."""
+    from meow_gpu.meow_backend import GPUModeSolver
+
+    _require_x64()
     solver = solver or GPUModeSolver(precision=precision, extra=4)
-    neff, _, _ = solver.solve(make_problem(*eps, x, y, wavelength), num_modes)
+    neff, e, h = solver.solve(mode_problem(xs, win, wavelength, dn), num_modes)
     info = getattr(solver, "last_info", None)
     if info is not None and not info.converged:
         raise ConvergenceError(f"mode solve: residual {info.residual:.1e} above the tolerance")
-    return np.asarray(neff)
+    return np.asarray(neff), e, h
+
+
+def mode_index(xs: CrossSection, win: Window, wavelength: float, num_modes: int = 1, dn=None,
+               precision: str = "mixed", solver=None):
+    """Complex mode indices (sorted by real part) of the cross-section, with an optional index change dn(X, Y)
+    (complex: dn + i dk). Uses the meow-gpu FDE solver (the tidy3d mode operator)."""
+    return mode_solve(xs, win, wavelength, num_modes, dn, precision, solver)[0]
 
 
 @dataclass
@@ -90,21 +108,30 @@ def temperature(xs: CrossSection, win: Window, heater_tag: str, power_per_length
     from thermal_gpu.solver import solve_steady
 
     _require_x64()
-    x, y = win.edges()
+    x, y, idx, prop, q, bc = thermal_problem(xs, win, heater_tag, power_per_length, t_ambient, top_h)
     xc, yc = _centers(x), _centers(y)
-    X, Y = np.meshgrid(xc, yc, indexing="ij")
-    _, _, prop = xs.sample(X, Y)
+    res = solve_steady(x * 1e-6, y * 1e-6, prop["kappa"], q, bc)
+    if not res.converged:
+        raise ConvergenceError(f"thermal solve: residual {res.residual:.1e} after {res.iterations} iterations")
+    rise = RegularGridInterpolator((xc, yc), res.T - t_ambient, bounds_error=False, fill_value=None)
+    return Temperature(rise, res.T, xc, yc, res.iterations, res.residual)
+
+
+def thermal_problem(xs: CrossSection, win: Window, heater_tag: str, power_per_length: float, t_ambient=300.0,
+                    top_h: float = 10.0):
+    """The thermal problem of `temperature` on the window: cell edges x, y (um), the shape index of each cell
+    (0: background, k: shape k - 1), the properties of each cell, the heat source q (W/m^3: power_per_length
+    uniformly in the heater cells) and the boundary conditions."""
+    x, y = win.edges()
+    X, Y = np.meshgrid(_centers(x), _centers(y), indexing="ij")
+    idx, _, prop = xs.sample(X, Y)
     heater = xs.mask(heater_tag, X, Y)
     if not heater.any():
         raise ValueError(f"no grid cell inside the heater {heater_tag!r}: use a smaller step")
     area = heater.sum() * (win.step * 1e-6) ** 2
     q = np.where(heater, power_per_length / area, 0.0)
     bc = {"ymin": ("dirichlet", t_ambient), "ymax": ("robin", top_h, t_ambient)}
-    res = solve_steady(x * 1e-6, y * 1e-6, prop["kappa"], q, bc)
-    if not res.converged:
-        raise ConvergenceError(f"thermal solve: residual {res.residual:.1e} after {res.iterations} iterations")
-    rise = RegularGridInterpolator((xc, yc), res.T - t_ambient, bounds_error=False, fill_value=None)
-    return Temperature(rise, res.T, xc, yc, res.iterations, res.residual)
+    return x, y, idx, prop, q, bc
 
 
 def phase_shifter_ppi(xs: CrossSection, optics: Window, thermal: Window, heater_tag: str, wavelength: float,
