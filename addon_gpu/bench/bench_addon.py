@@ -20,7 +20,8 @@ steady_mcells_per_s (GPU: between progress callbacks, from the second one on), s
 and the first freeze), agreement (relative L2 of the final Ez field and of the first flux spectrum against the
 first CPU leg), differing_words_vs_array (kernel legs: the float32 words of the final Ez field that differ from
 the array leg, which runs under keep, the policy that dispatch installs for the kernel legs), versions,
-driver.gpu, active_step_path, certified, the dispatched slots, and speedup (time of the first CPU leg / time_s).
+driver.gpu, active_step_path, certified, the dispatched slots, chi1inv_read (the read of the permittivity in the
+lift: bulk, or per-point), and speedup (time of the first CPU leg / time_s).
 """
 
 from __future__ import annotations
@@ -133,6 +134,7 @@ def main(argv=None) -> int:
                     "gpu": rec.get("gpu"), "active_step_path": rec.get("active_step_path"),
                     "certified": rec.get("certified"), "dispatched_slots": dispatch.get("dispatched_slots"),
                     "dispatch_table": dispatch.get("table"), "subnormal_policy": rec.get("subnormal_policy"),
+                    "chi1inv_read": (rec.get("chi1inv_read") or {}).get("path"),
                     "versions": rec["versions"], "add_on_file": repo_relative(rec.get("meep_gpu_file")),
                 }
                 print(json.dumps(out), flush=True)

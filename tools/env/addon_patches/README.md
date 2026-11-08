@@ -42,7 +42,21 @@ The patches:
    `tools/env/addon_gpu.sh` pins `cupy-rocm-7-0==14.2.0`, and `addon_gpu/tests/test_patches.py` checks that the
    token reaches the key of a keep compile and not the key of a compile before the install.
 
-**Rule 2 of the add-on (certification ledgers).** Both files are pinned by the certification ledgers of the add-on,
+3. `0003-bulk-chi1inv-read-double.patch` (`meep_gpu/from_meep.py`). The lift reads the inverse permittivity
+   (`chi1inv`) of the solver. On a build listed in `BULK_CHI1INV_BUILDS` it copies the stored arrays of the solver in
+   bulk (and reads only the points that no chunk owns one at a time); on any other build it calls `get_chi1inv` once
+   for each point and each tensor entry. Only single-precision 1.33.0 was listed, so the conda-forge build here
+   (1.35.0, double precision, Linux x86_64) read every point one at a time: 27.7 s of a 29.6 s lift of the 2-D bench
+   case (13,824,009 calls) and 37.3 s of a 49.4 s lift of the 3-D bench case, under the profiler
+   (`addon_gpu/profile_setup.py`). The bulk read already handles a double-precision build (it reads `c_double` words
+   when the build is not single precision). The patch adds the stamp `("1.35.0", "double", "Linux", "x86_64")` to the
+   list, after the comparisons that the add-on asks for, on this one build: the bulk-path tests of
+   `meep_gpu/test_from_meep_bulk_chi1inv.py` (6 cells: the read words equal `get_chi1inv` as uint64 at every point,
+   and the installed arrays equal those of the per-point read), and the final fields of the bench cases and the test
+   cases after a run, bulk read against per-point read (0 differing words; `addon_gpu/README.md`). The self-check of
+   the bulk read stays active: a disagreement restarts the read one point at a time, with a warning.
+
+**Rule 2 of the add-on (certification ledgers).** The three files are pinned by the certification ledgers of the add-on,
 so the patches put entries of those ledgers in drift. On the AMD GPU no identity is certified in any case: the
 kernels run only with `MEEP_GPU_HARDWARE=any`, and each run reports `certified: False`. `addon_gpu/README.md` gives
 the checks that replace the certification on this GPU, and the drift counts of the three weld contracts of the

@@ -1,0 +1,18 @@
+diff --git a/meep_gpu/from_meep.py b/meep_gpu/from_meep.py
+index 06b78a5..07d0b11 100644
+--- a/meep_gpu/from_meep.py
++++ b/meep_gpu/from_meep.py
+@@ -1061,6 +1061,13 @@ def _lift_say(mp, text: str) -> None:  # One flushed progress line to stderr, un
+ BULK_CHI1INV_BUILDS = frozenset({
+     ("1.33.0", "single", "Darwin", "arm64"),
+     ("1.33.0", "single", "Linux", "x86_64"),
++    # Added for the AMD GPU route (os-simulator-dev, tools/env/addon_patches/0003): the conda-forge
++    # 1.35.0 build (serial "nompi", double precision) on Linux x86_64, which reads its realnum
++    # chi1inv words as c_double. Compared on ONE build of this stamp, word for word as uint64,
++    # with get_chi1inv: the bulk-path tests of test_from_meep_bulk_chi1inv.py (6 cells), and
++    # the fields of the addon_gpu cases and bench cells after a run, bulk against per point.
++    # The counts are in addon_gpu/README.md of that repository.
++    ("1.35.0", "double", "Linux", "x86_64"),
+ })
+ 
+ 

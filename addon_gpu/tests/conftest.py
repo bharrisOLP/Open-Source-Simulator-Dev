@@ -66,6 +66,8 @@ def run_leg(tmp_path: Path, case: str, leg: str, *, table: str | None = None, po
             env_extra: dict | None = None, timeout: float = 900) -> tuple[dict, dict]:
     """Run one leg in its own process; return (the JSON record, the saved arrays)."""
     name = f"{case}-{leg}-{table or 'x'}-{policy or 'x'}-{resolution}-{until}"
+    if extra:                                    # legs that differ only in extra options need their own files
+        name += "-" + "-".join(part.strip("-").replace("/", "_") for part in extra)
     save = tmp_path / f"{name}.npz"
     args = ["run_case.py", "--case", case, "--leg", leg, "--save", str(save)]
     if table:

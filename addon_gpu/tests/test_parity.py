@@ -37,6 +37,8 @@ def slab(legs_dir):
     for table in TABLES:
         out[table] = run_leg(legs_dir, "slab2d", "gpu", table=table, until=20)
     out["array"] = run_leg(legs_dir, "slab2d", "array", policy="keep", until=20)
+    out["cuda-per-point"] = run_leg(legs_dir, "slab2d", "gpu", table="cuda", until=20,
+                                    extra=["--chi1inv-read", "per-point"])
     out["reference"] = run_leg(legs_dir, "slab2d", "reference", until=20)
     out["cpu"] = run_leg(legs_dir, "slab2d", "cpu", until=20)
     return out
@@ -100,6 +102,8 @@ def test_ring_point_series_and_resonances_against_the_cpu_solver(ring, table):
 def sphere(legs_dir):
     out = {table: run_leg(legs_dir, "sphere3d", "gpu", table=table, until=10) for table in TABLES}
     out["array"] = run_leg(legs_dir, "sphere3d", "array", policy="keep", until=10)
+    out["cuda-per-point"] = run_leg(legs_dir, "sphere3d", "gpu", table="cuda", until=10,
+                                    extra=["--chi1inv-read", "per-point"])
     out["cpu"] = run_leg(legs_dir, "sphere3d", "cpu", until=10)
     return out
 
@@ -114,3 +118,18 @@ def test_sphere_3d_against_the_array_path_and_the_cpu_solver(sphere, table):
     np.testing.assert_array_equal(gpu["flux_0"], array["flux_0"])
     assert rel_l2(gpu["field"], cpu["field"]) < BAND
     assert rel_l2(gpu["flux_0"], cpu["flux_0"]) < BAND
+
+
+@pytest.mark.parametrize("case", ["slab", "sphere"])
+def test_the_bulk_read_of_the_permittivity_changes_no_word(request, case):
+    """Patch 0003: the lift reads the permittivity in bulk on this solver build, and the fields after the run are
+    the same words as after a lift that reads every point one at a time (the reference of the add-on)."""
+    legs = request.getfixturevalue(case)
+    rec, bulk = legs["cuda"]
+    prec, per_point = legs["cuda-per-point"]
+    assert rec["chi1inv_read"]["path"] == "bulk", rec["chi1inv_read"]
+    assert not rec["chi1inv_read"]["refusal"] and not rec["chi1inv_read"]["restarted_by"], rec["chi1inv_read"]
+    assert prec["chi1inv_read"]["path"] == "per-point", prec["chi1inv_read"]
+    assert differing_words(bulk["field"], per_point["field"]) == 0
+    for name in [k for k in bulk if k.startswith("flux_")]:
+        np.testing.assert_array_equal(bulk[name], per_point[name])

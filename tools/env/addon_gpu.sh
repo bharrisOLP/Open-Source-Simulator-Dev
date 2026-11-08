@@ -38,8 +38,8 @@ TLIB=$SP/torch/lib
 COMPAT=$PWD/.local/rocm7-compat
 mkdir -p "$COMPAT"
 for i in 1 2 3 4; do
-  missing=$(find "$SP/cupy" "$SP/cupy_backends" -name "*.so" -print0 | LD_LIBRARY_PATH=$COMPAT:$TLIB xargs -0 ldd 2>/dev/null \
-    | awk '/not found/ {print $1}' | sort -u)
+  missing=$(find "$SP/cupy" "$SP/cupy_backends" -name "*.so" -print0 \
+    | LD_LIBRARY_PATH=$COMPAT:$TLIB xargs -0 ldd 2>/dev/null | awk '/not found/ {print $1}' | sort -u)
   [[ -z $missing ]] && break
   for so in $missing; do
     base=${so%%.so*}.so
@@ -56,7 +56,16 @@ if [[ $(git -C "$ADDON" rev-parse --short=7 HEAD) != "$ADDON_COMMIT" ]]; then
 fi
 for p in tools/env/addon_patches/*.patch; do
   [[ -e $p ]] || continue
-  if git -C "$ADDON" apply --check "$PWD/$p" 2>/dev/null; then git -C "$ADDON" apply "$PWD/$p" && echo "applied $p"; fi
+  if git -C "$ADDON" apply --check "$PWD/$p" 2>/dev/null; then
+    git -C "$ADDON" apply "$PWD/$p" && echo "applied $p"
+  elif git -C "$ADDON" apply --reverse --check "$PWD/$p" 2>/dev/null; then
+    echo "already applied $p"
+  else
+    # The clone carries other text in the files of this patch (for example an earlier version of it). Stop: an
+    # install that continued would run the add-on without this version of the patch.
+    echo "addon_gpu.sh: $p neither applies nor is applied to $ADDON; compare the clone with the patch" >&2
+    exit 1
+  fi
 done
 uv pip install --quiet --python "$PY" --no-deps -e "$ADDON"
 uv pip freeze --python "$PY" > .local/env-addon-gpu-freeze.txt

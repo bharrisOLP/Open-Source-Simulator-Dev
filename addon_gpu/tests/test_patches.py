@@ -13,7 +13,8 @@ PATCHES = sorted((REPO / "tools" / "env" / "addon_patches").glob("*.patch"))
 
 
 def test_there_are_patches_and_a_licence():
-    assert [p.name for p in PATCHES][:2] == ["0001-hiprtc-compile-options.patch", "0002-hip-keep-subnormals.patch"]
+    assert [p.name for p in PATCHES] == ["0001-hiprtc-compile-options.patch", "0002-hip-keep-subnormals.patch",
+                                         "0003-bulk-chi1inv-read-double.patch"]
     assert (REPO / "tools" / "env" / "addon_patches" / "LICENSE").read_text().startswith(
         (PINNED_CLONE / "LICENSE").read_text()[:200])
 

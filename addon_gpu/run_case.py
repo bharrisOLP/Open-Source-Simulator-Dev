@@ -51,6 +51,9 @@ def parse(argv=None):
     p.add_argument("--no-series", action="store_true", help="do not record the point series (benches)")
     p.add_argument("--save", default=None)
     p.add_argument("--full-report", action="store_true")
+    p.add_argument("--chi1inv-read", choices=("auto", "bulk", "per-point"), default="auto",
+                   help="force the read of the permittivity in the lift (GPU and reference legs): the bulk read "
+                        "of the stored chi1inv arrays, or one point at a time; auto keeps the choice of the add-on")
     p.add_argument("--progress-interval", type=int, default=100)
     return p.parse_args(argv)
 
@@ -128,6 +131,21 @@ def _summary(report) -> dict:
     }
 
 
+def _force_chi1inv_read(bulk: bool) -> None:
+    """Force the bulk or the per-point read of the permittivity, as the add-on's test of the bulk read does
+    (``meep_gpu/test_from_meep_bulk_chi1inv.py``: the private ``_bulk_read`` argument of the lift)."""
+    from meep_gpu import from_meep
+
+    real_lift = from_meep._lift_epsilon_structured
+
+    def lift(*args, **kwargs):
+        if not kwargs.get("_restarted_by"):
+            kwargs["_bulk_read"] = bulk
+        return real_lift(*args, **kwargs)
+
+    from_meep._lift_epsilon_structured = lift
+
+
 def _install_policy(args, meep_gpu):
     if args.policy == "default" or args.leg not in ("array", "reference"):
         return
@@ -194,6 +212,9 @@ def run(args) -> dict:
 
     from addon_cases import build
 
+    if args.chi1inv_read != "auto" and args.leg in ("gpu", "array", "reference"):
+        _force_chi1inv_read(args.chi1inv_read == "bulk")
+
     rec: dict = {"case": args.case, "leg": args.leg, "table": args.table if args.leg == "gpu" else None,
                  "resolution": args.resolution, "scale": args.scale, "versions": versions(),
                  "meep_gpu_file": meep_gpu.__file__,
@@ -258,6 +279,8 @@ def run(args) -> dict:
                        gpu=driver.gpu, active_step_path=driver.active_step_path,
                        subnormal_policy=meep_gpu.get_subnormal_policy())
             rec["dispatch"] = _summary(report)
+            read = getattr(driver, "chi1inv_read", None) or {}
+            rec["chi1inv_read"] = {k: read.get(k) for k in ("path", "refusal", "restarted_by")}
             rec["certified"] = (report or {}).get("certified")
             if args.full_report:
                 rec["report"] = report
