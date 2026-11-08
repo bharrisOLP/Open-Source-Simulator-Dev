@@ -149,6 +149,21 @@ def phase_shifter_ppi(xs: CrossSection, optics: Window, thermal: Window, heater_
     return wavelength * 1e-6 / (2 * dneff / power_per_length), dneff, th
 
 
+def charge_device(xs: CrossSection, win: Window):
+    """The charge-gpu Device of the cross-section on the window (sampled at the cell centers; SI units), with the
+    contacts of `carriers`: an ohmic contact on the left and on the right window side, on every semiconductor cell
+    that touches that side. Each solve of charge-gpu sets the contact voltages."""
+    from charge_gpu.poisson import Contact, Device
+
+    x, y = win.edges()
+    X, Y = np.meshgrid(_centers(x), _centers(y), indexing="ij")
+    _, doping, prop = xs.sample(X, Y)
+    semi = prop["semiconductor"].astype(bool)
+    n_net = np.where(semi, doping * 1e6, 0.0)                     # cm^-3 -> m^-3
+    contacts = [Contact("xmin", semi[0, :], 0.0), Contact("xmax", semi[-1, :], 0.0)]    # voltages: set by solve
+    return Device(x=x * 1e-6, y=y * 1e-6, eps_r=prop["eps_r"], n_net=n_net, semiconductor=semi, contacts=contacts)
+
+
 def carriers(xs: CrossSection, win: Window, v_n: float, v_p: float):
     """Carriers (m^-3) of the semiconductor shapes, with constant quasi-Fermi levels (reverse bias: v_n > v_p).
 
@@ -156,17 +171,12 @@ def carriers(xs: CrossSection, win: Window, v_n: float, v_p: float):
     that side (also a substrate or any other semiconductor shape). Each contact takes v_n if the mean net doping of
     its cells is positive (n type), else v_p (charge_gpu.solve sets it). So a side with mixed doping gets one voltage,
     and the side of the n and p regions does not matter. Returns (Solution, x centers, y centers)."""
-    from charge_gpu.poisson import Contact, Device, solve
+    from charge_gpu.poisson import solve
 
     _require_x64()
     x, y = win.edges()
     xc, yc = _centers(x), _centers(y)
-    X, Y = np.meshgrid(xc, yc, indexing="ij")
-    _, doping, prop = xs.sample(X, Y)
-    semi = prop["semiconductor"].astype(bool)
-    n_net = np.where(semi, doping * 1e6, 0.0)                     # cm^-3 -> m^-3
-    contacts = [Contact("xmin", semi[0, :], 0.0), Contact("xmax", semi[-1, :], 0.0)]    # voltages: set by solve
-    dev = Device(x=x * 1e-6, y=y * 1e-6, eps_r=prop["eps_r"], n_net=n_net, semiconductor=semi, contacts=contacts)
+    dev = charge_device(xs, win)
     sol = solve(dev, v_n, v_p)
     if not sol.converged:
         raise ConvergenceError(f"charge solve at v_n={v_n}, v_p={v_p}: no convergence in {sol.newton_iterations} "

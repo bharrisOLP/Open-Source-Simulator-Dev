@@ -26,6 +26,7 @@ p_pi, dneff, th = phase_shifter_ppi(xs, Window(-1.5, 1.5, -0.9, 1.1, 0.02), Wind
 | `carriers` | charge-gpu | electrons and holes at a reverse bias (contacts: every semiconductor cell on the left and right window sides; each contact takes v_n or v_p from the sign of its mean doping) |
 | `modulator_vpil` | charge-gpu + meow-gpu | V_pi L and the loss change per bias (negative: fewer carriers) |
 | `switching.phase_transient` | thermal-gpu (transient) + meow-gpu | the mode index change against time after the heater switches on or off, and its 10-90 % time (below) |
+| `pin.pin_phase_shifter` | charge-gpu (drift-diffusion) + thermal-gpu + meow-gpu | a forward-biased PIN with self-heating: the mode index change of the carriers and of the heat, the net phase, L_pi, P_pi, I_pi, the loss, the bias where the two parts cancel (below) |
 
 Units: um for geometry, cm^-3 for doping, W/m for heater power per length.
 
@@ -296,6 +297,245 @@ non-dispersive indices, and gives only the fundamental-mode coefficient (TE2 and
 older adapter `photonsuite.fdtd` puts its input detector 1.0 um into the device, on the end of a 1.0 um first segment
 in `bench/fdtd_taper*.py`: its overlap ratio `transmission` sees the start of the taper there (its calibrated T00 uses
 the input flux, which does not depend on the plane); not changed.
+
+## A PIN phase shifter with self-heating (`photonsuite.pin`)
+
+A forward current changes the index of the waveguide in two ways, with opposite signs: the injected free carriers
+lower the index and add loss (plasma dispersion), and the heat of the current raises the index (dn/dT).
+`pin_phase_shifter` calculates both parts on one cross-section.
+
+```python
+from photonsuite.physics import Window
+from photonsuite.pin import pin_rib, pin_phase_shifter
+
+xs = pin_rib()        # the lateral PIN rib of charge_gpu.injection.rib_pin, on 2 um of oxide over a Si substrate
+optics, charge = Window(-1.5, 1.5, -0.5, 0.9, 0.02), Window(-1.5, 1.5, -0.5, 0.72, 0.01)
+r = pin_phase_shifter(xs, optics, charge, Window(-5, 5, -5, 2.3, 0.05), 1.55, biases=[0.9, 1.0, 1.1, 1.2],
+                      tau=1e-9, core_tag="core")
+r.dneff_carrier, r.dneff_thermal, r.dneff     # complex changes of the mode index from 0 V: carriers, heat, both
+r.current, r.power                            # I' (A/m) and I' V (W/m)
+r.phase_per_length, r.l_pi, r.p_pi, r.i_pi    # rad/m, m, W, A (from the net change)
+r.loss_db_per_cm, r.crossover()               # the loss that the current adds; the bias where the parts cancel
+```
+
+1. Carriers (charge-gpu): the cross-section on the charge window (`physics.charge_device`: the cell centers, an
+   ohmic contact on the left and on the right window side, the rule of `carriers`), drift-diffusion with Newton and
+   SuperLU (`drift_diffusion.sweep`, continuation from 0 V in steps of 50 mV), SRH lifetimes tau_n = tau_p = tau.
+   `pin_rib` with the charge window of the snippet gives the Device of `rib_pin` (the same arrays; test).
+2. Heat: the heat density of the drift-diffusion solution without the thermoelectric (Peltier and Thomson) terms,
+   G. K. Wachutka, IEEE Trans. Computer-Aided Design 9, 1141 (1990):
+   H = -J_n . grad(phi_n) - J_p . grad(phi_p) + q R (phi_p - phi_n), with the quasi-Fermi potentials phi_n and
+   phi_p. The first two terms are the Joule heat of the two currents (|J|^2 / sigma, not negative); the last term
+   is the heat of the recombination. The discrete form uses the Scharfetter-Gummel face currents of charge-gpu
+   (each face gives -I (phi_b - phi_a) for each carrier, one half to each cell; a contact face has the contact
+   voltage at its node). Summation by parts with the discrete continuity equations gives sum H = I' V exactly, to
+   the residual of the solve. The electrostatic J . E is not this heat: its sum is I' (V - V_c), with V_c =
+   V_T (asinh(N_A / 2 n_i) + asinh(N_D / 2 n_i)) = 0.952 V at 1e18 cm^-3 (the potentials of the two contact
+   nodes), so it is negative below 0.952 V. Option `heat=<tags>`: I' V spread uniformly over the shapes with these
+   tags (a simpler model).
+3. Temperature (thermal-gpu, steady): the boundary conditions of `physics.temperature` (300 K at the bottom of the
+   thermal window, h = 10 W/m^2/K at the top, adiabatic sides). The heat of each charge cell goes to the thermal
+   cells in proportion to the area of overlap, so the sum stays I' V on any thermal grid.
+4. Modes (meow-gpu, the fundamental mode): full mode solves with the carrier change, with the thermal change, and
+   with both. The carrier change: Soref and Bennett at 1.55 um (R. A. Soref and B. R. Bennett, IEEE J. Quantum
+   Electron. 23, 123 (1987); `charge_gpu.modulator.plasma_dispersion`, from the absolute concentrations at V and
+   at 0 V, as `modulator_vpil`), dk = dalpha lambda / (4 pi), the mean over 8 x 8 points in the mode cell around
+   each Yee point (as `examples/pn_modulator_rc.py` of charge-gpu). The thermal change: dn/dT dT at the Yee points
+   (as `phase_shifter_ppi`; Si 1.86e-4 /K, G. Cocorullo and I. Rendina, Electron. Lett. 28, 83 (1992); SiO2
+   0.95e-5 /K, the value of the other examples). `plasma=` takes other coefficients (for example those of
+   M. Nedeljkovic, R. Soref and G. Z. Mashanovich, IEEE Photon. J. 3, 1171 (2011), for another wavelength); the
+   default refuses a wavelength other than 1.55 um.
+5. Outputs: the net phase per length 2 pi Re(dneff) / lambda, L_pi = lambda / (2 |Re dneff|), P_pi = I' V L_pi,
+   I_pi = I' L_pi, the added loss from Im(dneff), and the first bias interval where Re(dneff) changes sign
+   (`crossover()`: linear in I' between two biases; or a bias where it is exactly 0). Also the first-order
+   estimates of both parts (the weights of `switching.index_weights` times the complex dn), the Joule and
+   recombination parts of the heat, the sum of J . E, and the mean temperature rise of the core and of the Si of
+   the charge window.
+
+Results: the rows of `benchmarks/2026-11-08/suite-pin.jsonl` (the commands below; RX 7900 XT, shared computer).
+`pin_rib`, the windows of the snippet, the fundamental mode at 1.55 um (neff = 2.58936 at 0 V), dneff from 0 V.
+Lifetimes 1 ns (the first run of the file):
+
+| V | I' (A/m) | I' V (W/m) | Joule part of the heat | core rise (K) | dneff_carrier | dneff_thermal | dneff (both) | L_pi (mm) | P_pi (mW) | I_pi (mA) | added loss (dB/cm) | loss in L_pi (dB) |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| 0.80 | 0.5910 | 0.4728 | 0.062 | 0.114 | -1.9661e-4 | 2.1420e-5 | -1.7519e-4 | 4.42 | 2.09 | 2.61 | 2.50 | 1.11 |
+| 0.85 | 1.546 | 1.314 | 0.123 | 0.314 | -3.9713e-4 | 5.9090e-5 | -3.3804e-4 | 2.29 | 3.01 | 3.55 | 5.81 | 1.33 |
+| 0.90 | 3.828 | 3.445 | 0.222 | 0.814 | -7.2299e-4 | 1.5314e-4 | -5.6987e-4 | 1.36 | 4.69 | 5.21 | 11.83 | 1.61 |
+| 0.95 | 8.389 | 7.970 | 0.339 | 1.86 | -1.1448e-3 | 3.4995e-4 | -7.9488e-4 | 0.975 | 7.77 | 8.18 | 20.35 | 1.98 |
+| 1.00 | 15.92 | 15.92 | 0.451 | 3.68 | -1.6079e-3 | 6.9200e-4 | -9.1606e-4 | 0.846 | 13.47 | 13.47 | 30.34 | 2.57 |
+| 1.05 | 26.80 | 28.14 | 0.546 | 6.45 | -2.0820e-3 | 1.2137e-3 | -8.6868e-4 | 0.892 | 25.1 | 23.9 | 41.06 | 3.66 |
+| 1.10 | 41.23 | 45.36 | 0.623 | 10.33 | -2.5564e-3 | 1.9458e-3 | -6.1135e-4 | 1.27 | 57.5 | 52.3 | 52.2 | 6.62 |
+| 1.15 | 59.36 | 68.26 | 0.683 | 15.49 | -3.0275e-3 | 2.9168e-3 | -1.1201e-4 | 6.92 | 472 | 411 | 63.6 | 44.0 |
+| 1.20 | 81.23 | 97.48 | 0.731 | 22.05 | -3.4941e-3 | 4.1536e-3 | 6.5727e-4 | 1.18 | 114.9 | 95.8 | 75.1 | 8.86 |
+
+The test prints of `tests/test_pin.py` (0.9, 1.0, 1.1 and 1.2 V) are the same in all digits of this table.
+
+- The two parts have opposite signs: the carriers lower the index (and add loss), the heat raises it. The heat
+  grows faster with the bias than the carrier change: dneff_thermal / |dneff_carrier| = 0.109 at 0.8 V, 0.430 at
+  1.0 V and 1.189 at 1.2 V. So, below the cross-over (where the carriers win), the net change has its largest size
+  at 1.0 V (the shortest L_pi on that side, 0.846 mm, at P_pi 13.5 mW); it changes sign between 1.15 and 1.2 V, and
+  above that bias the heat wins and the phase turns. On the thermal side the net change grows again with the bias
+  (1.2 V: +6.5727e-4, L_pi 1.18 mm, P_pi 114.9 mW, a core rise of 22.05 K). This holds in this thermal model only:
+  with the heat path of `--heat-sink` the carriers win up to 1.3 V (the thermal environment, below).
+- The cross-over (`crossover()`, linear in I' between two biases): 1.157 V, 62.5 A/m, 72.4 W/m with the 50 mV
+  steps of the table; 1.159 V, 62.8 A/m, 72.8 W/m with 5 mV steps (`--biases 1.15 1.155 1.16 1.165`: the sign
+  changes between 1.155 and 1.16 V); 1.148 V with the 0.1 V steps of the test. These values belong to this thermal
+  model: the thermal environment changes dneff_thermal much more than the grids do. A wider window moves the
+  cross-over by 9.5 to 13 mV to higher bias, and the heat path of `--heat-sink` removes it up to 1.3 V (the
+  thermal environment, below).
+- At 0.9 V the heat raises the core by 0.81 K and cancels 21 % of the carrier change: L_pi is 1.36 mm, against
+  1.07 mm from the carrier part alone (1.072 mm in the charge-gpu example: `benchmarks/2026-10-30/charge-dd.jsonl`).
+- The heat source: the recombination heat is most of the power at low bias (0.938 at 0.8 V), the Joule heat at
+  high bias (0.731 at 1.2 V). The sum of J . E is -0.0901, -0.2007, 0.7575 and 20.1115 W/m at 0.8, 0.9, 1.0 and
+  1.2 V: I' (V - 0.952 V) (checks below).
+- The loss over L_pi rises from 1.11 dB (0.8 V) to 2.57 dB at the shortest L_pi (1.0 V).
+
+Lifetimes 10 ns (`--tau 1e-8`, to 1.3 V): at 0.9 V the current is 2.053 A/m (3.828 A/m at 1 ns) and the carrier
+change is larger (-1.0379e-3), so dneff_thermal / |dneff_carrier| is smaller: 0.076 at 0.9 V and 0.270 at 1.0 V
+(0.212 and 0.430 at 1 ns). Below the cross-over the shortest L_pi is 0.362 mm at 1.05 V (P_pi 12.98 mW, I' 34.17
+A/m, a core rise of 7.98 K); the cross-over is at 1.206 V, 128.3 A/m, 154.7 W/m (between 1.2 and 1.25 V; the core
+rise is 32.85 K at 1.2 V; with the heat path of `--heat-sink` there is no cross-over up to 1.3 V). Above it the
+heat wins: L_pi is 0.549 mm at 1.25 V and 0.218 mm at 1.3 V (net dneff
++3.5577e-3, P_pi 60.8 mW, I_pi 46.8 mA, a core rise of 62.1 K: far outside the 300 K carrier model, below). The
+Joule part of the heat is larger than at 1 ns at the same bias (0.760 against 0.222 at 0.9 V).
+
+Checks (`tests/test_pin.py`; the measured values are test prints, of two runs where the text says so; the test
+bounds are larger):
+
+| Check | Reference | Agreement |
+|---|---|---|
+| the Device of `pin_rib` on the charge window | `charge_gpu.injection.rib_pin()` | the same arrays (edges to 1e-15 m), the same contacts |
+| I' at 0.9 and 1.0 V | the logged charge-gpu example (`benchmarks/2026-10-30/charge-dd.jsonl`) | 3.7e-13 and 3.5e-14 or less (two runs) |
+| dneff_carrier at 0.9 V | the same example with `--modes` (its own sampling of the Si: the Yee points on y = 0 are oxide there) | -7.2299e-4 against -7.2300e-4: 2.3e-5 |
+| the sum of the heat source, 0.9 to 1.2 V | I' V: an identity of the discrete scheme (summation by parts; it holds for any cell potentials), so it checks the continuity residual and the flux code, not where the heat goes | 2.1e-13 or better, also after the move to the thermal grid |
+| the same, a 1-D diode (`diode_1d`, 1e17 cm^-3) at 0.5 and 0.7 V | I' V | 3.7e-8 (I' = 5.8e-5 A/m, near the current floor of charge-gpu) and 8.2e-12 |
+| the Joule and the recombination heat of each cell (the local checks) | not negative | above -1e-12 I' V (test) |
+| the recombination heat of each cell | q R A (phi_p - phi_n) from the public methods `DDSolution.recombination` and `quasi_fermi` | the same values (difference 0.0 at 0.9 to 1.2 V) |
+| the sum of J . E | I' (V - V_c), V_c = 2 V_T asinh(N / 2 n_i) = 0.9524 V (analytic) | 6.3e-15 of I' V or better |
+| the move to the thermal grid | a source cell over 2 x 2 thermal cells: the overlap areas by hand; a random source on a grid that is not aligned | within the test bounds 1e-14 and 1e-12 (not printed) |
+| the thermal part with I' V uniform in the core cells (`heat="core"`), 1.0 V | `phase_shifter_ppi` with the same heat in the same cells (the same q, bit for bit) | 1.9e-11 or less (three runs) |
+| the carrier part, 0.9 to 1.2 V | the first-order perturbation (`switching.index_weights` times the complex dn) | 7.1e-5, 1.5e-4, 2.4e-4, 3.2e-4: a second-order difference (the error divided by \|dneff\| changes by less than 10 %) |
+| the thermal part | the same | 1.0e-5, 4.7e-5, 1.3e-4, 2.8e-4 (the same) |
+| both changes in one solve | the sum of the two parts | the cross term is 2.4e-5 to 6.3e-4 of \|dneff_carrier\| |
+| dn/dT = 0 (all materials), 1.1 V | no heat: dneff_thermal = 0, dneff = dneff_carrier | 6.0e-14 or less; 4.6e-12 or less; the carrier part of the four-bias run to 7.8e-12 or less (three runs) |
+| no plasma dispersion (`plasma` gives 0), 1.1 V | no carriers: dneff_carrier = 0, dneff = dneff_thermal | 3.0e-13 or less; 4.7e-11 or less; the thermal part of the four-bias run to 1.6e-11 or less (three runs) |
+
+Also tested: the errors for biases that are not positive and increasing, for a charge window without a p and an n
+contact, for a wavelength other than 1.55 um with the default plasma dispersion, for a heat source outside the
+thermal window, for a heat tag that no shape has, for a slab shorter than the contacts, and for a thermal solve
+that does not converge (ConvergenceError); `crossover()` at an exact zero on a bias and without a zero (synthetic
+values); the thermal options of `pin_rib` do not change the charge Device; the mode is the largest index of a
+4-mode solve (2.589362; the next is 2.199027). Time of a run of the 15 tests: 32.7 s (the drift-diffusion sweep to
+1.2 V on the CPU of the GPU computer: about 19 s).
+
+The bench `bench/pin_self_heating.py` writes one JSON row per bias (also the Joule and recombination parts, the
+first-order values and the rise of the Si) and one row per run with the cross-over. Its options: `--tau`
+(lifetimes), `--biases`, `--thermal-step` and `--optics-step` (the grids), `--heat <tags>` (I' V uniform in the
+shapes with these tags, in place of the heat density), `--device-temperature` (the current at 300 K plus the mean
+rise of the Si: the size of the feedback that the workflow leaves out), and the thermal environment:
+`--thermal-half-width W` (the thermal window and the substrate +-W um wide; default 5), `--substrate-depth D` (the
+substrate D um deep; default 3) and `--heat-sink` (a crude heat path to the contacts: the p+ and n+ slab continues
+to the window sides, and both window sides are at 300 K over their whole height; the carriers do not change). The
+rows of `benchmarks/2026-11-08/suite-pin.jsonl` come from these commands, in this order (from the repository
+folder on the GPU computer):
+
+```bash
+B="python bench/pin_self_heating.py"
+for a in "--tau 1e-9 --device-temperature" \
+         "--tau 1e-8 --device-temperature --biases 0.8 0.85 0.9 0.95 1.0 1.05 1.1 1.15 1.2 1.25 1.3" \
+         "--thermal-step 0.02" "--thermal-step 0.01" "--optics-step 0.01" "--heat slab,core" \
+         "--heat slab,core,p,n" "--biases 1.15 1.155 1.16 1.165"; do bash tools/gpu_run.sh suite $B $a; done
+```
+
+The rows of `benchmarks/2026-11-08/suite-pin-2.jsonl` (the thermal environment) come from these commands:
+
+```bash
+B="python bench/pin_self_heating.py"
+for a in "--thermal-half-width 20" "--thermal-half-width 20 --substrate-depth 18" \
+         "--heat-sink --biases 0.8 0.85 0.9 0.95 1.0 1.05 1.1 1.15 1.2 1.25 1.3" \
+         "--heat-sink --tau 1e-8 --biases 0.8 0.85 0.9 0.95 1.0 1.05 1.1 1.15 1.2 1.25 1.3"; do
+  bash tools/gpu_run.sh suite $B $a; done
+```
+
+Each run takes 24.7 to 34.7 s (the drift-diffusion sweep 19.5 to 20.9 s on the CPU; the thermal and mode part
+4.2 to 7.2 s, 15.2 s with the 10 nm mode grid); peak RSS 1.77 to 2.03 GiB.
+
+Grids, heat models and thermal environments (lifetimes 1 ns; the two files):
+
+| Run | neff (0 V) | dneff_thermal at 1.0 V | at 1.2 V | dneff_carrier at 1.0 V | L_pi at 1.0 V (mm) | cross-over |
+|---|---|---|---|---|---|---|
+| default: thermal grid 50 nm, mode grid 20 nm, the heat density | 2.58936 | 6.9200e-4 | 4.1536e-3 | -1.6079e-3 | 0.8460 | 1.157 V, 62.5 A/m |
+| thermal grid 20 nm (`--thermal-step 0.02`) | 2.58936 | 6.9385e-4 | 4.1460e-3 | -1.6079e-3 | 0.8477 | 1.158 V, 62.7 A/m |
+| thermal grid 10 nm (`--thermal-step 0.01`) | 2.58936 | 6.9230e-4 | 4.1471e-3 | -1.6079e-3 | 0.8463 | 1.158 V, 62.7 A/m |
+| mode grid 10 nm (`--optics-step 0.01`) | 2.56908 | 6.9441e-4 | 4.1676e-3 | -1.6428e-3 | 0.8170 | 1.161 V, 64.1 A/m |
+| I' V uniform in the intrinsic zone (`--heat slab,core`) | 2.58936 | 7.2551e-4 | 4.4432e-3 | -1.6079e-3 | 0.8781 | 1.143 V, 56.8 A/m |
+| I' V uniform in all the Si of the device (`--heat slab,core,p,n`) | 2.58936 | 7.0001e-4 | 4.2870e-3 | -1.6079e-3 | 0.8535 | 1.152 V, 60.1 A/m |
+| thermal window and substrate +-20 um (`--thermal-half-width 20`; `suite-pin-2.jsonl`) | 2.58936 | 6.5187e-4 | 3.9072e-3 | -1.6079e-3 | 0.8105 | 1.170 V, 68.3 A/m |
+| the same, substrate 18 um deep (`--substrate-depth 18`) | 2.58936 | 6.6235e-4 | 3.9714e-3 | -1.6079e-3 | 0.8195 | 1.167 V, 66.7 A/m |
+| a heat path to the contacts (`--heat-sink`, to 1.3 V) | 2.58936 | 2.5135e-4 | 1.4174e-3 | -1.6079e-3 | 0.5713 | none up to 1.3 V |
+
+- Thermal grid: the 50 nm grid differs from the 10 nm grid by -0.44 % (0.8 V) to +0.16 % (1.2 V) in
+  dneff_thermal; the 20 nm grid by +0.22 % at 1.0 V (it samples the 90 nm slab as 80 nm). The cross-over moves by
+  less than 1 mV.
+- Mode grid: 10 nm against 20 nm changes neff by -0.020, dneff_carrier by +2.2 % (1.0 V; +2.1 % at 1.2 V),
+  dneff_thermal by +0.35 % and the cross-over by +3.6 mV. The 20 nm grid is that of the charge-gpu example (the
+  carrier part agrees with it, above); it is not converged.
+- Heat distribution: the same power, uniform in the intrinsic zone, gives 4.8 % (1.0 V) and 7.0 % (1.2 V) more
+  dneff_thermal than the heat density of the drift-diffusion solution and moves the cross-over 14.5 mV lower;
+  uniform in all the Si, 1.2 % and 3.2 % more. So, in this thermal environment, the place of the heat matters at
+  the level of a few percent; the thermal environment itself matters more (below).
+- The thermal environment (`suite-pin-2.jsonl`; the carriers are the same, dneff_carrier to 6e-11):
+  - The thermal window and the substrate +-20 um wide (the adiabatic sides farther away): dneff_thermal is 5.5 %
+    (0.8 V) to 5.9 % (1.2 V) lower than in the default model; the cross-over moves 13 mV higher (1.170 V). With
+    the substrate also 18 um deep: 4.1 % to 4.4 % lower, the cross-over 9.5 mV higher (1.167 V).
+  - The heat path of `--heat-sink`: dneff_thermal is 0.405 (0.8 V) to 0.341 (1.2 V) of the default (59 % to 66 %
+    lower; the core rise at 1.2 V is 7.53 K against 22.05 K), and there is no cross-over up to 1.3 V: the net
+    change has its largest size at 1.2 V (-2.0774e-3, L_pi 0.373 mm, P_pi 36.4 mW) and is still -1.8775e-3 at
+    1.3 V. At 10 ns: 63 % (0.8 V) to 68 % (1.3 V) lower, no cross-over up to 1.3 V, the shortest L_pi 0.173 mm
+    at 1.25 V (P_pi 35.9 mW, a core rise of 14.79 K).
+  - The test prints of `tests/test_pin.py` at 1.0 V (6.5187e-4 and 2.5135e-4) are the same values.
+  - So the default model (adiabatic sides at +-5 um, no heat path to the contacts) gives more dneff_thermal than
+    a device with a heat path. The thermal environment changes dneff_thermal and the cross-over much more than the
+    grids and the heat distribution do: the cross-over and the sign change are results of the thermal model.
+- Feedback of the device temperature (`--device-temperature`: one more drift-diffusion solve at 300 K plus the
+  mean rise of the Si, from the 300 K solution; all converged): the current at the same bias rises by 0.36 %,
+  1.86 %, 4.52 % and 6.69 % at 0.8, 0.9, 1.0 and 1.15 V (300.1, 300.8, 303.6 and 315.5 K), at 1 ns; at 10 ns by
+  up to 10.66 % (1.15 V, 322.5 K), and by 5.94 % at 1.3 V (362.9 K).
+
+Limits:
+- One-way coupling: the carriers are solved at 300 K, so the heat does not change the currents. The rows above
+  show the size of the missing feedback (one pass: up to 6.7 % more current at 1 ns, 10.7 % at 10 ns). So the bias
+  scale of the tables is that of a device at 300 K.
+- The heat source has no thermoelectric terms: the full model releases about E_g per recombination and has
+  Peltier heat at the junctions and the contacts (Wachutka 1990). The total stays I' V; only its distribution
+  changes. Its effect on dneff_thermal is not measured; the uniform heat models above change dneff_thermal by
+  1.2 % to 7.0 %.
+- The models of charge-gpu (no Auger recombination, no band-gap narrowing, no velocity saturation, Boltzmann
+  statistics; its README) and their range: charge-gpu tests forward bias to 1.0 V; the rows above 1.0 V are
+  outside that range (converged, but not checked against another solver), and the mean rise of the Si is above
+  20 K at 1.2 V (1 ns) and from 1.15 V on (10 ns).
+- The thermal model of `physics.temperature`: a 2-D cross-section of a long device, steady state, constant
+  kappa (the bulk value of Si) and dn/dT. The default thermal environment has adiabatic window sides 5 um from the
+  center and a slab that ends at the contacts in oxide, with no heat path to metal contacts. Both make the device
+  hotter than with a heat path: the sides at +-20 um give 4 % to 6 % less dneff_thermal, and the crude heat path of
+  `--heat-sink` 2.5 to 3.1 times less, with no cross-over up to 1.3 V (above). So the size of dneff_thermal, the
+  cross-over (about 1.16 V here; the heat distribution and the window width move it by up to 15 mV) and the sign
+  change are results of this thermal model, not of a PIN device in general; a device study needs its own thermal
+  environment (the contacts, the metal, the substrate). The 50 nm
+  thermal cells sample the 90 nm slab as 100 nm and the 220 nm rib as 200 nm (the heat stays in its place: the
+  overlap); the grid rows above give the effect.
+- `heat_source` reads the private helper `charge_gpu.drift_diffusion._fluxes` and the private fields of its mesh
+  (the face and contact indices, the contact node potentials, the cell areas): a refactor of charge-gpu can change
+  them. The tests of the heat sum and of the recombination heat per cell find a change of the flux or the index
+  convention. A public accessor of the face currents is a later change of charge-gpu.
+- The plasma dispersion of Soref and Bennett at 1.55 um only (`plasma=` for other coefficients), a constant
+  base index, and the 20 nm mode grid of the default (2.2 % in dneff_carrier against 10 nm, above).
+- The fundamental mode only. The workflow asks meow-gpu for one mode at its default target (just above the
+  largest index of the cross-section, Si), so the eigenvalue nearest the target is the mode with the largest
+  index. The modes that the meow-gpu solver misses (`meow_gpu/README.md`, "The modes that the solver misses",
+  the first open item) have neff = 1.444 or less (modes of the window without the core), far below neff = 2.589:
+  they do not change this workflow. `test_the_mode_is_the_fundamental_mode` checks that neff at 0 V is the
+  largest index of a solve with 4 modes.
 
 ## Next
 
