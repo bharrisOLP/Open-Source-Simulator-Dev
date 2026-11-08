@@ -4,8 +4,17 @@ Updated: 2026-11-07.
 
 ## In work
 
-**Now (2026-11-07; the fourth and fifth waves, one agent per package).** Each change gets one review before its
+**Now (2026-11-08; the fourth to sixth waves, one agent per package).** Each change gets one review before its
 commit.
+- Sixth wave (new features), done: thermal_gpu, transients with kappa(T) and rho c_p(T) (486b1d5; second order
+  in dt against solve_ivp; timings a47f265: 1.8x to 2.6x the constant-kappa transient with Si and SiO2 kappa(T));
+  optics_gpu, a type-1 non-uniform FFT for the image sum (ab60025; 1.3x to 194x faster than the direct complex128
+  sum, error at most 1.8e-14 of sum|a|; the default stays "direct"); bands_gpu, the eps sampling on the GPU
+  (2ce1bdd; 16.5x to 404x faster after the first call, equal to the CPU path; 3-D checks against an exact slab and
+  an independent supercell; no published gap value was found without WebFetch). All three reviews failed first
+  and were fixed: a label array in the wrong layout was reshaped silently (thermal); the NUFFT tolerance was not a
+  bound, and large grids fell to one ray per chunk (optics); in symmetric voxels the normal came from rounding,
+  so the CPU and GPU paths gave TE bands 7.8e-4 apart (bands).
 - Done: charge_gpu, the coupled Newton step on the GPU (297baf2; 5.8x to 5.9x faster than SuperLU at 5 nm) and
   a follow-up of its review (f937f57); optics_gpu, all focus planes in one pass (0bbad9f; 3.1x per plane in
   complex128, about 27x in complex64); meow_gpu, the profile of the batched path (88d5158; the taper in mixed

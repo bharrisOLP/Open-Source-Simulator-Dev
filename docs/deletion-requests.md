@@ -87,3 +87,10 @@ line, then delete it yourself or reject it.
 | 2026-11-07 | GPU computer | `os-simulator-dev/.local/upstream/addon-work-1` (a folder in the git-ignored .local/upstream there) | a work copy of the add-on with an early draft of patch 0001 that is in no commit | not needed: no result depends on it |
 | 2026-11-07 | GPU computer | `os-simulator-dev/.local/upstream/addon-work-2` | a work copy of the add-on with patch 0001 only | not needed: tools/env/addon_patches/0001 rebuilds it |
 | 2026-11-07 | GPU computer | `os-simulator-dev/.local/upstream/addon-work-4` | a work copy of the add-on with the three patches | not needed: the pinned clone `erised-fork` holds the same state (tools/env/addon_gpu.sh) |
+| 2026-11-07 | GPU computer | `/tmp/rev6_checks.py` | a scratch script of a reviewer (tests and checks) | not needed: no result depends on it |
+| 2026-11-07 | GPU computer | `/tmp/rev6_checks2.py` | a scratch script of a reviewer (tests and checks) | not needed: no result depends on it |
+| 2026-11-07 | GPU computer | `/tmp/rv_nufft_probe_7e.py` | a scratch script of a reviewer (tests and checks) | not needed: no result depends on it |
+| 2026-11-07 | GPU computer | `/tmp/rv_nufft_width_7e.py` | a scratch script of a reviewer (tests and checks) | not needed: no result depends on it |
+| 2026-11-08 | GPU computer | `/tmp/rv6_fuzz.py` | a scratch script of a reviewer (tests and checks) | not needed: no result depends on it |
+| 2026-11-08 | GPU computer | `/tmp/rv6_auto.py` | a scratch script of a reviewer (tests and checks) | not needed: no result depends on it |
+| 2026-11-08 | GPU computer | `/tmp/rv6_ties.py` | a scratch script of a reviewer (tests and checks) | not needed: no result depends on it |
