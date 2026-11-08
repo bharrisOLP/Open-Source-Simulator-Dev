@@ -17,18 +17,25 @@ Updated: 2026-11-07.
   two lowest modes were diagonal and rounding chose the source component; eta 0.8866 instead of 0.8888), and the
   same fix in the top-level example `examples/chip_to_fiber_coupling.py` (the documents commit of 2026-11-07);
   fdtd_gpu, objects repeat across periodic faces (eade281).
-- In work: the add-on route of item 2 (installed; two ROCm patches in `tools/env/addon_patches/`: hipRTC options
-  and subnormals; both kernel tables ran on the RX 7900 XT; parity tests and timings in work, one module at a time).
-- 2026-11-07, the GPU computer stopped at 16:49:44 EST: the kernel (7.0.0-38-generic) stopped with an Oops in the
+- Done on 2026-11-07, late: the add-on route of item 2 runs on the AMD GPU (a6938b6; time loop 16x to 28x faster
+  than the serial CPU solver on a 2.1-million-cell 3-D case; a longer setup). In work: its minor review findings
+  and the install of the patches into the pinned clone.
+- 2026-11-07, the GPU computer stopped at about 16:49:53 EST (the kernel time stamps; the last journal entry is
+  16:49:44): the kernel (7.0.0-38-generic) stopped with an Oops in the
   amdgpu/TTM memory manager ("list_del corruption" and "list_add corruption", then a NULL pointer dereference in
   `ttm_resource_move_to_lru_tail`) during a GPU memory allocation (KFD ioctl) of a `python` process of the user,
   about 80 s after the RX 7900 XT resumed from runtime suspend. `panic_on_oops` is 1, so kdump saved a crash dump
   (`/var/crash/202611071650` on that computer). The OOM kills and the "Fatal error during GPU init" of the next
   boot came from the kdump capture kernel (small memory, one CPU; the GPU error is for the integrated GPU), not from
-  the crash. The computer stayed down until the user restarted it (18:00; now kernel 7.0.0-42-generic). Not known:
-  which process (the add-on tests had just started), and if the trigger is a driver bug or the program. Found by
-  the review of the documents commit (the record has the log details). Until more is known: run the add-on tests
-  in small parts, one module at a time, and one GPU job at a time on the shared computer.
+  the crash. The computer stayed down until the user restarted it (18:00; now kernel 7.0.0-42-generic). The other
+  session on the computer used no GPU and no Python then (its message), so the process was very probably the
+  add-on test run of this repository: a short login session made its log file at 16:49:44.64, about 8 s before
+  the Oops, and the crashed python process has a higher process number than that session. Not known: if the
+  trigger is a driver bug or the program. Found by the reviews of the documents commits (the records have the log
+  details). On kernel 7.0.0-42, the 6 modules of that run ran one at a time (19:24 to 19:38) with no crash (some
+  of their tests fail: the defects that the patches fix, and certification digests that the patches put out of
+  date; `addon_gpu/README.md`), and the add-on tests, benches and example checks ran until 21:00, also with no
+  crash. Still: run the add-on tests in small parts, and one GPU job at a time on the shared computer.
 
 **1. meow-gpu (EME): version 0.1 works.** Folder: `meow_gpu/` (`meow_gpu/README.md` has the results).
 
@@ -58,7 +65,8 @@ Done:
 
 Open (later, in this order): profile the batched path (the work per member is its larger cost); angled propagation.
 
-**2. Meep on AMD: next.** Findings so far (git-ignored clones in `.local/upstream/`):
+**2. Meep on AMD: two routes work** (the fdtdx front end `fdtd_gpu/`, and the add-on route `addon_gpu/`).
+Findings (git-ignored clones in `.local/upstream/`):
 - The Erised fork (GPL-2.0-or-later) is a Python add-on: Meep builds the simulation, and the add-on time-steps it
   with an array module (NumPy or CuPy) plus Triton kernels and CUDA C kernels (cupy.RawKernel). Route to AMD: CuPy
   for ROCm (hipRTC compiles RawKernel source) and the AMD backend of Triton. About 250k lines of Python with tests.
@@ -74,10 +82,19 @@ Open (later, in this order): profile the batched path (the work per member is it
   fine"). `tools/env/addon_gpu.sh` (named `tools/env/fdtd_gpu.sh` until 2026-10-30, before the folder `fdtd_gpu/`
   of the fdtdx route) cloned the add-on at commit 8993426 into `.local/upstream/erised-fork` on the GPU computer and
   made `.local/envs/addon-gpu`: the solver 1.35.0 (conda-forge, serial), the add-on 1.0.0, PyTorch 2.14.1 for ROCm
-  7.2, Triton 3.8.0 and CuPy 14.2 see the RX 7900 XT. `tools/gpu_run.sh .local/upstream/erised-fork ...` (and
-  `tools/gpu_run.sh addon_gpu ...`, when the folder of the port exists) uses that environment. Next: run the
-  tests of the add-on on the AMD GPU, patch what fails (patches in `tools/env/addon_patches/`, GPL-2.0-or-later),
-  and compare the GPU time stepping with the CPU solver.
+  7.2, Triton 3.8.0 and CuPy 14.2 see the RX 7900 XT. `tools/gpu_run.sh .local/upstream/erised-fork ...` and
+  `tools/gpu_run.sh addon_gpu ...` use that environment.
+- **Add-on route: runs on the AMD GPU (a6938b6, 2026-11-07; `addon_gpu/README.md`).** Two patches
+  (`tools/env/addon_patches/`, GPL-2.0-or-later): hipRTC gets `-ffp-contract=off` for the NVIDIA option
+  `--fmad=false`, so the hand-written kernel table compiles; subnormal float32 values are kept on ROCm (CuPy-HIP
+  flushed them silently, a wrong-arithmetic defect). Both kernel tables equal the add-on's array path word for
+  word, and agree with the CPU solver to 8.3e-6 or better (field, relative L2). Time loop on a 2,097,152-cell 3-D case
+  (1,280 steps): 37.7 s on the serial CPU solver (float64), 1.34 s with the hand-written table (28x) and 2.35 s
+  with Triton (16x), in float32; but the setup before the first step is longer on the GPU route (39-42 s against
+  11.5 s), so a whole short run gains little in 3-D and is slower in 2-D
+  (`benchmarks/2026-11-07/addon-bench-full.jsonl`).
+  Nothing is certified on AMD (the kernels run with `MEEP_GPU_HARDWARE=any`). Next: install the patches into the
+  pinned clone, the minor review findings, a faster setup, and more of the add-on's 409 test modules (its pytest paths).
 
 **3. bands-gpu (the method of MPB): version 0.1 works.** Folder: `bands_gpu/` (`bands_gpu/README.md`).
 - Plane-wave operator with FFTs, anisotropic subpixel averaging, block LOBPCG (stabilized), warm start on the k
@@ -182,7 +199,7 @@ The user asked to start with Meep and meow. After those two, the order is by com
 | # | Tool | Open-source base | GPU path on AMD | Complexity | Notes |
 |---|---|---|---|---|---|
 | 1 | meow (EME) | meow (Apache-2) + own FDE solver | JAX on ROCm | medium | v0.1 done; improvements open |
-| 2 | Meep (FDTD) | Meep (GPL-2); GPU forks: Erised add-on (Triton/CUDA), gpmeep (CUDA C++) | CuPy-ROCm + Triton-AMD, HIP, or fdtdx | very high | fdtdx route v0.1 done (`fdtd_gpu/`); the add-on route: approved and installed, the AMD port is next |
+| 2 | Meep (FDTD) | Meep (GPL-2); GPU forks: Erised add-on (Triton/CUDA), gpmeep (CUDA C++) | CuPy-ROCm + Triton-AMD, HIP, or fdtdx | very high | fdtdx route v0.1 done (`fdtd_gpu/`, subpixel averaging); the add-on route runs on AMD (`addon_gpu/`, two patches; not certified) |
 | 3 | MPB (band and mode solver) | MPB (GPL-2) | plane-wave basis: FFT + block eigensolver in JAX | medium-high | v0.1 done (own code: `bands_gpu/`) |
 | 4 | Thermal | own finite-volume solver (femwell / scikit-fem as references) | CG on GPU (JAX) | medium | v0.1 done (`thermal_gpu/`) |
 | 5 | ZEMAX (ray + physical optics) | Optiland (MIT, PyTorch) + own physical optics | PyTorch on ROCm | medium | v0.1 done (`optics_gpu/`) |
@@ -242,4 +259,5 @@ Decided (2026-10-30):
   Commits: fdtd-gpu subpixel averaging (46da80a) and periodic faces (eade281); charge-gpu device-error fallback
   (0bb5179); meow-gpu cold-start stop (18f2178; a review-follow-up test found wrong converged modes on the SiN tip
   with 1 BLAS thread); optics-gpu symmetric core and explicit source (e15c847; its review found the staircase
-  error). The reviews also found the cause of the crash and the asymmetric core.
+  error); the documents with the crash cause and the top-level example (d694a86); the add-on route runs on the
+  AMD GPU (a6938b6). The reviews also found the cause of the crash and the asymmetric core.

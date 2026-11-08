@@ -63,3 +63,9 @@ line, then delete it yourself or reject it.
 | 2026-11-07 | GPU computer | `/tmp/rev_fdtd6_a.py` | a scratch script of a reviewer (tests and checks) | not needed: no result depends on it |
 | 2026-11-07 | GPU computer | `/tmp/rev_fdtd6_b.py` | a scratch script of a reviewer (tests and checks) | not needed: no result depends on it |
 | 2026-11-07 | GPU computer | `/dev/shm/rv_docs5_dm.txt`; `os-simulator-dev/results/chip_to_fiber/rv_docs5_x.npz` and `rv_docs5_y.npz` (in the git-ignored results folder there) | scratch files of a reviewer (the decoded crash dmesg; two mode files) | not needed: no result depends on them |
+| 2026-11-07 | GPU computer | `/tmp/rev_addon_k1.py` | a scratch file of a reviewer (tests and checks) | not needed: no result depends on it |
+| 2026-11-07 | GPU computer | `/tmp/rev_addon_k2.py` | a scratch file of a reviewer (tests and checks) | not needed: no result depends on it |
+| 2026-11-07 | GPU computer | `/tmp/rev_addon_k3_cuda_0.json` | a scratch file of a reviewer (tests and checks) | not needed: no result depends on it |
+| 2026-11-07 | GPU computer | `/tmp/rev_addon_k3_cuda_2.json` | a scratch file of a reviewer (tests and checks) | not needed: no result depends on it |
+| 2026-11-07 | GPU computer | `/tmp/rev_addon_k3_triton_0.json` | a scratch file of a reviewer (tests and checks) | not needed: no result depends on it |
+| 2026-11-07 | GPU computer | `/tmp/rev_addon_k3_triton_2.json` | a scratch file of a reviewer (tests and checks) | not needed: no result depends on it |
