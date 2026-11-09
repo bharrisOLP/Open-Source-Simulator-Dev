@@ -618,10 +618,10 @@ Limits:
   base index, and the 20 nm mode grid of the default (2.2 % in dneff_carrier against 10 nm, above).
 - The fundamental mode only. The workflow asks meow-gpu for one mode at its default target (just above the
   largest index of the cross-section, Si), so the eigenvalue nearest the target is the mode with the largest
-  index. The modes that the meow-gpu solver misses (`meow_gpu/README.md`, "The modes that the solver misses",
-  the first open item) have neff = 1.444 or less (modes of the window without the core), far below neff = 2.589:
-  they do not change this workflow. `test_the_mode_is_the_fundamental_mode` checks that neff at 0 V is the
-  largest index of a solve with 4 modes.
+  index. The modes that the meow-gpu solver did not give (`meow_gpu/README.md`, "The modes of the PEC walls":
+  spurious modes of the PEC walls, now excluded by the solver) have neff = 1.444 or less in the taper window, far
+  below neff = 2.589: they do not change this workflow. `test_the_mode_is_the_fundamental_mode` checks that neff at
+  0 V is the largest index of a solve with 4 modes.
 
 ## Next
 

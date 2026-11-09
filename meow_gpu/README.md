@@ -22,6 +22,10 @@ S, port_map = mw.compute_s_matrix(modes, cells=cells)   # the rest of meow does 
 - **Eigensolver.** Block generalized Davidson with a fast-diagonalization preconditioner (the separable operator
   with a reference permittivity, inverted with dense 1-D eigenbases: two small matrix products per side, good for
   a GPU, valid on non-uniform grids and with PML). Fixed-shape buffers, so JAX compiles once per grid size.
+- **PEC walls.** The operator keeps Ex on the near y wall and Ey on the near x wall (tangential E on a PEC wall) as
+  decoupled unknowns with spurious 1-D modes. As tidy3d, the solver excludes them (since 2026-11-08 evening; see
+  "The modes of the PEC walls"): its modes have zero E_t there. The reference permittivity of the preconditioner is
+  0.99 times the smallest real in-plane permittivity (a near-uniform window needs this shift; same part).
 - **Warm start.** The solver keeps the modes of its last solve. The cells of a taper change slowly, so the next
   cell needs about 15 iterations instead of 50 to 90.
 - **Precision.** `single` (default): complex64 iteration; the tolerance follows the complex64 floor. `mixed`:
@@ -429,14 +433,16 @@ or the centre of the bend inside the cross-section) falls back to tidy3d with a 
   5e-3), after one phase for each mode: meow's inner product uses only Ex, Ey, Hx and Hy, and Ez and Hz are the
   components that the back-transform changes. Without the Jacobian (Ez', Hz'), Ez and Hz differ from tidy3d by
   more than 1e-3 (test `test_the_jacobian_changes_ez_and_hz`).
-- 4 modes, double precision only: the GPU modes are the 4 eigenvalues of the tidy3d matrix nearest the target
-  (ARPACK shift-invert, 8 values, tol 1e-13; |dneff| < 1e-9; residuals with the tidy3d matrix < 1e-9). Mixed and
-  single precision can miss a box mode nearer the target, as tidy3d does (see the timing rows below). So the mode
-  set beyond the guided modes depends on the solver and the precision. `compute_modes_tidy3d` itself misses
-  box modes at the outer wall of the bend. Bench row (`--radii 5 50 --dx 0.04 --repeat 1 --x-min -1.2 --x-max 1.2`,
-  mixed, 4 modes), R = 5 um: tidy3d gives neff 2.4468, 1.8002, 1.5969, 1.4822, the GPU solver 2.4468, 1.8002,
-  1.6579, 1.5969 (the three common modes agree to 2.2e-14). At R = 50 um all 4 agree (5.0e-11). So the mode list of
-  tidy3d is the reference only for the guided modes.
+- 4 modes, double precision only: the GPU modes are the 4 eigenvalues nearest the target of the tidy3d matrix
+  without the unknowns of the PEC walls (ARPACK shift-invert, 8 values, tol 1e-13; |dneff| < 1e-9; residuals with the
+  tidy3d matrix < 1e-9), and each eigenvalue of the full matrix among its 4 nearest that the solver does not give is
+  a spurious mode of a PEC wall ("The modes of the PEC walls"). Mixed and single precision can miss a box mode
+  nearer the target, as tidy3d does (see the timing rows below). So the mode set beyond the guided modes depends on
+  the solver and the precision. Bench row of the solver of 505c4c5 (`--radii 5 50 --dx 0.04 --repeat 1 --x-min -1.2
+  --x-max 1.2`, mixed, 4 modes), R = 5 um: tidy3d gives neff 2.4468, 1.8002, 1.5969, 1.4822, the GPU solver 2.4468,
+  1.8002, 1.6579, 1.5969 (the three common modes agree to 2.2e-14). At R = 50 um all 4 agree (5.0e-11). The mode at
+  1.6579 (a "box mode at the outer wall", with its maximum at the corner of the PEC box) was a wall mode: the
+  solver of today excludes it, as tidy3d does (this bench row is not repeated).
 - Radiation loss (PML of 10 cells in x, the domain from -1.0 to 2.4 um, target neff 2.45, 1 mode): Im(neff) of the
   GPU solver equals that of tidy3d (radii 1.5 and 2 um, rel 1e-4, in double and mixed precision), and it falls with
   the radius (1.5, 2, 3 um).
@@ -567,10 +573,12 @@ In photonsuite: `photonsuite.eme.transmission(..., interface="conserving")` (the
 - The star-product cascade (`compute_s_matrix`, narrow, wide and narrow cells) gives the S-matrix and the port map
   of meow's SAX cascade within 1e-10, with the conserving interface and with meow's interface.
 - Equal guides: S = [[0, I], [I, 0]] within 1e-12.
-- Uniform media (the window filled with n = 1.444, then with n = 2.0): the two first modes of this grid are a
-  degenerate pair with neff = n (uniform Ex and uniform Ey). R = r I and T^H T = (1 - r^2) I on the pair within
-  1e-8, with the Fresnel value r = (n1 - n2) / (n1 + n2); no coupling into the other modes (1e-7); the fields of
-  the pair are real.
+- Uniform media (the window filled with n = 1.444, then with n = 2.0; the solver converges in both): the two first
+  modes are the TE box modes with one transverse wavenumber of zero (Ey with the first Dirichlet mode along x, then
+  Ex with the first Dirichlet mode along y), with neff^2 = n^2 - (2 sin(pi / 2N) / (k0 dl))^2 within 1e-9. For these
+  H_t = neff z x E_t / eta0, so R and T^H T are diagonal with r = (neff_1 - neff_2) / (neff_1 + neff_2) and
+  1 - r^2 within 1e-8; no coupling into the other modes (1e-7); the fields are real. (Up to 505c4c5 the two first
+  modes of this test were the spurious modes of the PEC walls, neff = n; see "The modes of the PEC walls".)
 - The complete set (a 0.2 and a 0.4 um strip on an 8 x 6 grid; all 96 modes from a dense eigensolve, most of them
   below cutoff): for the incidence of modes 0, 1 and 5, E_t and H_t are continuous at every sample within 1e-8 of
   the field maximum (the exact discrete solution); meow's formula with the same product, no TSVD and no passivity
@@ -587,31 +595,60 @@ In photonsuite: `photonsuite.eme.transmission(..., interface="conserving")` (the
   symmetrization).
 - The solver at 60 modes on the first cell of the taper (0.02 um grid): each mode is an eigenpair of the assembled
   operator (relative residual below 1e-9, an ARPACK eigenvalue), no copies, and each complex mode has its conjugate
-  eigenvalue in the ARPACK spectrum (a complex pair); `post_process_eigenmodes` keeps all 60.
+  eigenvalue in the ARPACK spectrum (a complex pair); `post_process_eigenmodes` keeps all 60. (`tests/test_walls.py`
+  checks that the solver gives the nearest eigenvalues; "The modes of the PEC walls".)
 - Errors: two different grids, a PML window (on either side).
 
 `suite/tests/test_eme.py` (`test_conserving_interface_keeps_the_power`): a 0.5 to 1.2 um step in photonsuite sends
 the input power into the kept modes within 1e-6 (meow's interface without a passivity rule: more than 1 + 1e-4); a
 straight guide transmits 1 within 1e-9.
 
-**Results** (the files of `benchmarks/2026-11-08/`: `meow-interface.jsonl`, 55 rows, and `meow-interface-2.jsonl`,
-12 rows, with meow's SAX cascade; `meow-interface-3.jsonl`, 4 rows, and `meow-interface-4.jsonl`, 25 rows, with the
-star cascade, see "Memory of the cascade"; `meow-solver-arpack.jsonl`, 8 rows; `suite-eme-fdtd-taper.jsonl` and
+**Results** (the files of `benchmarks/2026-11-08/`. The solver of 505c4c5: `meow-interface.jsonl`, 55 rows, and
+`meow-interface-2.jsonl`, 12 rows, with meow's SAX cascade; `meow-interface-3.jsonl`, 4 rows, and
+`meow-interface-4.jsonl`, 25 rows, with the star cascade, see "Memory of the cascade"; `meow-solver-arpack.jsonl`, 8
+rows. The wall unknowns excluded, before the shift of eps_ref: `meow-interface-5.jsonl`, 60 rows,
+`meow-solver-arpack-2.jsonl`, 18 rows, `meow-refine-walls.jsonl`, 3 rows. The final code of the tenth wave (the wall
+unknowns excluded and eps_ref shifted, "The modes of the PEC walls"): `meow-interface-6.jsonl`, 60 rows,
+`meow-solver-arpack-3.jsonl`, 18 rows, `meow-refine-shift.jsonl`, 3 rows. `suite-eme-fdtd-taper.jsonl` and
 `suite-eme-fdtd-double-step.jsonl` for the FDTD; RX 7900 XT, precision "mixed", 0.02 um grid unless stated, one EME
 cell per segment; the commands are at the end of this part). The meow rows give the eighth-wave rows of
 photonsuite.eme again (`suite-eme-fdtd-taper.jsonl`), for example T00 = 0.8761 ("invert") and 0.8980 ("none") at
 1.55 um and 10 modes. The power columns give the sum of |S|^2 from the input TE0 mode into the left and the right
-ports of the modes above cutoff. The conserving rows above 40 modes come from `meow-interface-4.jsonl` (the
-post-processing after the review of 2026-11-08: modes on the wrong branch are flipped, not removed). The conserving
+ports of the modes above cutoff. The rows of 10 to 40 modes come from `meow-interface.jsonl` (the final code gives
+them again within 7.9e-12, "Scope"). The conserving rows above 40 modes come from `meow-interface-6.jsonl` (the
+final code, with the post-processing after the review of 2026-11-08: modes on the wrong branch are flipped, not
+removed). The conserving
 rows above 40 modes of `meow-interface.jsonl` and `meow-interface-2.jsonl` came from the first version of
 `post_process_eigenmodes`, which removed valid modes (the members with Re(neff) < 0 of complex pairs and the modes
 on the growing branch); they are not used. With 40 modes or fewer no mode is below cutoff, and nothing was removed.
 
-**Scope: the mode sets lack modes.** All EME rows here, of both interfaces and at all mode counts, use the mode sets
-of the meow_gpu solver. In this window the solver misses about 10 of the 40 eigenvalues nearest the target, all
-above cutoff ("The modes that the solver misses", below; the first item of "Known limits and next steps"). So each
-"40 modes" set is not the set of the 40 modes nearest the target, and each EME result here is the result for such a
-set. It is not known how much the missed modes change T00.
+**Scope: the mode sets.** The EME rows of `meow-interface.jsonl` to `meow-interface-4.jsonl` use the mode sets of
+the meow_gpu solver of 505c4c5. The ninth wave found that it did not give about 10 of the 40 eigenvalues nearest the
+target. These are the spurious modes of the PEC walls, which tidy3d also excludes ("The modes of the PEC walls",
+below): the solver of 505c4c5 gave the physical modes nearest the target. `tests/test_walls.py` shows this for the
+first and the last cell of the taper at 40 and 60 modes (cold starts). The 60 rows of the taper and the double step
+with the final code (`meow-interface-6.jsonl`: 10 to 120 modes, five wavelengths, warm starts as before; every mode
+solve converged, largest residual 9.99e-11; peak RSS 6.41 GiB) give, row by row against the rows of 505c4c5
+(`meow-interface.jsonl` for 10 to 40 modes, `meow-interface-4.jsonl` above 40 modes), the same T00 (not rerun: the
+`--diag` rows, the rows of `meow-interface-2.jsonl` and `meow-interface-3.jsonl`, the 10 um taper of "Correction of
+meow's post-processing" and the rows of photonsuite):
+
+- 10 to 40 modes (no mode below cutoff): within 7.9e-12 for all three interfaces (35 rows each).
+- 60 and 80 modes of the double step: within 5.5e-13. 120 modes of the double step: within 1.4e-8 at 1.50, 1.525,
+  1.55 and 1.60 um; at 1.575 um the row of 505c4c5 came from a mode solve that did not converge (footnote (f) of the
+  double step).
+- 60 modes of the taper: within 8.3e-13, except at 1.60 um (3.6e-5). 80 modes of the taper: changes of 2.0e-5,
+  3.1e-5, 1.3e-13, 1.4e-13 and 2.2e-4 (the table rows (b) are those of the final code).
+
+The rows before the shift of eps_ref (`meow-interface-5.jsonl`) differ from those of the final code by at most
+1.2e-11 up to 40 modes, 1.4e-8 on the double step at 60 to 120 modes, and 1.4e-4 on the taper at 60 and 80 modes.
+The probable cause of the changes of the taper rows with modes below cutoff (a run of the review of 2026-11-08,
+`reviews/2026-11-08-735e7d3ec15d.md`, finding 5; not a logged row): at 1.60 um and 80 modes both search spaces give,
+in all 22 cells, the 80 eigenvalues of the matrix without the wall unknowns nearest the target (sorted distances
+within 7.9e-13 of |target|), and the two sets differ only in cells 5 and 18, by the member of a complex pair at the
+cut (the 80th and the 81st eigenvalue have the same distance). So T00 at 60 and 80 modes depends on that choice at
+the 1e-4 level; a rule for a pair at the cut (keep both members or neither) is a possible next step. The changes
+are smaller than the change of T00 from 60 to 80 modes (0.0027 to 0.0041).
 
 The causes (the 4 `--diag` rows; the taper, 1.55 um, 10 / 20 / 30 / 40 modes):
 
@@ -636,22 +673,25 @@ The taper of the eighth wave (T00 at 1.50, 1.525, 1.55, 1.575 and 1.60 um):
 | conserving | 20 | 0.8878, 0.8912, 0.8943, 0.8934, 0.8951 | 1 within 1e-12 |
 | conserving | 30 | 0.8998, 0.9021, 0.9039, 0.9060, 0.9079 | 1 within 1e-12 |
 | conserving | 40 | 0.9061, 0.9094, 0.9122, 0.9148, 0.9173 | 1 within 1e-12 |
-| conserving (b) | 60 | 0.9098, 0.9139, 0.9170, 0.9196, 0.9214 | 0.999998 to 1.000000 |
-| conserving (b) | 80 | 0.9071, 0.9102, 0.9129, 0.9156, 0.9189 | 0.999952 to 1.000212 |
+| conserving (b) | 60 | 0.9098, 0.9139, 0.9170, 0.9196, 0.9214 | 1.000000 to 1.000004 |
+| conserving (b) | 80 | 0.9071, 0.9102, 0.9129, 0.9156, 0.9187 | 0.999695 to 1.000018 |
 | 3-D FDTD, 60 cells per um (a) | | 0.9008, 0.9058, 0.9103, 0.9143, 0.9178 | T_flux 0.9996 to 1.0002 |
 
-(a) `benchmarks/2026-11-08/suite-eme-fdtd-taper.jsonl`, the eighth wave. (b) `meow-interface-4.jsonl`; all
-requested modes kept; modes below cutoff in all cells (251 to 387 of the stack at 60 modes, 691 to 827 at 80).
+(a) `benchmarks/2026-11-08/suite-eme-fdtd-taper.jsonl`, the eighth wave. (b) `meow-interface-6.jsonl` (the final
+code; the rows of 505c4c5 in `meow-interface-4.jsonl` differ by up to 2.2e-4, "Scope": 0.9189 at 1.60 um and 80
+modes); all requested modes kept; modes below cutoff in all cells (251 to 387 of the stack at 60 modes, 691 to 827
+at 80).
 
 - The conserving T00 rises by 0.0025 to 0.0127 for each 10 more modes up to 40 modes, by 0.0036 to 0.0048 from 40 to
-  60 modes, and falls by 0.0025 to 0.0041 from 60 to 80 modes. From 40 to 80 modes it stays between 0.9061 and
+  60 modes, and falls by 0.0027 to 0.0041 from 60 to 80 modes. From 40 to 80 modes it stays between 0.9061 and
   0.9214; it has no converged value.
 - The conserving interface differs from the FDTD (60 cells per um) by +0.0053, +0.0035, +0.0019, +0.0005, -0.0005
-  with 40 modes, +0.0090, +0.0080, +0.0066, +0.0053, +0.0036 with 60 modes and +0.0063, +0.0044, +0.0025, +0.0013,
-  +0.0011 with 80 modes (the FDTD limit is known to 2e-3 to 4e-3, `suite/README.md`); meow with "invert" is 0.0196
+  with 40 modes, +0.0090, +0.0080, +0.0066, +0.0053, +0.0037 with 60 modes and +0.0063, +0.0044, +0.0025, +0.0013,
+  +0.0009 with 80 modes (the FDTD limit is known to 2e-3 to 4e-3, `suite/README.md`); meow with "invert" is 0.0196
   to 0.0287 below the FDTD, with "none" 0.0058 to 0.0124 above (40 modes). Over the band, the conserving T00 rises
-  by 0.0111, 0.0116 and 0.0118 (40, 60 and 80 modes), the FDTD T00 by 0.0169.
-- With modes below cutoff the power on the ports of the modes above cutoff stays within 2.2e-4 of 1 (80 modes).
+  by 0.0111, 0.0116 and 0.0116 (40, 60 and 80 modes), the FDTD T00 by 0.0169.
+- With modes below cutoff the power on the ports of the modes above cutoff stays within 3.1e-4 of 1 (80 modes; the
+  rows of 505c4c5: 2.2e-4).
 
 The double step (0.5 um, then 1.25 um for 0.1 um, then 2.0 um; `--length 0.1 --segments 1`; the FDTD is
 photonsuite.fdtd_avg on the same segments):
@@ -663,7 +703,7 @@ photonsuite.fdtd_avg on the same segments):
 | conserving | 40 | 0.5532, 0.5603, 0.5676, 0.5744, 0.5810 | 1 within 1e-12 |
 | conserving (e) | 60 | 0.5554, 0.5622, 0.5690, 0.5762, 0.5846 | 1 within 1e-7 |
 | conserving (e) | 80 | 0.5561, 0.5605, 0.5645, 0.5713, 0.5807 | 1 within 1e-7 |
-| conserving (e) | 120 | 0.5575, 0.5637, 0.5690, 0.5739, 0.5828 | 1 within 1e-7 |
+| conserving (e) | 120 | 0.5575, 0.5637, 0.5690, 0.5749 (f), 0.5828 | 1 within 1e-7 |
 | conserving, 0.01 um grid (b) | 40 | 1.55 um: 0.5677 | 1.00000 |
 | conserving, window x -3 to 3, y -1.8 to 2.02 um (c) | 40 | 1.55 um: 0.6101 | 1 (no mode below cutoff) |
 | conserving, the same window (c) | 80 | 1.55 um: 0.5825 | 1 (no mode below cutoff) |
@@ -679,8 +719,16 @@ GPU memory (its GMRES basis, 168 b n bytes for b = 48 block vectors and n = 582,
 limit of the shared computer (`XLA_PYTHON_CLIENT_MEM_FRACTION=0.4`). (c) `meow-interface-3.jsonl` (star cascade; no
 mode below cutoff, so nothing was removed): the walls 1 um farther away than in the FDTD window; 120 modes did not
 run (an error row: a 2.29 GiB allocation of the same GMRES basis, b = 128 and n = 114,600, under the same limit).
-(d) `suite-eme-fdtd-double-step.jsonl`. (e) `meow-interface-4.jsonl`; all requested modes kept; 36 to 230 modes
-of the stack below cutoff.
+(d) `suite-eme-fdtd-double-step.jsonl`. (e) `meow-interface-6.jsonl` (the final code; the rows of 505c4c5 in
+`meow-interface-4.jsonl` give the same values within 1.4e-8, except (f)); all requested modes kept; 36 to 230 modes
+of the stack below cutoff. (f) The final code (`meow-interface-6.jsonl`; all mode solves converged, largest
+residual 9.99e-11, solve_s 32.5 s) and the rows before the shift of eps_ref (`meow-interface-5.jsonl`, solve_s
+25.2 s) both give 0.5749. The row of `meow-interface-4.jsonl` gave 0.5739, very probably from a mode solve that did
+not converge: the stderr log of that run (`benchmarks/2026-11-08/meow-interface-stderr.log`, line 77) has "the
+eigensolver did not converge (residual 4.9e-06)" (the tolerance of "mixed" is 1e-10); that row has solve_s 84.5 s
+against 22.7 to 43.5 s of the other 120-mode rows of the double step, and 189 raw modes below cutoff against 225 in
+both reruns (216 to 230 at the other wavelengths). The bench rows of that run did not record the convergence; since
+2026-11-08 evening `bench_interface.py` writes "converged", "not_converged_cells" and "residual_max" into each row.
 
 The EME and the FDTD do not agree on the double step, and the cause is not known:
 
@@ -689,7 +737,8 @@ The EME and the FDTD do not agree on the double step, and the cause is not known
   monotonically (0.5616, 0.5578, 0.5599, 0.5591 at 1.55 um).
 - The EME is not converged in the mode count: from 20 to 40 modes T00 falls by 0.031 to 0.048; from 40 to 120
   modes it moves by 0.0034 to 0.0049 at each wavelength and not monotonically (1.55 um: 0.5676, 0.5690, 0.5645 and
-  0.5690 at 40, 60, 80 and 120 modes). Over 40 to 120 modes the EME is above the FDTD by 0.0040 to 0.0103.
+  0.5690 at 40, 60, 80 and 120 modes). Over 40 to 120 modes the EME is above the FDTD by 0.0040 to 0.0103. (At
+  1.575 um and 120 modes these ranges use the final code, (f); the non-converged value 0.5739 also lies inside them.)
 - Where the power goes at 1.55 um: the EME (40 modes) puts 0.5676 into TE0, 0.4255 into the other transmitted modes
   and 0.0070 into the reflected modes. The FDTD (60 cells per um) puts 0.5591 into TE0 and 0.4377 into the rest of
   the transmitted flux (T_flux 0.9968); its input plane gives a mode power of 1.0037 of the net flux, which is about
@@ -705,25 +754,101 @@ The EME and the FDTD do not agree on the double step, and the cause is not known
   modes in the default window. The larger window has more modes above cutoff, so at 40 and 80 modes it is farther
   from convergence in the mode count (the default window gave 0.6055 and 0.6058 at 10 and 20 modes). These rows
   cannot show the effect of the walls; it is not known.
-- Not tested: the walls, the modes that the solver misses (below), the mode truncation and the FDTD error. The gap
-  of 0.0040 to 0.0085 at 40 modes (0.0040 to 0.0103 over 40 to 120 modes) is not explained.
+- Not tested: the walls (their reflection of the field; not the wall modes of the next part), the mode truncation
+  and the FDTD error. The gap of 0.0040 to 0.0085 at 40 modes (0.0040 to 0.0103 over 40 to 120 modes) is not
+  explained.
 
-**The modes that the solver misses** (`meow-solver-arpack.jsonl`, `bench/solver_vs_arpack.py`: the first and the
-last cell of the taper, 0.5 and 2.0 um strips, 1.55 um, the 0.02 um grid; ARPACK shift-invert on the assembled
-operator at the target of the solver):
+**The modes of the PEC walls** (2026-11-08 evening; `tests/test_walls.py`, `bench/solver_vs_arpack.py`). The ninth
+wave (`meow-solver-arpack.jsonl`: the first and the last cell of the taper, 0.5 and 2.0 um strips, 1.55 um, the
+0.02 um grid; ARPACK shift-invert on the assembled operator at the target of the solver) found that each mode of the
+solver is an eigenpair (relative residual 2.4e-11 or less, no copies), but that the solver did not give 10, 13, 15
+and 18 (0.5 um cell) and 9, 12, 14 and 18 (2.0 um cell) of the 40, 60, 80 and 120 eigenvalues nearest the target.
+The cause:
 
-- Each mode of the solver is an eigenpair: relative residual 2.4e-11 or less, eigenvalue within 9.2e-13 (relative)
-  of an ARPACK eigenvalue; no copies. After `post_process_eigenmodes` each complex mode has the other member of its
-  pair in the set, except one mode in the 60-mode and one in the 120-mode set of the 0.5 um cell (the other member is
-  outside the set).
-- The solver does not give the k eigenvalues nearest the target. Of the nearest 40, 60, 80 and 120 it misses 10, 13,
-  15 and 18 (0.5 um cell) and 9, 12, 14 and 18 (2.0 um cell).
-- The missed modes above cutoff are the same in both cells: neff = 1.444 (twice), 1.43094, 1.39104, 1.37979,
-  1.32187, 1.21849, 1.16624, 1.07105, 0.85716, 0.67428 and 0.49757 (all twelve from 60 modes on; the first ten and
-  nine at 40 modes); the others are below cutoff. These values are, within 1.9e-3, the modes of the window without
-  the core that have one transverse wavenumber of zero: sqrt(1.444^2 - (m lambda / 2a)^2) with a = 4 um, m = 1 to 7,
-  and sqrt(1.444^2 - (n lambda / 2b)^2) with b = 1.82 um, n = 1 to 3, and the two uniform-field modes at 1.444 (an
-  interpretation of the logged values; why the solver misses them is open).
+- The operator of the tidy3d solver (meow_gpu solves the same matrix) keeps Ex on the near y wall (y = -0.8 um) and Ey
+  on the near x wall (x = -2 um) as unknowns: tangential E on a PEC wall. The stencils of a near PEC wall have zero
+  entries (`main[0] = 0`: row 0 of Db and column 0 of Df are zero) that decouple these unknowns. The matrix is
+  block-diagonal in the wall unknowns (`operator.wall_unknowns`; 200 + 91 here) and the others: exactly, also with
+  PML, with a PEC symmetry and in bends, in our matrix and in the tidy3d matrix (`test_wall_unknowns_are_decoupled`).
+- The wall block has its own eigenpairs, 1-D modes along each wall: for a wall of N cells of size dl in a medium of
+  index n, lambda_m = -(n^2 - (2 sin(m pi / 2N) / (k0 dl))^2), m = 0 to N - 1. The eigenvalues of the wall block of
+  the 0.5 um cell equal this formula within 1e-11 of |target|. These are not modes of the PEC waveguide: their field
+  is the tangential E on the wall. tidy3d excludes them: its start vector is zero on these rows
+  (`EigSolver.set_initial_vec`), and the decoupling keeps them at zero.
+- The eigenvalues that the solver did not give are these wall modes (the tests
+  `test_wall_modes_are_the_neumann_modes_that_505c4c5_missed` and `test_solver_gives_the_nearest_eigenvalues`):
+  the 12 logged neff above cutoff (1.444 twice, 1.43094, 1.39104, 1.37979, 1.32187, 1.21849, 1.16624, 1.07105,
+  0.85716, 0.67428, 0.49757) are the 12 wall modes above cutoff (n = 1.444; m = 0 to 7 on the y wall, 0 to 3 on the
+  x wall), within the 5e-6 rounding of the log; the 6 logged values below cutoff are wall modes too; and at 40 and 60
+  modes the logged counts (10 and 13, 9 and 12) are the numbers of wall eigenvalues among the 40 and 60 eigenvalues
+  of the full matrix nearest the target. (The
+  interpretation of the ninth wave, the modes of the window with one transverse wavenumber of zero, was wrong; those
+  modes have the same 1-D dispersion.)
+- Why the solver did not converge to them: the preconditioner is separable and uses the cladding permittivity, so on
+  a wall in the cladding it is the wall block itself. Then Davidson's correction (A0 - theta)^-1 (A - theta) x has the
+  wall components of x: the iteration cannot change the wall components of the start block, and no Ritz vector
+  becomes a wall mode. In a bend the media vary along the wall, the preconditioner is not exact there, and the solver
+  could converge to a wall mode: the box mode at the outer wall of the 5 um bend in "Bend modes" (neff 1.6579) is
+  one (`test_bend_modes_are_the_eigenvalues_nearest_the_target`).
+- The change: the solver excludes the wall unknowns, as tidy3d does. `make_preconditioner` gives a mask
+  (`Preconditioner.mask`); the preconditioner sets the wall components to zero, and `davidson`, `davidson_batch` and
+  `refine` set them to zero in the start block. The operator keeps zero wall components at zero (exact zeros of the
+  stencils, in complex64 and complex128; tested), so all iterates and all modes have exactly zero E_t on the wall
+  unknowns, as the modes of tidy3d. `make_preconditioner(p, deflate_walls=False)` gives the preconditioner of
+  505c4c5 exactly (no mask and no shift of eps_ref, below; for comparisons).
+- Checks (`tests/test_walls.py`): at 40 and 60 modes on the 0.5 and the 2.0 um cell (cold starts), the solver gives
+  the eigenvalues nearest the target of the matrix without the wall unknowns (ARPACK shift-invert on that matrix: the
+  sorted distances to the target agree within 1e-9 of |target|, so no eigenvalue is missed; at a cut through a
+  complex pair either member can be kept), and the search space of 505c4c5 gives eigenvalues of the same matrix with
+  the same distances (1e-9): it also gave the physical modes nearest the target. The start blocks of
+  all paths (single, mixed, double, batched, the refinement) with wall components give modes with zero wall
+  components.
+- The shift of eps_ref. In a uniform window (an EME cell without a core) the preconditioner with eps_ref = eps is
+  the operator itself, and Davidson's correction is the Ritz vector; in a window that is uniform except for a small
+  change it is nearly so. Up to 505c4c5 the two first modes of a uniform window were the wall modes of neff = n, at
+  the target (the test of the uniform step used them). Without the wall unknowns the first version of this change
+  did not converge in a uniform window (a development run), so it shifted eps_ref, but only in an exactly uniform
+  window. The review of 2026-11-08 (`reviews/2026-11-08-735e7d3ec15d.md`, finding 1; 60 x 41 cells, n = 1.444, 6
+  modes, against ARPACK on the matrix without the wall unknowns) found that near-uniform windows still failed: no
+  convergence (500 iterations, wrong eigenvalues, only a warning) in single and mixed precision for a lossy cladding
+  (Im(eps) = 1e-8), one cell with eps (1 + 1e-9) or (1 + 1e-6), and eps_zz (1 + 1e-8), and in mixed precision for
+  one cell at (1 + 1e-4); and a set without the physical mode at neff 1.2917, with converged=True, for one cell at
+  (1 + 1e-3) and (1 + 1e-2) (mixed and double; single also at (1 + 1e-1)). The search space of 505c4c5 converged in
+  these windows (to its set with wall modes). Now the default eps_ref is (1 - 1e-2) times the smallest real in-plane
+  permittivity for every problem (`eigensolver.REF_SHIFT`): the correction then adds the direction of shifted
+  inverse iteration. `test_near_uniform_window_gives_the_nearest_eigenvalues` checks these 8 windows (d = 1e-9 to
+  1e-1) in single, mixed and double precision against ARPACK, and the test of the uniform step checks the
+  convergence. The shift changes the preconditioner of every problem, so the iteration paths, the times and, at a
+  cut through a complex pair, the kept member can change; the converged eigenpairs stay within the tolerance. The
+  rows before the shift (`meow-interface-5.jsonl`, `meow-solver-arpack-2.jsonl`, `meow-refine-walls.jsonl`; in their
+  windows the preconditioner was that of 505c4c5 plus the mask) and the rows of the final code
+  (`meow-interface-6.jsonl`, `meow-solver-arpack-3.jsonl`, `meow-refine-shift.jsonl`) give the same counts of this
+  part and the same EME rows within 1.2e-11 up to 40 modes ("Scope").
+- The bench rows of the final code (`meow-solver-arpack-3.jsonl`: `bench/solver_vs_arpack.py`, both cells, 40 to
+  120 modes, both search spaces, "deflated" (the final code) and "full" (505c4c5 exactly); cold starts): the coupling
+  between the wall unknowns and the others is 0.0 in both directions; the wall eigenvalues equal the formula within
+  6.9e-13 of |target|; 12 wall modes are above cutoff. Of the 40, 60, 80 and 120 eigenvalues of the full matrix
+  nearest the target, the final code does not give 10, 13, 15 and 18 (0.5 um cell) and 9, 12, 14 and 18 (2.0 um
+  cell), all of them wall modes (the counts of the ninth wave). Against the matrix without the wall unknowns it misses
+  none: the sorted distances to the target agree within 3.8e-13 of |target|; residuals 2.6e-11 or less; zero wall
+  components; no copies. The search space of 505c4c5 gives the same counts, misses none against the restricted
+  matrix, and gives the eigenvalues of the final code (`conjugate_swaps` and `differ_otherwise` 0 in all 8 cases;
+  sorted distances within 5.4e-13); its modes have wall components of 2.2e-12 or less. Before the shift
+  (`meow-solver-arpack-2.jsonl`) the counts were the same, and the search space of 505c4c5 kept the other member of
+  a complex pair at the 60- and the 120-mode cut of the 0.5 um cell (`conjugate_swaps` 1).
+- Speed. The rows of the final code (one cold solve of one cell; the two search spaces in the same process): the
+  final code took from 16.0 % less to 25.7 % more time than the search space of 505c4c5 (15 fewer to 13 more
+  iterations); the sums of the 8 solves are 49.85 s against 46.37 s. One cold solve varies between runs: the same
+  505c4c5 case (2.0 um, 60 modes) took 12.09 s with the fallback in `meow-solver-arpack-2.jsonl` and 8.45 s
+  without it in `meow-solver-arpack-3.jsonl`. The 30-cell taper of `bench_refine.py` (`OMP_NUM_THREADS=1`, the same
+  command):
+  mode solves of the final code (`meow-refine-shift.jsonl`) 24.07 s (double), 8.03 s (mixed, refine) and 4.72 s
+  (single); before the shift (`meow-refine-walls.jsonl`) 24.75, 8.08 and 4.70 s; on 2026-10-30
+  (`benchmarks/2026-10-30/meow-refine-profiled.jsonl`) 23.01, 7.91 and 4.37 s. Against 2026-10-30 the final code
+  takes 4.6 %, 1.5 % and 8.0 % longer, with 1059, 481 and 480 iterations (1081, 480, 474) and 1703 complex128
+  applies in mixed (1722); |S21| is the same within 3.6e-13 in double and 1.0e-14 in mixed. The rows of 2026-10-30
+  come from the code of that day: the later changes (for example the stop of the complex64 stage after a cold
+  start, 2026-11-07) are also in this difference.
 
 **Memory of the cascade.** The rows of `meow-interface.jsonl` and `meow-interface-2.jsonl` used meow's SAX cascade
 (`meow.compute_s_matrix`, klu backend). Its analysis step (`sax.backends.klu.analyze_circuit_klu`) builds a boolean
@@ -771,6 +896,22 @@ cd meow_gpu; for k in 10 20 30; do for m in star sax; do                    # me
   JAX_PLATFORMS=cpu ../.venv-rocm/bin/python bench/mem_cascade.py --method $m --cells 22 --modes $k; done; done
 ```
 
+The `solver_vs_arpack.py` rows of `meow-solver-arpack.jsonl` came from the bench of 505c4c5 (no "wall" lines, one
+search space). Since 2026-11-08 evening: the same `solver_vs_arpack.py` command (both search spaces, with
+`GPU_RUN_TIMEOUT=2400`; 18 rows each), the EME rows below (60 rows each, in this order; the bench rows now record
+the convergence of the mode solves; peak RSS 6.44 and 6.41 GiB) and `OMP_NUM_THREADS=1 bash tools/gpu_run.sh
+meow_gpu python bench/bench_refine.py --cases double,mixed-refine,single --repeat 2` (3 rows each). Before the shift
+of eps_ref: `meow-solver-arpack-2.jsonl`, `meow-interface-5.jsonl`, `meow-refine-walls.jsonl`; the final code:
+`meow-solver-arpack-3.jsonl`, `meow-interface-6.jsonl`, `meow-refine-shift.jsonl`:
+
+```bash
+GPU_RUN_TIMEOUT=3600 bash tools/gpu_run.sh meow_gpu $B --modes 10,20,30,40 $W
+GPU_RUN_TIMEOUT=3600 bash tools/gpu_run.sh meow_gpu $B --modes 60,80 --interfaces conserving $W
+GPU_RUN_TIMEOUT=3600 bash tools/gpu_run.sh meow_gpu $B --length 0.1 --segments 1 --modes 10,20,40 $W
+GPU_RUN_TIMEOUT=3600 bash tools/gpu_run.sh meow_gpu $B --length 0.1 --segments 1 --modes 60,80,120 \
+  --interfaces conserving $W
+```
+
 Limits:
 
 - Straight guides in a closed window only (no PML, no bend, no angled propagation: `ValueError`). The product of a
@@ -783,22 +924,27 @@ Limits:
   T00 still changes with the mode count: the box modes of the closed window stand for the radiation.
 - With modes below cutoff in the set, |S|^2 summed over all ports is not the power: the bench gives the sums over
   the ports of the modes above cutoff (`P_right_prop`, `P_left_prop`).
-- The eigensolver can miss modes nearer the target than the kept ones ("Known limits"); a missed mode is a
-  truncation, not an error of the interface. In the window of the taper the solver misses about 10 modes above
-  cutoff ("The modes that the solver misses"; `test_solver_modes_near_cutoff_are_eigenpairs` checks that its modes
-  are true eigenpairs without copies).
+- A mode that the eigensolver misses is a truncation, not an error of the interface. In the window of the taper the
+  solver gives the eigenvalues nearest the target without the spurious modes of the PEC walls ("The modes of the PEC
+  walls"); `test_solver_modes_near_cutoff_are_eigenpairs` checks that its modes are true eigenpairs without copies.
 
 ## Known limits and next steps
 
-- **Open, first: the solver misses modes above cutoff.** In the window of the taper and the double step (x -2 to 2
-  um, y -0.8 to 1.02 um, 0.02 um grid) the Davidson solver of meow_gpu gives correct eigenpairs, but not the set
-  nearest the target: it misses 10 and 9 of the 40 nearest eigenvalues of the 0.5 and the 2.0 um cell, and 12 modes
-  above cutoff from 60 modes on (`meow-solver-arpack.jsonl`; "The modes that the solver misses"). The results that
-  use such sets: every EME row of "A power-conserving interface" (meow's interface and the conserving interface, all
-  mode counts; the larger window of the double step probably also, not checked), the 10 um taper of "Correction of
-  meow's post-processing", and the EME rows of photonsuite in `suite/README.md`. The effect on T00 is not known.
-  Next: find why the solver misses these modes (its start block, its preconditioner or its selection; not checked),
-  fix it, and repeat these rows.
+- **Closed (2026-11-08 evening, with the fix of the review of the same day): "the solver misses modes above
+  cutoff".** The missed eigenvalues are the spurious modes of the PEC walls (decoupled unknowns of the tidy3d
+  operator; tidy3d excludes them too). The solver of 505c4c5 gave the physical modes nearest the target (tested on
+  the first and the last cell of the taper at 40 and 60 modes); the solver now excludes the wall unknowns explicitly,
+  and it shifts eps_ref for all problems, because near-uniform windows otherwise failed (review of 2026-11-08; "The
+  modes of the PEC walls"; `tests/test_walls.py` checks 8 such windows against ARPACK). The 60 rows of the taper and
+  the double step with the final code (`meow-interface-6.jsonl`; "Scope: the mode sets") give the T00 of 505c4c5
+  within 1.4e-8, except the taper rows at 60 modes and 1.60 um (3.6e-5) and at 80 modes (up to 2.2e-4; probably the
+  member of a complex pair at the cut) and the 120-mode row of the double step at 1.575 um, whose solve of 505c4c5
+  did not converge (footnote (f): 0.5749 now, 0.5739 before). Not rerun: the other EME rows ("Scope").
+- Changed results: a bend whose wall media vary along the wall (for example the 5 um bend of "Bend modes") no longer
+  gives wall modes, and a window with media other than the cladding on a near wall (a substrate, or the slab of a rib
+  that reaches the side wall) can change its mode set in the same way: there the preconditioner is not exact on the
+  wall, and the solver of 505c4c5 could converge to a wall mode. The EME rows of photonsuite (`suite/README.md`) use
+  the window of the taper (cladding on the walls); the rib cross-sections of photonsuite are not checked here.
 
 - At small cross-sections (about 36k unknowns) the GPU is about 3x faster than one core. The batched solve gains
   less in mixed precision than in single precision (see "Profile of the batched path"): the device kernels of a
@@ -835,11 +981,13 @@ Limits:
   pair nearer the target that is not in its block can be missed, and then the result depends on the rounding (see
   "Cold starts"). The warm start makes this less probable (the block holds the modes of a similar problem), but it
   is not checked. Use `switch_tol=2e-5` (or `polish="davidson"`) when such a pair is probable.
-- All precisions can miss eigenvalues nearer the target than the kept modes. Taper cell 18 (`bench_refine.py`):
-  ARPACK on the assembled matrix finds lambda = -1.9350 and -1.9038 (box modes below cutoff, neff 1.391 and 1.380)
-  between the 9th (-1.9871) and the 10th kept mode (-1.8877); the double, the mixed and the single solves keep
-  -1.8877. The strip of `tests/test_refine.py` (4 modes): ARPACK finds two modes at neff 1.444 and modes at 1.4074
-  and 1.3604 nearer the target than the 4th kept mode (1.3413), which tidy3d also gives (`tests/test_solver.py`).
+- ARPACK on the full matrix finds eigenvalues nearer the target than the kept modes that are spurious modes of the
+  PEC walls ("The modes of the PEC walls"; the solver and tidy3d exclude them). Taper cell 18 (`bench_refine.py`):
+  lambda = -1.9350 and -1.9038 (neff 1.391 and 1.380: the wall modes 1.39104 and 1.37979 of that list) between the
+  9th (-1.9871) and the 10th kept mode (-1.8877). The strip of `tests/test_refine.py` (4 modes): two modes at neff
+  1.444 and modes at 1.4074 and 1.3604 before the 4th kept mode (1.3413, which tidy3d also gives,
+  `tests/test_solver.py`); these four are the wall modes m = 0 and m = 1 of the two walls of that window
+  (`test_strip_wall_modes`).
 - The batched solve (`davidson_batch`) runs the refinement member after member, after the batched complex64
   Davidson (the same steps as the per-cell solve, but the device kernels of the refinement are not batched). A
   `jax.vmap` of the GMRES kernel over 8 members takes the time of 8 calls (see "Profile of the batched path"), so
@@ -851,8 +999,8 @@ Limits:
   at R = 1.5 um in the bench domain). The preconditioner does not include the bend; a better one is open work.
   The bend transform of tidy3d has an error of first order in dx / R (see "Bend modes"). The modes beyond the
   guided ones are box modes at the outer wall; tidy3d and the mixed and single solves can miss some that are
-  nearer the target than the kept modes (only the double solve is checked against ARPACK), so compare bend mode
-  sets of two solvers or precisions only for the guided modes.
+  nearer the target than the kept modes (only the double solve is checked against ARPACK, without the wall
+  unknowns), so compare bend mode sets of two solvers or precisions only for the guided modes.
 - meow's own post-processing (normalization, Gram-Schmidt, on the CPU) costs about 35 ms per cell.
 
 ## Tests
@@ -879,6 +1027,7 @@ of the example all 4 modes, with and without the admission rule; the batched fal
 `converged=False` (tolerance out of reach: the stall rule of the fallback and the better result; step limit; solver
 warning), the error without `jax_enable_x64`, and the earlier polish (per cell and batched). `tests/test_bend.py`
 checks the bend modes (see "Bend modes"), and a batch of bends and a straight cell. `tests/test_interface.py`
-checks the power-conserving interface (see "A power-conserving interface"). Run all tests on the GPU
+checks the power-conserving interface (see "A power-conserving interface"). `tests/test_walls.py` checks the
+exclusion of the unknowns of the PEC walls (see "The modes of the PEC walls"). Run all tests on the GPU
 computer (`bash tools/remote.sh push`, then `bash tools/gpu_run.sh meow_gpu python -m pytest -q` there;
 `tools/gpu_run.sh` uses `.venv-rocm` and the GPU lock; first `bash tools/remote.sh setup-env`).

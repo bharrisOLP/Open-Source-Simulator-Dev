@@ -26,10 +26,12 @@ The rows of benchmarks/2026-11-08/meow-interface.jsonl, -2 and -3 above 40 modes
 post_process_eigenmodes, which removed the modes with Re(neff) < 0 or Im(neff) < 0 (its count: backward_raw).
 With --diag, also the two mixed cases (which change of the two causes the difference), and for each interface of the
 taper: the largest singular value of S, the Gram matrices of the eigenmodes in the two products, and how real the
-fields are. Prints one JSON line for each wavelength and mode count (with the peak memory of the process); a row
-that raises prints a JSON line with "error" and the end of the traceback (and the traceback on stderr), and the
-script goes on with the next row. --window moves the PEC walls of the closed EME window (the FDTD of
-photonsuite.fdtd_avg has a PML outside the default window); write it with "=" (the value starts with "-").
+fields are. Prints one JSON line for each wavelength and mode count (with the peak memory of the process; since
+2026-11-08 evening also "converged" (all cells), "not_converged_cells" and "residual_max" of the mode solves: before,
+a solve that did not converge gave only a warning on stderr); a row that raises prints a JSON line with "error" and
+the end of the traceback (and the traceback on stderr), and the script goes on with the next row. --window moves
+the PEC walls of the closed EME window (the FDTD of photonsuite.fdtd_avg has a PML outside the default window);
+write it with "=" (the value starts with "-").
 
 Memory: --cascade star (the default since 2026-11-08 afternoon) cascades with the star product of
 meow_gpu.interface.compute_s_matrix. The rows of benchmarks/2026-11-08/meow-interface.jsonl and meow-interface-2.jsonl
@@ -214,11 +216,12 @@ def one_row(a, wl, n_modes, cells, css, window):
                           f"{n_modes} modes on {nx} x {ny} samples; above --max-gb {a.max_gb}): lower --modes")
     # post-process each cell after its solve and keep the raw modes only for --diag: the modes of 22 cells take
     # about 1.67 MiB per mode on the 0.02 um grid (2.86 GiB for 22 cells x 80 modes, for each list)
-    raw, gs, eig, counts, t_solve = [], [], [], np.zeros(2, int), 0.0
+    raw, gs, eig, counts, t_solve, infos = [], [], [], np.zeros(2, int), 0.0, []
     for cs in css:
         t0 = time.perf_counter()
         r = compute_modes_gpu(cs, num_modes=n_modes, solver=solver, post_process=lambda ms: ms)
         t_solve += time.perf_counter() - t0
+        infos.append(solver.last_info)
         counts += [sum(abs(np.imag(m.neff)) > 1e-9 * abs(m.neff) for m in r),
                    sum(np.imag(m.neff) < -1e-9 * abs(m.neff) for m in r)]
         if need_gs:
@@ -235,7 +238,10 @@ def one_row(a, wl, n_modes, cells, css, window):
            "negative_re_neff": int(sum(np.real(m.neff) < -1e-9 * abs(m.neff) for ms in eig for m in ms)),
            "flipped_raw": int(counts[1]),
            "solve_s": round(t_solve, 1), "device": device_summary(), "cascade": a.cascade,
-           "fields_gb_estimate": round(fields_gb, 2)}
+           "fields_gb_estimate": round(fields_gb, 2),
+           "converged": all(i.converged for i in infos),
+           "not_converged_cells": [k for k, i in enumerate(infos) if not i.converged],
+           "residual_max": float(max(i.residual for i in infos))}
     variants = {
         "meow_invert": (gs, mw.compute_interface_s_matrices),
         "meow_none": (gs, functools.partial(mw.compute_interface_s_matrices, passivity_method="none")),

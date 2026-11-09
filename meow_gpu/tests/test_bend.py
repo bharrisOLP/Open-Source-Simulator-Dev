@@ -120,22 +120,38 @@ def test_bend_modes_single_precision():
 
 @pytest.mark.parametrize("radius,axis", [(5.0, 1), (50.0, 1), (5.0, 0)])
 def test_bend_modes_are_the_eigenvalues_nearest_the_target(radius, axis):
-    """4 modes: the eigenvalues of the tidy3d matrix (captured from tidy3d, ARPACK shift-invert, 8 values, tol
-    1e-13) nearest the target, and residuals of the GPU eigenpairs with that matrix. Here compute_modes_tidy3d
-    itself misses box modes at the outer wall (for 5 um, bend_axis 1: neff 1.6579, with its maximum at the corner of
-    the PEC box), so this test does not use its mode list."""
+    """4 modes: the eigenvalues nearest the target of the tidy3d matrix (captured from tidy3d) without the unknowns
+    of the PEC walls (ARPACK shift-invert, 8 values, tol 1e-13; tests/test_walls.py: these unknowns are decoupled and
+    their modes are spurious, and tidy3d and meow_gpu exclude them), and residuals of the GPU eigenpairs with the
+    full matrix. Each eigenvalue of the full matrix among its 4 nearest that the GPU solver does not give is an
+    eigenvalue of the wall block. Up to 505c4c5 this test used the full matrix, and the double solve also gave such a
+    wall mode (the "box mode at the outer wall" of the 5 um bend, bend_axis 1, neff 1.6579, with its maximum at the
+    corner of the PEC box; compute_modes_tidy3d did not give it): in a bend the media of the wall vary along the
+    wall, so the preconditioner is not exact there, and the solver could converge to a wall mode."""
+    from meow_gpu.fde.operator import wall_unknowns
+    from meow_gpu.meow_backend import _problem
     cs = bend_cross_section(radius, axis)
     mat = tidy3d_solver_matrix(cs.nx**2, cs.ny**2, cs.nz**2, cs.mesh.x, cs.mesh.y, cs.env.wl, bend_radius=radius,
-                               bend_axis=axis, plane_center=(0.0, 0.0))
+                               bend_axis=axis, plane_center=(0.0, 0.0)).tocsr()
+    walls = wall_unknowns(_problem(cs)).ravel()
+    iw, ir = np.flatnonzero(walls), np.flatnonzero(~walls)
     sigma = -(N_SI * (1 + 10 * np.finfo(float).eps)) ** 2
-    vals = spl.eigs(mat, k=8, sigma=sigma, tol=1e-13, return_eigenvectors=False)
+    vals = spl.eigs(mat[ir][:, ir], k=8, sigma=sigma, tol=1e-13, return_eigenvectors=False)
     want = np.sort(np.sqrt(-vals.astype(complex))[np.argsort(np.abs(vals - sigma))[:4]].real)[::-1]
     got = _gpu(cs, 4, "double", post_process=_raw)
     assert np.max(np.abs(np.array([m.neff.real for m in got]) - want)) < 1e-9
-    for m in got:
+    lams = np.array([-(complex(m.neff) ** 2) for m in got])
+    for m, lam in zip(got, lams):
         u = np.concatenate([np.ravel(m.Ex), np.ravel(m.Ey)])
-        lam = -(complex(m.neff) ** 2)
         assert np.linalg.norm(mat @ u - lam * u) < 1e-9 * abs(lam) * np.linalg.norm(u)
+    full = spl.eigs(mat, k=8, sigma=sigma, tol=1e-13, return_eigenvectors=False)
+    wall_vals = np.linalg.eigvals(mat[iw][:, iw].toarray())
+    for v in full[np.argsort(np.abs(full - sigma))[:4]]:
+        if np.min(np.abs(lams - v)) > 1e-9 * abs(v):
+            assert np.min(np.abs(wall_vals - v)) < 1e-9 * abs(v), np.sqrt(-v)
+    if (radius, axis) == (5.0, 1):        # the "box mode at the outer wall" (README, "Bend modes"): a wall mode
+        neff_wall = np.sqrt(-wall_vals.astype(complex)).real
+        assert np.min(np.abs(neff_wall - 1.6579)) < 1e-4 and np.min(np.abs(want - 1.6579)) > 1e-3
 
 
 # A tight bend with PML in x: the fundamental TE mode radiates (Im neff > 0). The domain reaches past the radius

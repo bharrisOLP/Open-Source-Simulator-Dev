@@ -231,7 +231,7 @@ def test_the_limits_without_heat_and_without_carriers(electrical, result):
 
 def test_the_mode_is_the_fundamental_mode(result):
     # the workflow solves one mode at the default target (just above the index of Si): it must be the mode with the
-    # largest index (meow_gpu/README.md: the modes that the solver misses have neff <= 1.444)
+    # largest index (meow_gpu/README.md, "The modes of the PEC walls": the solver excludes the spurious wall modes)
     from photonsuite.physics import mode_index
 
     four = mode_index(XS, OPTICS, 1.55, num_modes=4)

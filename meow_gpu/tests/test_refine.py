@@ -299,8 +299,8 @@ def test_weakly_guided_mode_converges():
     the fallback, "mixed" returned converged=False here, while polish="davidson" converged). The fallback runs the
     steps of the earlier polish from the complex64 block. References: the earlier polish and the double
     solve from the same start (neff and fields), ARPACK shift-invert on the assembled matrix (the neff of the two
-    guided modes; ARPACK also finds two modes at exactly n = 1.444 that all precisions of this solver miss, a known
-    limit), and the residuals of all 4 pairs with the assembled SciPy matrix."""
+    guided modes; ARPACK also finds two modes at exactly n = 1.444: the spurious modes of the PEC walls, which the
+    solver excludes, tests/test_walls.py), and the residuals of all 4 pairs with the assembled SciPy matrix."""
     p = make_problem(*sin_tip(), 1.55)
     s = GPUModeSolver(precision="mixed", extra=8, warm_start=False)
     n_mix, e_mix, _ = s.solve(p, K)

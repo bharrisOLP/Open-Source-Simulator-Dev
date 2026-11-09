@@ -156,7 +156,11 @@ def test_iteration_limit_of_each_member(problems):
     for i, n in enumerate(limits):
         ref = davidson(ops[i], pcs[i], K, targets[i], x0[i], tol=1e-10, max_iter=n, precision="double")
         assert _same_steps(ref.iterations, got.iterations[i]) and ref.converged == got.converged[i]
-        assert np.max(np.abs(got.values[i] - ref.values)) < 1e-9
+        # member 0 stops after 3 iterations: its Ritz values (residuals about 1, a complex pair among them) are
+        # sensitive to the rounding of the batched kernels (2.3e-9 apart, 1e-10 relative, on the RX 7900 XT after
+        # the exclusion of the PEC-wall unknowns of 2026-11-08): compare them relative to |lambda|
+        tol = 1e-9 if ref.converged or n == 0 else 1e-9 * np.max(np.abs(ref.values))
+        assert np.max(np.abs(got.values[i] - ref.values)) < tol
         if ON_CPU or i != 1:     # at the limit, both expand the subspace once more before the stop
             assert got.matvecs[i] == ref.matvecs
 

@@ -179,6 +179,34 @@ def make_problem(eps_xx: np.ndarray, eps_yy: np.ndarray, eps_zz: np.ndarray, x: 
                       float(bend_radius - plane_center[0 if bend_axis == 1 else 1]))
 
 
+def wall_unknowns(p: FDEProblem) -> np.ndarray:
+    """The unknowns of the near PEC walls, as a bool array with the shape of u, (2, Nx, Ny): Ex on the first row of
+    y (y = y_min) and Ey on the first column of x (x = x_min), on each axis with more than one cell and a PEC wall at
+    its near side (no PMC symmetry).
+
+    These samples are tangential E on a PEC wall: zero in the PEC problem. The operator of the tidy3d solver keeps
+    them as unknowns, but decouples them. The near-side PEC stencils have main[0] = 0, so row 0 of Db and column 0 of
+    Df are zero. Then Ex[:, 0] enters no equation of another unknown (c = Dxf Ey - Dyf Ex does not contain it, and
+    d[:, 0] enters Dyf d with the coefficient main[0] = 0), and its own equations contain only Ex[:, 0]:
+    (A u)_x[:, 0] = -eps_xx Ex[:, 0] + Dxf (Dxb (-eps_xx Ex[:, 0]) / eps_zz). The same holds for Ey[0, :]. So the
+    matrix is block-diagonal in (wall, rest), also with PML and in a bend (the PML and the radial transform scale
+    the stencils and the media, not the zero entries). The wall block has its own eigenpairs: 1-D modes along each
+    wall, for a uniform wall of N cells of size dl
+
+        lambda_m = -(eps - (2 sin(m pi / (2 N)) / (k0 dl))^2),   m = 0 .. N - 1   (neff = n_wall at m = 0),
+
+    which are not modes of the PEC waveguide (spurious modes). tidy3d excludes them: its start vector is zero on these
+    rows (``EigSolver.set_initial_vec``), and the decoupling keeps them zero. meow_gpu excludes them the same way
+    (``eigensolver.make_preconditioner``). An axis of one cell has no derivative and no wall unknowns: for one cell
+    along y, Ex[:, 0] is all of Ex (the physical field of a slab); the wall of the other axis stays."""
+    walls = np.zeros((2,) + p.shape, dtype=bool)
+    if p.dyf.n > 1 and p.dyf.main[0] == 0 and p.dyb.main[0] == 0:
+        walls[0, :, 0] = True
+    if p.dxf.n > 1 and p.dxf.main[0] == 0 and p.dxb.main[0] == 0:
+        walls[1, 0, :] = True
+    return walls
+
+
 # ---------------------------------------------------------------------------------------------------------------
 # Matrix-free operator on the device
 # ---------------------------------------------------------------------------------------------------------------

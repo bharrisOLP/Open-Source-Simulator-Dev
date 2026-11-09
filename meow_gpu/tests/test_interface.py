@@ -2,8 +2,8 @@
 
 Checks: a lossless step conserves power (S unitary) and is reciprocal (S = S^T), also through meow's SAX cascade;
 meow's interface on the same modes does not conserve power; a step between equal guides is the identity; a step
-between two uniform media gives the impedance reflection of the fundamental mode (analytic); with the complete set of
-the discrete modes of a small grid the result satisfies the continuity of E_t and H_t at every sample (the exact
+between two uniform media gives the impedance reflection of the two first TE box modes (analytic); with the complete
+set of the discrete modes of a small grid the result satisfies the continuity of E_t and H_t at every sample (the exact
 discrete solution) and equals meow's formula; the Yee product makes the eigenmodes orthogonal, meow's product does
 not."""
 import functools
@@ -148,20 +148,31 @@ def test_equal_guides_give_the_identity(step_raw):
 
 def test_uniform_media_step_gives_the_impedance_reflection():
     """A window filled with n = 1.444, then with n = 2.0 (no core): the transverse eigenvectors are the same, so a
-    mode couples only to the modes of its own transverse profile. On this grid the two first modes are a degenerate
-    pair with neff = n (uniform Ex and uniform Ey: the walls of the discrete operator allow them; H_t = n z x E_t /
-    eta0), so r = (n1 - n2) / (n1 + n2) and |t|^2 = 1 - r^2 (the Fresnel values at normal incidence). The eigensolver
-    gives any basis of the pair, so the check is on the 2 x 2 block: R = r I and T^H T = (1 - r^2) I; the fields of
-    the pair are real after the post-processing."""
+    mode couples only to the modes of its own transverse profile. The two first modes are the TE box modes with one
+    transverse wavenumber of zero: Ey with the first Dirichlet mode along x (uniform along y), then Ex with the first
+    Dirichlet mode along y (uniform along x), with neff^2 = n^2 - (2 sin(pi / 2N) / (k0 dl))^2 (N cells of size dl
+    across the window). For each, E_z = 0 and H_t = neff z x E_t / eta0 on the Yee grid, so the mode impedance gives
+    r = (neff_1 - neff_2) / (neff_1 + neff_2) and |t|^2 = 1 - r^2: R and T^H T are diagonal on the two modes. The
+    fields are real after the post-processing. Up to 505c4c5 the two first modes of this test were the spurious modes
+    of the PEC walls (neff = n, tests/test_walls.py); the solver excludes them now, as tidy3d does."""
     solver = GPUModeSolver(precision="mixed", extra=4)
-    a, b = (compute_modes_gpu(cross_section(None, n_clad=n), num_modes=4, solver=solver,
-                              post_process=post_process_eigenmodes) for n in (1.444, 2.0))
-    assert max(abs(a[k].neff - 1.444) for k in (0, 1)) < 1e-9 and max(abs(b[k].neff - 2.0) for k in (0, 1)) < 1e-9
+    css = [cross_section(None, n_clad=n) for n in (1.444, 2.0)]
+    a, b = [], []
+    for cs, out in zip(css, (a, b)):
+        out += compute_modes_gpu(cs, num_modes=4, solver=solver, post_process=post_process_eigenmodes)
+        assert solver.last_info.converged               # a uniform window (eigensolver.REF_SHIFT)
+    p = _problem(css[0])
+    kt2 = np.array([(2 * np.sin(np.pi / (2 * len(dl))) / (p.k0 * np.mean(dl))) ** 2 for dl in p.dl_f])
+    n_a, n_b = np.sqrt(1.444**2 - kt2), np.sqrt(2.0**2 - kt2)       # Ey along x, then Ex along y (kt2[0] < kt2[1])
+    assert np.max(np.abs(np.array([a[0].neff, a[1].neff]) - n_a)) < 1e-9
+    assert np.max(np.abs(np.array([b[0].neff, b[1].neff]) - n_b)) < 1e-9
+    assert np.max(np.abs(a[0].Ex)) < 1e-9 * np.max(np.abs(a[0].Ey))       # mode 0: Ey only
+    assert np.max(np.abs(a[1].Ey)) < 1e-9 * np.max(np.abs(a[1].Ex))       # mode 1: Ex only
     r_ll, t_lr, _, _ = interface_blocks(a, b)
-    r = (1.444 - 2.0) / (1.444 + 2.0)
-    assert np.max(np.abs(r_ll[:2, :2] - r * np.eye(2))) < 1e-8
+    r = (n_a - n_b) / (n_a + n_b)
+    assert np.max(np.abs(r_ll[:2, :2] - np.diag(r))) < 1e-8
     t = t_lr[:2, :2]
-    assert np.max(np.abs(t.conj().T @ t - (1.0 - r**2) * np.eye(2))) < 1e-8
+    assert np.max(np.abs(t.conj().T @ t - np.diag(1.0 - r**2))) < 1e-8
     assert np.max(np.abs(r_ll[2:, :2])) < 1e-7 and np.max(np.abs(t_lr[2:, :2])) < 1e-7
     for m in a[:2] + b[:2]:
         for c in ("Ex", "Ey", "Hx", "Hy"):
@@ -307,8 +318,9 @@ def test_solver_modes_near_cutoff_are_eigenpairs():
     false modes there. Each mode is an eigenpair of the assembled operator (relative residual below 1e-9; its
     eigenvalue is an ARPACK eigenvalue, shift-invert at the target); no mode is a copy of another; the conjugate
     eigenvalue of each complex mode is also an ARPACK eigenvalue (a complex pair of the real operator).
-    post_process_eigenmodes keeps all 60 modes, and all decay in +z. The solver does not give the 60 eigenvalues
-    nearest the target (it misses some modes above cutoff; bench/solver_vs_arpack.py gives the counts)."""
+    post_process_eigenmodes keeps all 60 modes, and all decay in +z. ARPACK here works on the full matrix, with the
+    spurious modes of the PEC walls; the solver excludes these (tests/test_walls.py checks that it gives the nearest
+    eigenvalues of the other unknowns)."""
     import scipy.sparse.linalg as sla
 
     from meow_gpu.interface import _is_copy

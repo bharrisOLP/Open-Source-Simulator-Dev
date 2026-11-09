@@ -11,7 +11,18 @@ a constant reference permittivity eps_ref is separable,
 
 so (A0 - theta)^-1 r costs two small dense products per side with the 1-D eigenbases (Lynch, Rice and Thomas
 1964). This works on non-uniform grids and with PML. With eps_ref below neff^2 of the wanted modes, the
-denominators do not go through zero. The preconditioner always runs in complex64: it is an approximation.
+denominators do not go through zero. The default eps_ref is (1 - REF_SHIFT) times the smallest real in-plane
+permittivity (``make_preconditioner``: the shift keeps the preconditioner from being the operator itself in the
+cladding). The preconditioner always runs in complex64: it is an approximation.
+
+The PEC walls: the unknowns of ``operator.wall_unknowns`` (Ex on the near y wall, Ey on the near x wall) are a
+decoupled block of the operator with spurious eigenpairs (1-D modes along the walls). The solver works without
+them, as tidy3d does: the preconditioner sets them to zero (``Preconditioner.mask``) and ``davidson``,
+``davidson_batch`` and ``refine`` set them to zero in the start block. The operator keeps them at zero (the block
+structure is exact also in floating point), so all iterates stay in the space of the other unknowns. Before this
+(up to 505c4c5) the start block had random wall components: the preconditioner is exact on a wall of the reference
+permittivity, so the iteration could not change these components; it did not converge to the wall modes, but they
+were in the subspace (bench/solver_vs_arpack.py compares both).
 
 Precision: consumer GPUs (RDNA3: FP64 at 1/32 of the FP32 rate) run complex128 matrix products slowly. In the
 "mixed" mode the subspace iteration runs in complex64 to a residual of about ``switch_tol``. Then a complex128 polish
@@ -44,7 +55,7 @@ import jax.numpy as jnp
 import numpy as np
 
 from meow_gpu.device import put, solver_device
-from meow_gpu.fde.operator import DeviceOperator, FDEProblem, apply
+from meow_gpu.fde.operator import DeviceOperator, FDEProblem, apply, wall_unknowns
 
 try:                      # optional: the BLAS thread limit of the host thread pool (``_blas_limit``)
     from threadpoolctl import ThreadpoolController
@@ -63,6 +74,7 @@ class Preconditioner:
     vy: jax.Array        # (2, Ny, Ny)
     vy_inv: jax.Array
     lam: jax.Array       # (2, Nx, Ny): -(eps_ref + ax_i + ay_j)
+    mask: jax.Array      # (2, Nx, Ny): 0 at the unknowns of the PEC walls (``operator.wall_unknowns``), else 1
 
 
 _BASES: dict = {}           # 1-D eigenbases of the preconditioner, by stencil coefficients (they do not depend on eps)
@@ -93,20 +105,49 @@ def _bases(p: FDEProblem):
     return hit
 
 
-def make_preconditioner(p: FDEProblem, eps_ref: float | None = None) -> Preconditioner:
-    """The fast-diagonalization preconditioner. Default ``eps_ref``: the smallest real in-plane permittivity.
-    The 1-D eigenbases depend only on the grid, the wavelength and the PML: they are cached."""
+REF_SHIFT = 1e-2         # the default eps_ref is (1 - REF_SHIFT) min Re(eps) (``make_preconditioner``)
+
+
+def make_preconditioner(p: FDEProblem, eps_ref: float | None = None, deflate_walls: bool = True) -> Preconditioner:
+    """The fast-diagonalization preconditioner. The 1-D eigenbases depend only on the grid, the wavelength and the
+    PML: they are cached.
+
+    ``deflate_walls`` (True): the solver works without the unknowns of the PEC walls (``operator.wall_unknowns``; the
+    module docstring), and the default ``eps_ref`` is (1 - REF_SHIFT) times the smallest real in-plane permittivity.
+    False gives the preconditioner of the solver up to 505c4c5 exactly (no mask, eps_ref = the smallest real in-plane
+    permittivity); for comparisons only.
+
+    The shift. With eps_ref = eps of the cladding, the preconditioner equals the operator wherever the media are the
+    cladding. In a uniform window it is the operator itself, so Davidson's correction (A0 - theta)^-1 r is the Ritz
+    vector and the subspace gets only rounding noise; in a window that is uniform except for a small change (a lossy
+    cladding with Im(eps) = 1e-8, one cell with eps (1 + 1e-9) to (1 + 1e-2), eps_zz (1 + 1e-8)) the correction adds
+    almost nothing new. Without the wall unknowns the solver then did not converge, or (one cell at 1e-3 and 1e-2)
+    converged to a set without a physical mode nearer the target (review of 2026-11-08; up to 505c4c5 the random wall
+    components of the start block hid this). With eps_ref = (1 - REF_SHIFT) eps_clad, A0 = A + delta in the cladding
+    (delta = REF_SHIFT eps_clad), and the correction minus the Ritz vector holds -delta (A + delta - theta)^-1 x, the
+    direction of shifted inverse iteration. The shift is the same for all problems (no test on how uniform the
+    window is); tests/test_walls.py checks the near-uniform windows against ARPACK."""
     if eps_ref is None:
         eps_ref = float(np.min(np.real(np.stack([p.eps_xx, p.eps_yy]))))
+        if deflate_walls:
+            eps_ref *= 1 - REF_SHIFT
     vx, vxi, vy, vyi, ax, ay = _bases(p)
     lam = -(eps_ref + ax[:, :, None] + ay[:, None, :])
-    return Preconditioner(vx, vxi, vy, vyi, put(lam, PC_DTYPE))
+    keep = np.ones((2,) + p.shape) if not deflate_walls else (~wall_unknowns(p)).astype(float)
+    return Preconditioner(vx, vxi, vy, vyi, put(lam, PC_DTYPE), put(keep, PC_DTYPE))
+
+
+def deflate(pc: Preconditioner, x: jax.Array) -> jax.Array:
+    """x (b, 2, Nx, Ny) without its components on the unknowns of the PEC walls (``pc.mask``); for a batch, pc
+    batched (``stack``) and x (B, b, 2, Nx, Ny)."""
+    mask = pc.mask if pc.mask.ndim == 3 else pc.mask[:, None]
+    return x * mask.astype(x.dtype)
 
 
 @jax.jit
 def precondition(pc: Preconditioner, r: jax.Array, theta: jax.Array) -> jax.Array:
-    """(A0 - theta)^-1 r for a block r of shape (b, 2, Nx, Ny), theta of shape (b,). Computed in complex64; the
-    result has the dtype of r."""
+    """(A0 - theta)^-1 r for a block r of shape (b, 2, Nx, Ny), theta of shape (b,), with zero on the unknowns of
+    the PEC walls (``pc.mask``). Computed in complex64; the result has the dtype of r."""
     r32 = r.astype(PC_DTYPE)
     rt = jnp.einsum("cij,bcjk->bcik", pc.vx_inv, r32)
     rt = jnp.einsum("bcik,clk->bcil", rt, pc.vy_inv)
@@ -114,7 +155,7 @@ def precondition(pc: Preconditioner, r: jax.Array, theta: jax.Array) -> jax.Arra
     den = jnp.where(jnp.abs(den) < 1e-6, 1e-6, den)
     t = jnp.einsum("cij,bcjk->bcik", pc.vx, rt / den)
     t = jnp.einsum("bcik,clk->bcil", t, pc.vy)
-    return t.astype(r.dtype)
+    return (t * pc.mask).astype(r.dtype)
 
 
 # ---------------------------------------------------------------------------------------------------------------
@@ -477,7 +518,7 @@ def refine(op32: DeviceOperator, op64: DeviceOperator, pc: Preconditioner, k: in
     b = x0.shape[0]
     big_m = 2 * b
     drop = 1e-10                                     # as the complex128 Davidson
-    x0 = put(x0.astype(jnp.complex128))
+    x0 = deflate(pc, put(x0.astype(jnp.complex128)))
     zeros = put(jnp.zeros((big_m,) + x0.shape[1:], jnp.complex128))
     q, kq = _svqb(x0, drop)
     aq = _apply_block(op64, q)
@@ -605,6 +646,7 @@ def davidson(op: DeviceOperator | tuple[DeviceOperator, DeviceOperator], pc: Pre
         raise ValueError(f"polish must be one of {POLISHES}")
     require_x64(precision)
     max_subspace = max_subspace or max(4 * b, b + 2 * k)   # the host eig costs O(max_subspace^3)
+    x0 = deflate(pc, put(x0))                     # no components on the PEC walls (the module docstring)
     if precision == "mixed":
         op32, op64 = op
         lo = _davidson_fixed(op32, pc, k, target, x0.astype(jnp.complex64),
@@ -978,6 +1020,7 @@ def davidson_batch(op: DeviceOperator | tuple[DeviceOperator, DeviceOperator], p
         raise ValueError(f"polish must be one of {POLISHES}")
     require_x64(precision)
     max_subspace = max_subspace or max(4 * b, b + 2 * k)
+    x0 = deflate(pc, put(x0))                     # no components on the PEC walls (the module docstring)
     target = np.broadcast_to(np.asarray(target, dtype=complex), (nbat,))
     tol = np.broadcast_to(np.asarray(tol, dtype=float), (nbat,))
     max_iter = np.broadcast_to(np.asarray(max_iter, dtype=int), (nbat,))
