@@ -102,3 +102,35 @@ def test_hole_slab_even_bands_triangular_against_the_supercell():
     assert gap_tri[1] > gap_tri[0]                                     # a gap of the even guided modes
     # guided: below the light line of air at M and K (|k| = 1/sqrt(3) and 2/3 in units of 2 pi / a)
     assert gap_tri[0] < 2 / 3 and gap_tri[1] < 1 / S3
+
+
+def sampled_thickness(height: float, nz: int, sub: int = 8) -> float:
+    """The slab thickness that the subpixel samples see: (samples inside the slab) / sub x dz, in a column of a cell of
+    the given height (the slab of the hole slab, without the hole)."""
+    cell = Cell(size=(1, 1, height), shape=(1, 1, nz), objects=(Block(size=(np.inf, np.inf, 0.5), eps=12.0),))
+    return float(np.count_nonzero(cell.eps_samples(sub) == 12.0)) / sub * height / nz
+
+
+def test_hole_slab_faces_on_a_subpixel_sample():
+    """The grid of the test above and of bench/bench_hole_slab.py (height 4 a, 4 n + 1 points, sub 8) puts each slab
+    face exactly on a subpixel sample (z = 0.25 is 7/16 of a voxel below a voxel center), so the samples see
+    a face voxel as 0 or 2/16 full in place of 1/16: the slab is dz / 8 too thick or too thin. With the height
+    (4 n + 1) / n (dz = 1 / n; `hole_slab_fdtd.bands_cell`) the faces are on voxel faces (n a multiple of 4) and the
+    samples give the exact thickness. The bands of the two grids at n = 16 differ by more than 4e-4; a thicker slab
+    gives lower frequencies. Measured (test print): band 1 at K 0.264781 (height 4) against 0.265368, band 2 at M
+    0.344200 against 0.344869."""
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    import hole_slab_fdtd as hs
+
+    n = 16
+    dz = 4.0 / (4 * n + 1)
+    t_old, t_new = sampled_thickness(4.0, 4 * n + 1), sampled_thickness((4 * n + 1) / n, 4 * n + 1)
+    print("sampled thickness: height 4", t_old, "height (4 n + 1) / n", t_new, "dz / 8", dz / 8)
+    assert abs(abs(t_old - 0.5) - dz / 8) < 1e-12
+    assert abs(t_new - 0.5) < 1e-12
+    old = hs.even_bands(hs.bands_cell(n, None, 4.0), ("K", "M"), num=4)
+    new = hs.even_bands(hs.bands_cell(n, None), ("K", "M"), num=4)
+    d = np.array([old["K"][0][0] - new["K"][0][0], old["M"][0][1] - new["M"][0][1]])
+    print("band 1 at K, band 2 at M: height 4", old["K"][0][0], old["M"][0][1], "exact faces", new["K"][0][0],
+          new["M"][0][1], "difference", d)
+    assert np.all(np.abs(d) > 4e-4) and np.all(np.sign(d) == -np.sign(t_old - 0.5))

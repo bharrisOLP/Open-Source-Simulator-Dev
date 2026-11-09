@@ -4,6 +4,8 @@ M of the z-even bands (tests/test_slab3d.py checks the triangular cell against t
 
     python bench/bench_hole_slab.py --n 16          # grid n x n x (4 n + 1) (an odd grid along z for the parity)
 Prints one JSON line: the gap edges, the time of the band solves (the eps sampling included) and the device.
+This grid (height 4 a, 4 n + 1 points) puts the slab faces on subpixel samples, which biases the bands (README, "3-D
+slab checks"); bench/bench_hole_slab_fdtd.py uses dz = 1 / n.
 """
 import argparse
 import json

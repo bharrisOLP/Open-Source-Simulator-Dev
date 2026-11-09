@@ -296,8 +296,158 @@ The strip value moves from n_eff 2.4315 at n 16 to 2.4443 at n 64 (grid converge
 
 The even gap of the hole slab is guided: both edges are below the light line of air (2/3 at K, 1/sqrt(3) at M).
 No published value of this gap was available for a comparison (the MPB example and the paper give the structure;
-this work had no access to their numbers). The values at 16 points per a move by up to 2.71e-4 at 24 and 32 points
-per a (`benchmarks/2026-11-07/bands-hole-slab.jsonl`; the table in "GPU timings").
+this work had no access to their numbers; a web search on 2026-11-08 found no value at the precision of these
+checks). The values at 16 points per a move by up to 2.71e-4 at 24 and 32 points per a
+(`benchmarks/2026-11-07/bands-hole-slab.jsonl`; the table in "GPU timings"). These rows have the face bias of the
+next paragraph.
+
+**The slab faces of this grid are on subpixel samples** (`test_hole_slab_faces_on_a_subpixel_sample`). With the
+height 4 a and 4 n + 1 points along z (this check, `bench/bench_hole_slab.py` and its rows of 2026-11-07), z = +-0.25
+is 7/16 of a voxel from a voxel center (n a multiple of 4), which is the position of a sample at sub 8. The samples
+see a face voxel as 0 or 2/16 full in place of 1/16, so the slab is dz / 8 too thick or too thin, and the bands are
+biased. With the height (4 n + 1) / n (dz = 1 / n), the faces are on voxel faces (n a multiple of 4) and the samples
+give the exact thickness. At n = 16 the test measures a sampled thickness of 0.50769 a (height 4; too thick) against
+0.5 a. Bias of the triangular crystal (height 4 minus the exact faces; the rows of 2026-11-07 and
+`benchmarks/2026-11-08/bands-hole-slab-fdtd.jsonl`): band 1 at K -5.87e-4, -4.74e-4, -3.88e-4 and band 2 at M
+-6.69e-4, -5.24e-4, -4.19e-4 at n = 16, 24, 32 (the test prints the same values at n = 16). So the gap of the
+triangular hole slab is 0.265304 to 0.344444 at n = 48 with the exact faces (next section), not 0.2650 to 0.3441
+(height 4, n = 32). The 2.8e-4 check above has the biased grid too, but the triangular cell and the supercell have
+the same bias, so that check is still valid.
+
+## The hole slab against 3-D FDTD (`tests/test_hole_slab_fdtd.py`, `bench/bench_hole_slab_fdtd.py`)
+
+fdtd_gpu (3-D Yee grid, subpixel averaging, PML, Harminv; this repository) is an independent method: time stepping
+on a grid in real space, against plane waves and an eigensolver. The setup (`tests/hole_slab_fdtd.py`):
+
+- **k points without Bloch phases.** fdtd_gpu has periodic faces with k = 0 only. The k point folds onto Gamma in a
+  rectangular supercell: M = b2 / 2 in the cell 1 x Ly (2 holes), K = (b2 - b1) / 3 in the cell 3 x Ly (6 holes).
+  Real dipoles at the same point of each primitive cell, with the weights cos(2 pi k . R) (R: the translation of
+  that cell), excite only the Bloch modes at k and -k (the same frequencies, by time reversal): the weights are
+  orthogonal to the phases of the other k points that fold onto Gamma. The probe signals get the same weights
+  before Harminv.
+- **The 7/4 crystal.** The voxels of fdtd_gpu are cubes, so the periods must be whole numbers of voxels; sqrt(3) is
+  irrational. The FDTD crystal has Ly = 7/4 at resolutions that are multiples of 8: a1 = (1, 0), a2 = (1/2, 7/8),
+  1.04 % longer along y than the triangular crystal. Then a2 is also a whole number of voxels, so the grid is exactly
+  periodic with the primitive lattice and the weights select k exactly. bands_gpu solves the same crystal in an
+  oblique cell (the same k in reduced coordinates), so the two methods are compared at the same eps; bands_gpu also
+  gives the change from the 7/4 crystal to the triangular one.
+- **z-even.** Dipoles E_x and E_y (one direction, 0.6 rad from x) at z = 0, probes of E_x and E_y at z = 0. With an odd
+  number of cells along z, the plane z = 0 holds the E_x and E_y nodes and the Yee grid is mirror symmetric. The
+  averaged eps of fdtd_gpu is not exactly mirror symmetric: its sample lattice is centrally symmetric about each
+  voxel center, not mirror symmetric, so the E_x and E_y components of the voxels at the slab faces differ from
+  their mirror voxels. The z-odd modes (E_x = E_y = 0 at z = 0 in a symmetric structure) are therefore suppressed,
+  not exactly excluded. The test has a z-odd control (E_z dipoles and probes at z = +-dx/2, the two E_z nodes next to
+  z = 0, with the same sign; `run_fdtd(..., parity="odd")`), below.
+- **Boundaries.** 1.5 a of air above and below the slab, then a PML of 1 a (along z only); the in-plane faces are
+  periodic. Gaussian source at 0.3 (c / a), fwidth 0.3; Harminv on [0.18, 0.42], 150 a / c after the source.
+- **Averaging of eps.** fdtd_gpu: at each Yee E component the diagonal of the inverse tensor of Kottke et al. (the
+  default; or the diagonal of the forward tensor, `--diagonal forward`), from about 2000 samples per voxel and a
+  fitted normal; the dropped off-diagonal terms make the error first order in dx for E in the plane of a curved wall
+  (fdtd_gpu/README.md, check 8), and the guided TE-like modes have E in the plane at the hole walls. bands_gpu: the
+  full tensor with the analytic normal of the hole, 8^3 samples per voxel, the slab faces on voxel faces (height
+  (4 n + 1) / n).
+
+The test (`tests/test_hole_slab_fdtd.py`, FDTD at 16 and 32 voxels per a, bands_gpu at 32 x 32 x 129; test prints):
+the modes that the FDTD finds (|Q| >= 1e3, amplitude >= 1e-2 of the largest; 2 or 3 modes in [0.18, 0.42]), in
+order, are the even bands of bands_gpu in order (by index), 0.3 % to 2.2 % above them. Band 1 at K: FDTD 0.266168
+(16), 0.264919 (32); band 2 at M: 0.347643, 0.344073; bands_gpu 0.263947 and 0.340313. The error falls by 0.44 (K)
+and 0.51 (M) from 16 to 32 (first order), and the first-order extrapolation 2 f(32) - f(16) gives 0.263670 (K,
+-1.05e-3 relative) and 0.340503 (M, +5.6e-4).
+
+At M the frequency alone does not tell the even band 2 from the z-odd band 1: bands_gpu gives 0.340313 and 0.346633
+(n = 32), 6.32e-3 apart, and the FDTD error at 16 and 32 voxels per a (+7.3e-3 and +3.8e-3) is more than half of
+that, so the modes at 16 (0.347643) and 32 (0.344073) are both nearer to the odd band. The z-odd control finds the
+z-odd modes of the same grid: at M 0.346785 (16) and 0.347140 (32) (bands_gpu odd band 1: 0.346633). No mode of the
+z-even runs is within 1e-4 of a mode of the control (nearest: 8.6e-4 at M, 16 voxels per a; 2.3e-3 at 32), and the
+same grid gives the same mode at the same frequency to about 2e-8 (the change with 300 a / c of signal, below), so
+the z-even runs do not contain the z-odd mode. Also, the extrapolation
+0.340503 is 1.9e-4 from the even band 2 and 6.1e-3 from the odd band 1 (the test requires a ratio below 0.1), and
+the bench series below converges to the even band.
+
+Bench rows: `benchmarks/2026-11-08/bands-hole-slab-fdtd.jsonl` (90 rows, logged 2026-11-08 17:33 to 18:29 EST, RX 7900
+XT; bands_gpu in double precision, tol 1e-8, sub 8; fdtd_gpu with float32 fields), and the `summary` output of that
+file, `benchmarks/2026-11-08/bands-hole-slab-fdtd-summary.txt` (the series, the fits, and an older identification of the
+FDTD modes: see below). Commands, through `bash tools/gpu_run.sh bands_gpu` (`GPU_RUN_TIMEOUT=1800`), in this order:
+`python bench/bench_hole_slab_fdtd.py bands --n 16,24,32,48`; `bands --n 16,24,32,48 --triangular`; `bands --n 16
+--triangular --height 4`; `bands --n 16 --layers 6`; `fdtd --res 16,24,32,40,48,56,64,80 --point K,M`; `fdtd --res 96
+--point M`; `fdtd --res 32,40,48,56,64,80 --point M --shifts 4`; `fdtd --res 32,40,48,56,64 --point K --shifts 4`; `fdtd
+--res 16,24,32,40,48,56,64,80,96 --point M --diagonal forward`; `fdtd --res 16,24,32,40,48,64 --point K --diagonal
+forward`; `fdtd --res 32 --air 2.5`; `fdtd --res 32 --t-after 300`; then `python bench/bench_hole_slab_fdtd.py summary
+<the rows>`. All rows have `converged` true (bands_gpu: the eigensolver at K and M; fdtd_gpu: the band was found).
+
+bands_gpu (z-even bands; grid n x n x (4 n + 1); "time" and "memory": the 7/4 rows, the setup and both solves,
+and the peak host memory, `max_rss_gb`, in GiB):
+
+| n | 7/4: band 1 at K | 7/4: band 2 at M | triangular: band 1 at K | triangular: band 2 at M | time | memory |
+|---|---|---|---|---|---|---|
+| 16 | 0.264030 | 0.340956 | 0.265368 | 0.344869 | 3.4 s | 1.7 GiB |
+| 24 | 0.263979 | 0.340448 | 0.265346 | 0.344454 | 7.0 s | 2.4 GiB |
+| 32 | 0.263947 | 0.340313 | 0.265366 | 0.344522 | 15.4 s | 3.3 GiB |
+| 48 | 0.263921 | 0.340385 | 0.265304 | 0.344444 | 45.9 s | 7.2 GiB |
+
+The 7/4 crystal: K falls at each step (-5.1e-5, -3.2e-5, -2.6e-5); M is not monotonic (-5.08e-4, -1.35e-4,
++7.2e-5). The triangular cell moves less regularly at K (-2.3e-5, +2.0e-5, -6.2e-5). Triangular minus 7/4: +1.338e-3
+to +1.419e-3 (K) and +3.913e-3 to +4.209e-3 (M) at n = 16 to 48. A supercell height of 6 a in place of 4 a (7/4,
+n = 16) changes the bands by +9e-8 (K) and +2.9e-6 (M).
+
+fdtd_gpu on the 7/4 crystal ("no shift": the hole centers on voxel corners; "4 shifts": the mean over 4 shifts of the
+crystal by fractions of a voxel, (0, 0), (0.5, 0.25), (0.25, 0.75), (0.75, 0.5), with the spread max - min;
+"forward": the diagonal of the forward tensor, no shift; "time": `run_s` of the no-shift rows, K / M; res: voxels
+per a):
+
+| res | K, no shift | K, 4 shifts (spread) | K, forward | M, no shift | M, 4 shifts (spread) | M, forward | time |
+|---|---|---|---|---|---|---|---|
+| 16 | 0.266168 | - | 0.265470 | 0.347643 | - | 0.344537 | 1.2 / 0.6 s |
+| 24 | 0.265403 | - | 0.264970 | 0.345959 | - | 0.343969 | 1.8 / 0.8 s |
+| 32 | 0.264919 | 0.264930 (2.3e-5) | 0.264549 | 0.344073 | 0.344233 (2.3e-4) | 0.342427 | 3.9 / 1.3 s |
+| 40 | 0.264713 | 0.264713 (1.3e-5) | 0.264461 | 0.343532 | 0.343490 (1.3e-4) | 0.342375 | 7.6 / 2.0 s |
+| 48 | 0.264588 | 0.264575 (2.1e-5) | 0.264357 | 0.343053 | 0.343005 (9.8e-5) | 0.341987 | 18.0 / 3.2 s |
+| 56 | 0.264447 | 0.264465 (2.7e-5) | - | 0.342504 | 0.342595 (1.3e-4) | 0.341675 | 35.4 / 5.0 s |
+| 64 | 0.264406 | 0.264397 (1.8e-5) | 0.264248 | 0.342418 | 0.342353 (1.1e-4) | 0.341684 | 82.2 / 9.4 s |
+| 80 | 0.264288 | - | - | 0.341933 | 0.341925 (1.6e-5) | 0.341359 | 231.2 / 31.3 s |
+| 96 | - | - | - | 0.341560 | - | 0.341073 | - / 84.9 s |
+
+The largest runs: K at 80 voxels per a has 14.8 M cells (240 x 140 x 441), M at 96 has 8.5 M; the peak host memory
+of the FDTD rows is 3.5 GiB. Identification by index: the strong modes of each FDTD row, in order, are the even bands
+of bands_gpu (n = 48) in [0.18, 0.42], in order: at K band 1 and the near pair of bands 2 and 3, at M bands 1 to 3
+(3 strong modes in 78 rows; 2 at K at 24 voxels per a, both diagonals, where one mode of the pair is weak). All 238
+modes are 0.040 % to 2.13 % above their bands. The summary file has an older identification, the mode nearest to
+each band; it is not one-to-one for the K pair (the pair is shifted up by more than its splitting, so both bands
+map to the lower mode). The FDTD values are above bands_gpu (n = 48) at all resolutions; at 64 voxels per a (no
+shift) by 4.85e-4 (K, 0.18 %) and 2.03e-3 (M, 0.60 %); M at 96 by 1.18e-3 (0.35 %).
+
+**Order.** First order in h = 1 / res, as the diagonal averaging predicts. The 4-shift means have the ratio of the
+differences (32 to 48) / (48 to 64) of 1.99 (K) and 1.88 (M), where first order gives 2.00 and second order 2.86; M
+from 40 to 56 and 56 to 80: 1.336 (first order 1.333, second order 1.88). The single-shift series are not smooth: the
+position of the hole walls in the voxels changes M by up to 2.3e-4 at 32 voxels per a (the spread of the shifts).
+
+**Extrapolation** (least squares in h; the summary file; K: band 1 at K, M: band 2 at M; f0 - bands_gpu: against the
+7/4 crystal at n = 48):
+
+| series | fit | res | K: f0 (max residual) | f0 - bands_gpu | M: f0 (max residual) | f0 - bands_gpu |
+|---|---|---|---|---|---|---|
+| 4 shifts | f0 + b h | 3 finest (K 48 to 64, M 56 to 80) | 0.263857 (5.4e-6) | -6.4e-5 | 0.340361 (2.4e-5) | -2.4e-5 |
+| 4 shifts | f0 + b h | 4 finest (K 40 to 64, M 48 to 80) | 0.263861 (5.3e-6) | -6.0e-5 | 0.340328 (2.2e-5) | -5.8e-5 |
+| 4 shifts | f0 + b h + c h^2 | K 32 to 64, M 32 to 80 | 0.263875 (5.1e-6) | -4.7e-5 | 0.340228 (2.3e-5) | -1.57e-4 |
+| 4 shifts | f0 + b h + c h^2 | all but 32 | 0.263879 (5.0e-6) | -4.2e-5 | 0.340182 (2.5e-5) | -2.04e-4 |
+
+b = +0.032 to +0.034 (K) and +0.126 to +0.147 (M). The c terms (K +0.03 and +0.04, M -0.43 and -0.58) change f0 by
+at most 1.8e-4 (M) and do not lower the residuals of M (2.3e-5 and 2.5e-5 against 2.2e-5 and 2.4e-5): the rows do not
+fix a second-order term. The same four fits of the single-shift series scatter more: inverse diagonal K 0.263844 to
+0.263989 (-7.8e-5 to +6.8e-5; max residuals 1.7e-5 to 4.9e-5), M 0.339865 to 0.340601 (-5.21e-4 to +2.16e-4; 1.9e-5
+to 3.5e-4); forward diagonal K 0.263852 to 0.264210 (-6.9e-5 to +2.89e-4; 6.2e-6 to 7.5e-5), M 0.339880 to 0.340765
+(-5.05e-4 to +3.80e-4; 2.7e-5 to 4.2e-4).
+
+**Agreement.** With the 4-shift means, the FDTD extrapolations are 4.2e-5 to 6.4e-5 (K; 1.6e-4 to 2.4e-4 relative)
+and 2.4e-5 to 2.04e-4 (M; 0.7e-4 to 6.0e-4 relative) below bands_gpu at n = 48. The largest M difference (2.04e-4)
+is 1.1 times the spread of the four fits (1.8e-4) and below the largest spread of the shifts at one resolution
+(2.3e-4, at 32 voxels per a). The K difference is 1.6 to 2.9 times each of its three uncertainties, and below their
+sum (7.5e-5): the spread of the fits (2.2e-5), the spread of the shifts at one resolution (1.3e-5 to 2.7e-5), and the
+last step of bands_gpu (-2.6e-5 from n = 32 to 48, toward the FDTD values; M: +7.2e-5). The boundaries do not
+contribute: 2.5 a of air in place of 1.5 a changes the FDTD values at 32 voxels per a by +6.7e-13 (K) and
++7.0e-13 (M), 300 a / c of signal in place of 150 a / c by -3.8e-9 and -2.1e-8, and the supercell height of bands_gpu
+(above) by at most 2.9e-6. The 7/4 crystal is the same in both methods; the change to the triangular crystal is from
+bands_gpu only.
 
 ## GPU timings (RX 7900 XT against the same algorithm on the 16 CPU threads of the same PC)
 
@@ -373,6 +523,10 @@ N x N x (4 N + 1), sub 8, double precision, tol 1e-8, on the GPU: the even gap f
 Band 1 at K rises by 9.1e-5 and 1.06e-4 per step; band 2 at M moves by -2.71e-4 and +1.73e-4 (not monotonic). At
 32 points per a, the gap is 0.2650 to 0.3441 (26.0 % of the mid-gap frequency); the steps of the last resolution
 are of the order of 2e-4.
+These rows have the face bias ("3-D slab checks": the slab faces are on subpixel samples, and the sampled slab is
+dz / 8 too thick at n = 16). The bias falls with dz and changes the steps of this table: with the faces on voxel
+faces (`benchmarks/2026-11-08/bands-hole-slab-fdtd.jsonl`) the values are 0.265368, 0.265346, 0.265366 (K) and
+0.344869, 0.344454, 0.344522 (M) at n = 16, 24, 32, steps of -2.3e-5 and +2.0e-5 (K) and -4.15e-4 and +6.9e-5 (M).
 
 ## Known limits
 
@@ -419,7 +573,12 @@ are of the order of 2e-4.
   with an odd number of grid points on that axis. The symmetry check is at the resolution of the subpixel samples:
   a structure that is asymmetric by less than the sample spacing, and moves no sample across a face, passes.
 - The subpixel samples place a flat face to dx / (2 sub) only (1/16 of a voxel with the default sub 8). For
-  converged waveguide numbers, use a larger sub, or put the faces at voxel centers or edges (the slab table).
+  converged waveguide numbers, use a larger sub, or put the faces at voxel centers or edges (the slab table). A face
+  exactly on a sample has the largest error, dx / (2 sub) per face (the hole slab with the height 4 a).
+- The check against 3-D FDTD uses the 7/4 crystal (fdtd_gpu has cubic voxels and no Bloch phases); the triangular
+  crystal is solved by bands_gpu only. The FDTD check covers band 1 at K and band 2 at M (and the other even bands
+  in [0.18, 0.42] by the identification), not Gamma: there the even bands above omega = 0 are above the light line
+  (leaky in the FDTD, supercell modes in bands_gpu), so the two methods do not solve the same problem.
 - Degenerate bands: bands closer than 1e-9 (relative, in omega^2; 1e-5 in single precision) count as one cluster
   for the group velocity. Bands that are nearly degenerate but not in a cluster get the Hellmann-Feynman value of
   each vector, which is correct only for a separated band.

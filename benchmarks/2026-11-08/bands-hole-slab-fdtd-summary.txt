@@ -1,0 +1,126 @@
+bands_gpu 7/4        n  48 sub  8 height 4.0208: band1_K 0.263921 band2_M 0.340385 converged True
+bands_gpu 7/4        n  32 sub  8 height 4.0312: band1_K 0.263947 band2_M 0.340313 converged True
+bands_gpu 7/4        n  24 sub  8 height 4.0417: band1_K 0.263979 band2_M 0.340448 converged True
+bands_gpu 7/4        n  16 sub  8 height 4.0625: band1_K 0.264030 band2_M 0.340956 converged True
+bands_gpu 7/4        n  16 sub  8 height 6.0625: band1_K 0.264030 band2_M 0.340959 converged True
+bands_gpu triangular n  16 sub  8 height 4.0000: band1_K 0.264781 band2_M 0.344200 converged True
+bands_gpu triangular n  48 sub  8 height 4.0208: band1_K 0.265304 band2_M 0.344444 converged True
+bands_gpu triangular n  32 sub  8 height 4.0312: band1_K 0.265366 band2_M 0.344522 converged True
+bands_gpu triangular n  24 sub  8 height 4.0417: band1_K 0.265346 band2_M 0.344454 converged True
+bands_gpu triangular n  16 sub  8 height 4.0625: band1_K 0.265368 band2_M 0.344869 converged True
+triangular - 7/4 (n 48): band1_K +0.001383 band2_M +0.004059
+fdtd forward air 1.5 t_after 150.0 K res  16 shift [0.0, 0.0]: band1_K 0.26546988752543493 (strong ['0.26547', '0.35487', '0.35591']) nearest to bands_gpu 0.26392->0.26547, 0.35170->0.35487, 0.35365->0.35487, 0.50782->0.35591
+fdtd forward air 1.5 t_after 150.0 K res  24 shift [0.0, 0.0]: band1_K 0.26496968237996266 (strong ['0.26497', '0.35518']) nearest to bands_gpu 0.26392->0.26497, 0.35170->0.35518, 0.35365->0.35518, 0.50782->0.35518
+fdtd forward air 1.5 t_after 150.0 K res  32 shift [0.0, 0.0]: band1_K 0.2645490797998841 (strong ['0.26455', '0.35370', '0.35453']) nearest to bands_gpu 0.26392->0.26455, 0.35170->0.35370, 0.35365->0.35370, 0.50782->0.35453
+fdtd forward air 1.5 t_after 150.0 K res  40 shift [0.0, 0.0]: band1_K 0.26446119486874187 (strong ['0.26446', '0.35362', '0.35458']) nearest to bands_gpu 0.26392->0.26446, 0.35170->0.35362, 0.35365->0.35362, 0.50782->0.35458
+fdtd forward air 1.5 t_after 150.0 K res  48 shift [0.0, 0.0]: band1_K 0.26435729961902005 (strong ['0.26436', '0.35323', '0.35441']) nearest to bands_gpu 0.26392->0.26436, 0.35170->0.35323, 0.35365->0.35323, 0.50782->0.35441
+fdtd forward air 1.5 t_after 150.0 K res  64 shift [0.0, 0.0]: band1_K 0.2642483254586334 (strong ['0.26425', '0.35293', '0.35426']) nearest to bands_gpu 0.26392->0.26425, 0.35170->0.35293, 0.35365->0.35426, 0.50782->0.35426
+fdtd forward air 1.5 t_after 150.0 K no shift, fit f0 + b h + c h^2 (res [16, 24, 32, 40, 48, 64]): f0 0.263852 b +0.0233 c +0.0441 max residual 7.5e-05; f0 - bands_gpu (7/4, n 48) -0.000069
+fdtd forward air 1.5 t_after 150.0 K no shift, fit f0 + b h + c h^2 (res [24, 32, 40, 48, 64]): f0 0.264210 b -0.0053 c +0.5575 max residual 4.2e-05; f0 - bands_gpu (7/4, n 48) +0.000289
+fdtd forward air 1.5 t_after 150.0 K no shift, fit f0 + b h (res [40, 48, 64]): f0 0.263892 b +0.0226 max residual 6.2e-06; f0 - bands_gpu (7/4, n 48) -0.000029
+fdtd forward air 1.5 t_after 150.0 K no shift, fit f0 + b h (res [32, 40, 48, 64]): f0 0.263951 b +0.0195 max residual 2.2e-05; f0 - bands_gpu (7/4, n 48) +0.000030
+fdtd forward air 1.5 t_after 150.0 M res  16 shift [0.0, 0.0]: band2_M 0.34453732795224445 (strong ['0.24219', '0.34454', '0.40925']) nearest to bands_gpu 0.24130->0.24219, 0.34039->0.34454, 0.40844->0.40925, 0.44734->0.40925
+fdtd forward air 1.5 t_after 150.0 M res  24 shift [0.0, 0.0]: band2_M 0.34396905124584043 (strong ['0.24196', '0.34397', '0.40962']) nearest to bands_gpu 0.24130->0.24196, 0.34039->0.34397, 0.40844->0.40962, 0.44734->0.40962
+fdtd forward air 1.5 t_after 150.0 M res  32 shift [0.0, 0.0]: band2_M 0.3424267707087353 (strong ['0.24168', '0.34243', '0.40903']) nearest to bands_gpu 0.24130->0.24168, 0.34039->0.34243, 0.40844->0.40903, 0.44734->0.40903
+fdtd forward air 1.5 t_after 150.0 M res  40 shift [0.0, 0.0]: band2_M 0.3423751888456673 (strong ['0.24164', '0.34238', '0.40913']) nearest to bands_gpu 0.24130->0.24164, 0.34039->0.34238, 0.40844->0.40913, 0.44734->0.40913
+fdtd forward air 1.5 t_after 150.0 M res  48 shift [0.0, 0.0]: band2_M 0.3419872267930716 (strong ['0.24157', '0.34199', '0.40900']) nearest to bands_gpu 0.24130->0.24157, 0.34039->0.34199, 0.40844->0.40900, 0.44734->0.40900
+fdtd forward air 1.5 t_after 150.0 M res  56 shift [0.0, 0.0]: band2_M 0.3416745644841956 (strong ['0.24151', '0.34167', '0.40885']) nearest to bands_gpu 0.24130->0.24151, 0.34039->0.34167, 0.40844->0.40885, 0.44734->0.40885
+fdtd forward air 1.5 t_after 150.0 M res  64 shift [0.0, 0.0]: band2_M 0.34168362809643404 (strong ['0.24150', '0.34168', '0.40889']) nearest to bands_gpu 0.24130->0.24150, 0.34039->0.34168, 0.40844->0.40889, 0.44734->0.40889
+fdtd forward air 1.5 t_after 150.0 M res  80 shift [0.0, 0.0]: band2_M 0.34135882469401757 (strong ['0.24145', '0.34136', '0.40876']) nearest to bands_gpu 0.24130->0.24145, 0.34039->0.34136, 0.40844->0.40876, 0.44734->0.40876
+fdtd forward air 1.5 t_after 150.0 M res  96 shift [0.0, 0.0]: band2_M 0.3410733645689298 (strong ['0.24140', '0.34107', '0.40862']) nearest to bands_gpu 0.24130->0.24140, 0.34039->0.34107, 0.40844->0.40862, 0.44734->0.40862
+fdtd forward air 1.5 t_after 150.0 M no shift, fit f0 + b h + c h^2 (res [16, 24, 32, 40, 48, 56, 64, 80, 96]): f0 0.340025 b +0.1069 c -0.5340 max residual 4.2e-04; f0 - bands_gpu (7/4, n 48) -0.000360
+fdtd forward air 1.5 t_after 150.0 M no shift, fit f0 + b h + c h^2 (res [24, 32, 40, 48, 56, 64, 80, 96]): f0 0.340765 b +0.0344 c +0.9581 max residual 3.5e-04; f0 - bands_gpu (7/4, n 48) +0.000380
+fdtd forward air 1.5 t_after 150.0 M no shift, fit f0 + b h (res [64, 80, 96]): f0 0.339880 b +0.1161 max residual 2.7e-05; f0 - bands_gpu (7/4, n 48) -0.000505
+fdtd forward air 1.5 t_after 150.0 M no shift, fit f0 + b h (res [56, 64, 80, 96]): f0 0.340264 b +0.0839 max residual 1.1e-04; f0 - bands_gpu (7/4, n 48) -0.000121
+fdtd inverse air 1.5 t_after 150.0 K res  16 shift [0.0, 0.0]: band1_K 0.2661684695842489 (strong ['0.26617', '0.35768', '0.35877']) nearest to bands_gpu 0.26392->0.26617, 0.35170->0.35768, 0.35365->0.35768, 0.50782->0.35877
+fdtd inverse air 1.5 t_after 150.0 K res  24 shift [0.0, 0.0]: band1_K 0.26540333935053895 (strong ['0.26540', '0.35684']) nearest to bands_gpu 0.26392->0.26540, 0.35170->0.35684, 0.35365->0.35684, 0.50782->0.35684
+fdtd inverse air 1.5 t_after 150.0 K res  32 shift [0.0, 0.0]: band1_K 0.2649193198760912 (strong ['0.26492', '0.35527', '0.35589']) nearest to bands_gpu 0.26392->0.26492, 0.35170->0.35527, 0.35365->0.35527, 0.50782->0.35589
+fdtd inverse air 1.5 t_after 150.0 K res  32 shift [0.0, 0.0]: band1_K 0.2649193198760912 (strong ['0.26492', '0.35527', '0.35589']) nearest to bands_gpu 0.26392->0.26492, 0.35170->0.35527, 0.35365->0.35527, 0.50782->0.35589
+fdtd inverse air 1.5 t_after 150.0 K res  32 shift [0.25, 0.75]: band1_K 0.2649420841622335 (strong ['0.26494', '0.35550', '0.35591']) nearest to bands_gpu 0.26392->0.26494, 0.35170->0.35550, 0.35365->0.35550, 0.50782->0.35591
+fdtd inverse air 1.5 t_after 150.0 K res  32 shift [0.5, 0.25]: band1_K 0.26492590553544704 (strong ['0.26493', '0.35543', '0.35598']) nearest to bands_gpu 0.26392->0.26493, 0.35170->0.35543, 0.35365->0.35543, 0.50782->0.35598
+fdtd inverse air 1.5 t_after 150.0 K res  32 shift [0.75, 0.5]: band1_K 0.2649326630371675 (strong ['0.26493', '0.35553', '0.35592']) nearest to bands_gpu 0.26392->0.26493, 0.35170->0.35553, 0.35365->0.35553, 0.50782->0.35592
+fdtd inverse air 1.5 t_after 150.0 K res  40 shift [0.0, 0.0]: band1_K 0.26471271640161326 (strong ['0.26471', '0.35472', '0.35553']) nearest to bands_gpu 0.26392->0.26471, 0.35170->0.35472, 0.35365->0.35472, 0.50782->0.35553
+fdtd inverse air 1.5 t_after 150.0 K res  40 shift [0.0, 0.0]: band1_K 0.26471271640161326 (strong ['0.26471', '0.35472', '0.35553']) nearest to bands_gpu 0.26392->0.26471, 0.35170->0.35472, 0.35365->0.35472, 0.50782->0.35553
+fdtd inverse air 1.5 t_after 150.0 K res  40 shift [0.25, 0.75]: band1_K 0.2647197747203841 (strong ['0.26472', '0.35473', '0.35550']) nearest to bands_gpu 0.26392->0.26472, 0.35170->0.35473, 0.35365->0.35473, 0.50782->0.35550
+fdtd inverse air 1.5 t_after 150.0 K res  40 shift [0.5, 0.25]: band1_K 0.26471327139015455 (strong ['0.26471', '0.35460', '0.35549']) nearest to bands_gpu 0.26392->0.26471, 0.35170->0.35460, 0.35365->0.35460, 0.50782->0.35549
+fdtd inverse air 1.5 t_after 150.0 K res  40 shift [0.75, 0.5]: band1_K 0.26470709198593234 (strong ['0.26471', '0.35467', '0.35543']) nearest to bands_gpu 0.26392->0.26471, 0.35170->0.35467, 0.35365->0.35467, 0.50782->0.35543
+fdtd inverse air 1.5 t_after 150.0 K res  48 shift [0.0, 0.0]: band1_K 0.26458820162708474 (strong ['0.26459', '0.35425', '0.35524']) nearest to bands_gpu 0.26392->0.26459, 0.35170->0.35425, 0.35365->0.35425, 0.50782->0.35524
+fdtd inverse air 1.5 t_after 150.0 K res  48 shift [0.0, 0.0]: band1_K 0.26458820162708474 (strong ['0.26459', '0.35425', '0.35524']) nearest to bands_gpu 0.26392->0.26459, 0.35170->0.35425, 0.35365->0.35425, 0.50782->0.35524
+fdtd inverse air 1.5 t_after 150.0 K res  48 shift [0.25, 0.75]: band1_K 0.26457344838906716 (strong ['0.26457', '0.35420', '0.35522']) nearest to bands_gpu 0.26392->0.26457, 0.35170->0.35420, 0.35365->0.35420, 0.50782->0.35522
+fdtd inverse air 1.5 t_after 150.0 K res  48 shift [0.5, 0.25]: band1_K 0.2645672354546295 (strong ['0.26457', '0.35420', '0.35519']) nearest to bands_gpu 0.26392->0.26457, 0.35170->0.35420, 0.35365->0.35420, 0.50782->0.35519
+fdtd inverse air 1.5 t_after 150.0 K res  48 shift [0.75, 0.5]: band1_K 0.26457018604394694 (strong ['0.26457', '0.35416', '0.35522']) nearest to bands_gpu 0.26392->0.26457, 0.35170->0.35416, 0.35365->0.35416, 0.50782->0.35522
+fdtd inverse air 1.5 t_after 150.0 K res  56 shift [0.0, 0.0]: band1_K 0.2644466969687005 (strong ['0.26445', '0.35372', '0.35493']) nearest to bands_gpu 0.26392->0.26445, 0.35170->0.35372, 0.35365->0.35372, 0.50782->0.35493
+fdtd inverse air 1.5 t_after 150.0 K res  56 shift [0.0, 0.0]: band1_K 0.2644466969687005 (strong ['0.26445', '0.35372', '0.35493']) nearest to bands_gpu 0.26392->0.26445, 0.35170->0.35372, 0.35365->0.35372, 0.50782->0.35493
+fdtd inverse air 1.5 t_after 150.0 K res  56 shift [0.25, 0.75]: band1_K 0.2644680495975028 (strong ['0.26447', '0.35383', '0.35498']) nearest to bands_gpu 0.26392->0.26447, 0.35170->0.35383, 0.35365->0.35383, 0.50782->0.35498
+fdtd inverse air 1.5 t_after 150.0 K res  56 shift [0.5, 0.25]: band1_K 0.26447365053184113 (strong ['0.26447', '0.35383', '0.35501']) nearest to bands_gpu 0.26392->0.26447, 0.35170->0.35383, 0.35365->0.35383, 0.50782->0.35501
+fdtd inverse air 1.5 t_after 150.0 K res  56 shift [0.75, 0.5]: band1_K 0.2644712767978469 (strong ['0.26447', '0.35384', '0.35500']) nearest to bands_gpu 0.26392->0.26447, 0.35170->0.35384, 0.35365->0.35384, 0.50782->0.35500
+fdtd inverse air 1.5 t_after 150.0 K res  64 shift [0.0, 0.0]: band1_K 0.26440605242805243 (strong ['0.26441', '0.35364', '0.35484']) nearest to bands_gpu 0.26392->0.26441, 0.35170->0.35364, 0.35365->0.35364, 0.50782->0.35484
+fdtd inverse air 1.5 t_after 150.0 K res  64 shift [0.0, 0.0]: band1_K 0.26440605242805243 (strong ['0.26441', '0.35364', '0.35484']) nearest to bands_gpu 0.26392->0.26441, 0.35170->0.35364, 0.35365->0.35364, 0.50782->0.35484
+fdtd inverse air 1.5 t_after 150.0 K res  64 shift [0.25, 0.75]: band1_K 0.26438790787934136 (strong ['0.26439', '0.35353', '0.35480']) nearest to bands_gpu 0.26392->0.26439, 0.35170->0.35353, 0.35365->0.35353, 0.50782->0.35480
+fdtd inverse air 1.5 t_after 150.0 K res  64 shift [0.5, 0.25]: band1_K 0.26439665765694503 (strong ['0.26440', '0.35356', '0.35481']) nearest to bands_gpu 0.26392->0.26440, 0.35170->0.35356, 0.35365->0.35356, 0.50782->0.35481
+fdtd inverse air 1.5 t_after 150.0 K res  64 shift [0.75, 0.5]: band1_K 0.26439614981829956 (strong ['0.26440', '0.35356', '0.35483']) nearest to bands_gpu 0.26392->0.26440, 0.35170->0.35356, 0.35365->0.35356, 0.50782->0.35483
+fdtd inverse air 1.5 t_after 150.0 K res  80 shift [0.0, 0.0]: band1_K 0.2642881493457184 (strong ['0.26429', '0.35317', '0.35458']) nearest to bands_gpu 0.26392->0.26429, 0.35170->0.35317, 0.35365->0.35317, 0.50782->0.35458
+fdtd inverse air 1.5 t_after 150.0 K res  32: mean of 4 shifts 0.264930, spread (max - min) 2.3e-05
+fdtd inverse air 1.5 t_after 150.0 K res  40: mean of 4 shifts 0.264713, spread (max - min) 1.3e-05
+fdtd inverse air 1.5 t_after 150.0 K res  48: mean of 4 shifts 0.264575, spread (max - min) 2.1e-05
+fdtd inverse air 1.5 t_after 150.0 K res  56: mean of 4 shifts 0.264465, spread (max - min) 2.7e-05
+fdtd inverse air 1.5 t_after 150.0 K res  64: mean of 4 shifts 0.264397, spread (max - min) 1.8e-05
+fdtd inverse air 1.5 t_after 150.0 K no shift, fit f0 + b h + c h^2 (res [16, 24, 32, 40, 48, 56, 64, 80]): f0 0.263844 b +0.0341 c +0.0526 max residual 4.9e-05; f0 - bands_gpu (7/4, n 48) -0.000078
+fdtd inverse air 1.5 t_after 150.0 K no shift, fit f0 + b h + c h^2 (res [24, 32, 40, 48, 56, 64, 80]): f0 0.263989 b +0.0211 c +0.3036 max residual 2.8e-05; f0 - bands_gpu (7/4, n 48) +0.000068
+fdtd inverse air 1.5 t_after 150.0 K no shift, fit f0 + b h (res [56, 64, 80]): f0 0.263919 b +0.0301 max residual 1.7e-05; f0 - bands_gpu (7/4, n 48) -0.000003
+fdtd inverse air 1.5 t_after 150.0 K no shift, fit f0 + b h (res [48, 56, 64, 80]): f0 0.263851 b +0.0348 max residual 2.6e-05; f0 - bands_gpu (7/4, n 48) -0.000070
+fdtd inverse air 1.5 t_after 150.0 K mean of 4 shifts, fit f0 + b h + c h^2 (res [32, 40, 48, 56, 64]): f0 0.263875 b +0.0328 c +0.0321 max residual 5.1e-06; f0 - bands_gpu (7/4, n 48) -0.000047
+fdtd inverse air 1.5 t_after 150.0 K mean of 4 shifts, fit f0 + b h + c h^2 (res [40, 48, 56, 64]): f0 0.263879 b +0.0323 c +0.0434 max residual 5.0e-06; f0 - bands_gpu (7/4, n 48) -0.000042
+fdtd inverse air 1.5 t_after 150.0 K mean of 4 shifts, fit f0 + b h (res [48, 56, 64]): f0 0.263857 b +0.0343 max residual 5.4e-06; f0 - bands_gpu (7/4, n 48) -0.000064
+fdtd inverse air 1.5 t_after 150.0 K mean of 4 shifts, fit f0 + b h (res [40, 48, 56, 64]): f0 0.263861 b +0.0341 max residual 5.3e-06; f0 - bands_gpu (7/4, n 48) -0.000060
+fdtd inverse air 1.5 t_after 150.0 M res  16 shift [0.0, 0.0]: band2_M 0.34764260223827337 (strong ['0.24297', '0.34764', '0.41171']) nearest to bands_gpu 0.24130->0.24297, 0.34039->0.34764, 0.40844->0.41171, 0.44734->0.41171
+fdtd inverse air 1.5 t_after 150.0 M res  24 shift [0.0, 0.0]: band2_M 0.3459586758591563 (strong ['0.24237', '0.34596', '0.41098']) nearest to bands_gpu 0.24130->0.24237, 0.34039->0.34596, 0.40844->0.41098, 0.44734->0.41098
+fdtd inverse air 1.5 t_after 150.0 M res  32 shift [0.0, 0.0]: band2_M 0.3440728422879823 (strong ['0.24206', '0.34407', '0.41024']) nearest to bands_gpu 0.24130->0.24206, 0.34039->0.34407, 0.40844->0.41024, 0.44734->0.41024
+fdtd inverse air 1.5 t_after 150.0 M res  32 shift [0.0, 0.0]: band2_M 0.3440728422879823 (strong ['0.24206', '0.34407', '0.41024']) nearest to bands_gpu 0.24130->0.24206, 0.34039->0.34407, 0.40844->0.41024, 0.44734->0.41024
+fdtd inverse air 1.5 t_after 150.0 M res  32 shift [0.25, 0.75]: band2_M 0.34426168413186464 (strong ['0.24206', '0.34426', '0.41026']) nearest to bands_gpu 0.24130->0.24206, 0.34039->0.34426, 0.40844->0.41026, 0.44734->0.41026
+fdtd inverse air 1.5 t_after 150.0 M res  32 shift [0.5, 0.25]: band2_M 0.3443075379385782 (strong ['0.24206', '0.34431', '0.41025']) nearest to bands_gpu 0.24130->0.24206, 0.34039->0.34431, 0.40844->0.41025, 0.44734->0.41025
+fdtd inverse air 1.5 t_after 150.0 M res  32 shift [0.75, 0.5]: band2_M 0.34428955770126163 (strong ['0.24203', '0.34429', '0.41028']) nearest to bands_gpu 0.24130->0.24203, 0.34039->0.34429, 0.40844->0.41028, 0.44734->0.41028
+fdtd inverse air 1.5 t_after 150.0 M res  40 shift [0.0, 0.0]: band2_M 0.3435315974544113 (strong ['0.24190', '0.34353', '0.40995']) nearest to bands_gpu 0.24130->0.24190, 0.34039->0.34353, 0.40844->0.40995, 0.44734->0.40995
+fdtd inverse air 1.5 t_after 150.0 M res  40 shift [0.0, 0.0]: band2_M 0.3435315974544113 (strong ['0.24190', '0.34353', '0.40995']) nearest to bands_gpu 0.24130->0.24190, 0.34039->0.34353, 0.40844->0.40995, 0.44734->0.40995
+fdtd inverse air 1.5 t_after 150.0 M res  40 shift [0.25, 0.75]: band2_M 0.3435296907854397 (strong ['0.24189', '0.34353', '0.40993']) nearest to bands_gpu 0.24130->0.24189, 0.34039->0.34353, 0.40844->0.40993, 0.44734->0.40993
+fdtd inverse air 1.5 t_after 150.0 M res  40 shift [0.5, 0.25]: band2_M 0.3434038093276559 (strong ['0.24187', '0.34340', '0.40993']) nearest to bands_gpu 0.24130->0.24187, 0.34039->0.34340, 0.40844->0.40993, 0.44734->0.40993
+fdtd inverse air 1.5 t_after 150.0 M res  40 shift [0.75, 0.5]: band2_M 0.3434959500715013 (strong ['0.24189', '0.34350', '0.40987']) nearest to bands_gpu 0.24130->0.24189, 0.34039->0.34350, 0.40844->0.40987, 0.44734->0.40987
+fdtd inverse air 1.5 t_after 150.0 M res  48 shift [0.0, 0.0]: band2_M 0.3430528190552809 (strong ['0.24179', '0.34305', '0.40972']) nearest to bands_gpu 0.24130->0.24179, 0.34039->0.34305, 0.40844->0.40972, 0.44734->0.40972
+fdtd inverse air 1.5 t_after 150.0 M res  48 shift [0.0, 0.0]: band2_M 0.3430528190552809 (strong ['0.24179', '0.34305', '0.40972']) nearest to bands_gpu 0.24130->0.24179, 0.34039->0.34305, 0.40844->0.40972, 0.44734->0.40972
+fdtd inverse air 1.5 t_after 150.0 M res  48 shift [0.25, 0.75]: band2_M 0.3430035034770114 (strong ['0.24179', '0.34300', '0.40970']) nearest to bands_gpu 0.24130->0.24179, 0.34039->0.34300, 0.40844->0.40970, 0.44734->0.40970
+fdtd inverse air 1.5 t_after 150.0 M res  48 shift [0.5, 0.25]: band2_M 0.3430077373935735 (strong ['0.24179', '0.34301', '0.40968']) nearest to bands_gpu 0.24130->0.24179, 0.34039->0.34301, 0.40844->0.40968, 0.44734->0.40968
+fdtd inverse air 1.5 t_after 150.0 M res  48 shift [0.75, 0.5]: band2_M 0.3429546527503284 (strong ['0.24178', '0.34295', '0.40971']) nearest to bands_gpu 0.24130->0.24178, 0.34039->0.34295, 0.40844->0.40971, 0.44734->0.40971
+fdtd inverse air 1.5 t_after 150.0 M res  56 shift [0.0, 0.0]: band2_M 0.3425036897673456 (strong ['0.24170', '0.34250', '0.40946']) nearest to bands_gpu 0.24130->0.24170, 0.34039->0.34250, 0.40844->0.40946, 0.44734->0.40946
+fdtd inverse air 1.5 t_after 150.0 M res  56 shift [0.0, 0.0]: band2_M 0.3425036897673456 (strong ['0.24170', '0.34250', '0.40946']) nearest to bands_gpu 0.24130->0.24170, 0.34039->0.34250, 0.40844->0.40946, 0.44734->0.40946
+fdtd inverse air 1.5 t_after 150.0 M res  56 shift [0.25, 0.75]: band2_M 0.3426173870437508 (strong ['0.24171', '0.34262', '0.40951']) nearest to bands_gpu 0.24130->0.24171, 0.34039->0.34262, 0.40844->0.40951, 0.44734->0.40951
+fdtd inverse air 1.5 t_after 150.0 M res  56 shift [0.5, 0.25]: band2_M 0.3426265058039154 (strong ['0.24171', '0.34263', '0.40953']) nearest to bands_gpu 0.24130->0.24171, 0.34039->0.34263, 0.40844->0.40953, 0.44734->0.40953
+fdtd inverse air 1.5 t_after 150.0 M res  56 shift [0.75, 0.5]: band2_M 0.34263220198596933 (strong ['0.24172', '0.34263', '0.40952']) nearest to bands_gpu 0.24130->0.24172, 0.34039->0.34263, 0.40844->0.40952, 0.44734->0.40952
+fdtd inverse air 1.5 t_after 150.0 M res  64 shift [0.0, 0.0]: band2_M 0.3424179644735852 (strong ['0.24166', '0.34242', '0.40939']) nearest to bands_gpu 0.24130->0.24166, 0.34039->0.34242, 0.40844->0.40939, 0.44734->0.40939
+fdtd inverse air 1.5 t_after 150.0 M res  64 shift [0.0, 0.0]: band2_M 0.3424179644735852 (strong ['0.24166', '0.34242', '0.40939']) nearest to bands_gpu 0.24130->0.24166, 0.34039->0.34242, 0.40844->0.40939, 0.44734->0.40939
+fdtd inverse air 1.5 t_after 150.0 M res  64 shift [0.25, 0.75]: band2_M 0.3423092304117844 (strong ['0.24165', '0.34231', '0.40935']) nearest to bands_gpu 0.24130->0.24165, 0.34039->0.34231, 0.40844->0.40935, 0.44734->0.40935
+fdtd inverse air 1.5 t_after 150.0 M res  64 shift [0.5, 0.25]: band2_M 0.3423468205197754 (strong ['0.24166', '0.34235', '0.40936']) nearest to bands_gpu 0.24130->0.24166, 0.34039->0.34235, 0.40844->0.40936, 0.44734->0.40936
+fdtd inverse air 1.5 t_after 150.0 M res  64 shift [0.75, 0.5]: band2_M 0.3423364386510572 (strong ['0.24165', '0.34234', '0.40938']) nearest to bands_gpu 0.24130->0.24165, 0.34039->0.34234, 0.40844->0.40938, 0.44734->0.40938
+fdtd inverse air 1.5 t_after 150.0 M res  80 shift [0.0, 0.0]: band2_M 0.34193296906204035 (strong ['0.24157', '0.34193', '0.40917']) nearest to bands_gpu 0.24130->0.24157, 0.34039->0.34193, 0.40844->0.40917, 0.44734->0.40917
+fdtd inverse air 1.5 t_after 150.0 M res  80 shift [0.0, 0.0]: band2_M 0.34193296906204035 (strong ['0.24157', '0.34193', '0.40917']) nearest to bands_gpu 0.24130->0.24157, 0.34039->0.34193, 0.40844->0.40917, 0.44734->0.40917
+fdtd inverse air 1.5 t_after 150.0 M res  80 shift [0.25, 0.75]: band2_M 0.3419300171872683 (strong ['0.24157', '0.34193', '0.40916']) nearest to bands_gpu 0.24130->0.24157, 0.34039->0.34193, 0.40844->0.40916, 0.44734->0.40916
+fdtd inverse air 1.5 t_after 150.0 M res  80 shift [0.5, 0.25]: band2_M 0.3419173997635343 (strong ['0.24157', '0.34192', '0.40916']) nearest to bands_gpu 0.24130->0.24157, 0.34039->0.34192, 0.40844->0.40916, 0.44734->0.40916
+fdtd inverse air 1.5 t_after 150.0 M res  80 shift [0.75, 0.5]: band2_M 0.3419180512017641 (strong ['0.24157', '0.34192', '0.40916']) nearest to bands_gpu 0.24130->0.24157, 0.34039->0.34192, 0.40844->0.40916, 0.44734->0.40916
+fdtd inverse air 1.5 t_after 150.0 M res  96 shift [0.0, 0.0]: band2_M 0.341560349955924 (strong ['0.24151', '0.34156', '0.40897']) nearest to bands_gpu 0.24130->0.24151, 0.34039->0.34156, 0.40844->0.40897, 0.44734->0.40897
+fdtd inverse air 1.5 t_after 150.0 M res  32: mean of 4 shifts 0.344233, spread (max - min) 2.3e-04
+fdtd inverse air 1.5 t_after 150.0 M res  40: mean of 4 shifts 0.343490, spread (max - min) 1.3e-04
+fdtd inverse air 1.5 t_after 150.0 M res  48: mean of 4 shifts 0.343005, spread (max - min) 9.8e-05
+fdtd inverse air 1.5 t_after 150.0 M res  56: mean of 4 shifts 0.342595, spread (max - min) 1.3e-04
+fdtd inverse air 1.5 t_after 150.0 M res  64: mean of 4 shifts 0.342353, spread (max - min) 1.1e-04
+fdtd inverse air 1.5 t_after 150.0 M res  80: mean of 4 shifts 0.341925, spread (max - min) 1.6e-05
+fdtd inverse air 1.5 t_after 150.0 M no shift, fit f0 + b h + c h^2 (res [16, 24, 32, 40, 48, 56, 64, 80, 96]): f0 0.339966 b +0.1586 c -0.5546 max residual 3.5e-04; f0 - bands_gpu (7/4, n 48) -0.000419
+fdtd inverse air 1.5 t_after 150.0 M no shift, fit f0 + b h + c h^2 (res [24, 32, 40, 48, 56, 64, 80, 96]): f0 0.340601 b +0.0964 c +0.7253 max residual 2.5e-04; f0 - bands_gpu (7/4, n 48) +0.000216
+fdtd inverse air 1.5 t_after 150.0 M no shift, fit f0 + b h (res [64, 80, 96]): f0 0.339865 b +0.1639 max residual 1.9e-05; f0 - bands_gpu (7/4, n 48) -0.000521
+fdtd inverse air 1.5 t_after 150.0 M no shift, fit f0 + b h (res [56, 64, 80, 96]): f0 0.340261 b +0.1307 max residual 1.1e-04; f0 - bands_gpu (7/4, n 48) -0.000124
+fdtd inverse air 1.5 t_after 150.0 M mean of 4 shifts, fit f0 + b h + c h^2 (res [32, 40, 48, 56, 64, 80]): f0 0.340228 b +0.1414 c -0.4272 max residual 2.3e-05; f0 - bands_gpu (7/4, n 48) -0.000157
+fdtd inverse air 1.5 t_after 150.0 M mean of 4 shifts, fit f0 + b h + c h^2 (res [40, 48, 56, 64, 80]): f0 0.340182 b +0.1469 c -0.5776 max residual 2.5e-05; f0 - bands_gpu (7/4, n 48) -0.000204
+fdtd inverse air 1.5 t_after 150.0 M mean of 4 shifts, fit f0 + b h (res [56, 64, 80]): f0 0.340361 b +0.1259 max residual 2.4e-05; f0 - bands_gpu (7/4, n 48) -0.000024
+fdtd inverse air 1.5 t_after 150.0 M mean of 4 shifts, fit f0 + b h (res [48, 56, 64, 80]): f0 0.340328 b +0.1282 max residual 2.2e-05; f0 - bands_gpu (7/4, n 48) -0.000058
+fdtd inverse air 1.5 t_after 300.0 K res  32 shift [0.0, 0.0]: band1_K 0.26491931609685776 (strong ['0.26492', '0.35523', '0.35588']) nearest to bands_gpu 0.26392->0.26492, 0.35170->0.35523, 0.35365->0.35523, 0.50782->0.35588
+fdtd inverse air 1.5 t_after 300.0 M res  32 shift [0.0, 0.0]: band2_M 0.34407282150182034 (strong ['0.24206', '0.34407', '0.41024']) nearest to bands_gpu 0.24130->0.24206, 0.34039->0.34407, 0.40844->0.41024, 0.44734->0.41024
+fdtd inverse air 2.5 t_after 150.0 K res  32 shift [0.0, 0.0]: band1_K 0.2649193198767587 (strong ['0.26492', '0.35527', '0.35589']) nearest to bands_gpu 0.26392->0.26492, 0.35170->0.35527, 0.35365->0.35527, 0.50782->0.35589
+fdtd inverse air 2.5 t_after 150.0 M res  32 shift [0.0, 0.0]: band2_M 0.3440728422886798 (strong ['0.24206', '0.34407', '0.41024']) nearest to bands_gpu 0.24130->0.24206, 0.34039->0.34407, 0.40844->0.41024, 0.44734->0.41024
