@@ -323,7 +323,7 @@ def test_solver_modes_near_cutoff_are_eigenpairs():
     eigenvalues of the other unknowns)."""
     import scipy.sparse.linalg as sla
 
-    from meow_gpu.interface import _is_copy
+    from meow_gpu.interface import _is_complex, _is_copy
     from meow_gpu.meow_backend import _target
     cs = cross_section(0.5, dx=0.02, x=(-2.0, 2.0), y=(-0.8, 1.02))
     raw = compute_modes_gpu(cs, num_modes=60, solver=GPUModeSolver(precision="mixed"), post_process=lambda ms: ms)
@@ -340,5 +340,110 @@ def test_solver_modes_near_cutoff_are_eigenpairs():
         if abs(np.imag(m.neff)) > 1e-9 * abs(m.neff) and abs(np.real(m.neff)) > 1e-9 * abs(m.neff):
             assert np.min(np.abs(lam_ref - np.conj(lam))) < 1e-9 * scale, m.neff
     assert not any(_is_copy(raw[i], raw[j], 1e-9) for i in range(len(raw)) for j in range(i))
+    solved = post_process_eigenmodes(raw, pairs="as_solved")
+    assert len(solved) == 60 and all(np.imag(m.neff) >= -1e-9 * abs(m.neff) for m in solved)
+    # the rule for a pair at the cut: the added members are eigenpairs too (ARPACK eigenvalues, residual 1e-9)
+    cut = sum(1 for m in solved if _is_complex(m) and not any(
+        abs(complex(k.neff) + np.conj(complex(m.neff))) < 1e-7 * abs(m.neff) for k in solved))
     got = post_process_eigenmodes(raw)
-    assert len(got) == 60 and all(np.imag(m.neff) >= -1e-9 * abs(m.neff) for m in got)
+    assert len(got) == 60 + cut and len(post_process_eigenmodes(raw, pairs="neither")) == 60 - cut
+    for m in got[60:]:
+        lam = -complex(m.neff) ** 2
+        u = np.concatenate([np.asarray(m.Ex).ravel(), np.asarray(m.Ey).ravel()])
+        assert np.linalg.norm(a_op @ u - lam * u) < 1e-9 * scale * np.linalg.norm(u), m.neff
+        assert np.min(np.abs(lam_ref - lam)) < 1e-9 * scale, m.neff
+
+
+def _pair_case():
+    """The complete sets (8 x 6 grid) of a 0.2 and a 0.4 um strip, on the branch that decays in +z, each sorted by
+    the distance of its eigenvalue -neff^2 to the target of the solver (as a mode count keeps them)."""
+    from meow_gpu.meow_backend import _target
+    kw = dict(dx=0.1, x=(-0.4, 0.4), y=(-0.3, 0.3))
+    out = []
+    for w in (0.2, 0.4):
+        cs = cross_section(w, **kw)
+        modes = post_process_eigenmodes(_raw_all_modes(cs)[1], pairs="as_solved")
+        target = _target(_problem(cs), None)
+        out.append(sorted(modes, key=lambda m: abs(-complex(m.neff) ** 2 - target)))
+    return out
+
+
+def test_conjugate_partner_is_the_other_member_of_the_pair():
+    """In the complete set every complex mode has its partner, and conjugate_partner gives it: the same neff (1e-10),
+    parallel E_t, an eigenpair of the assembled operator (relative residual 1e-10), and E_z and H as fields() gives
+    them from E_t and the new neff (1e-10)."""
+    from meow_gpu.interface import _is_complex, conjugate_partner
+    from meow_gpu.meow_backend import _target
+    modes = _pair_case()[0]
+    cs = modes[0].cs
+    p = _problem(cs)
+    a_op = assemble(p).toarray()
+    scale = abs(_target(p, None))
+    nx, ny = p.shape
+    complex_modes = [m for m in modes if _is_complex(m)]
+    assert len(complex_modes) >= 4
+    for m in complex_modes:
+        q = conjugate_partner(m)
+        match = [k for k in modes if abs(complex(k.neff) - complex(q.neff)) < 1e-10 * abs(q.neff)]
+        assert len(match) == 1 and match[0] is not m
+        u = np.concatenate([np.asarray(q.Ex).ravel(), np.asarray(q.Ey).ravel()])
+        v = np.concatenate([np.asarray(match[0].Ex).ravel(), np.asarray(match[0].Ey).ravel()])
+        assert abs(np.vdot(u, v)) > (1 - 1e-10) * np.linalg.norm(u) * np.linalg.norm(v)
+        lam = -complex(q.neff) ** 2
+        assert np.linalg.norm(a_op @ u - lam * u) < 1e-10 * scale * np.linalg.norm(u)
+        e, h = fields(p.device(jnp.complex128), put(u.reshape(1, 2, nx, ny)), put(np.array([complex(q.neff)])))
+        for k, name in enumerate(("Ex", "Ey", "Ez")):
+            assert np.max(np.abs(np.array(e)[0, k] - getattr(q, name))) < 1e-10 * np.max(np.abs(u))
+        h_max = max(np.max(np.abs(getattr(q, name))) for name in ("Hx", "Hy", "Hz"))
+        for k, name in enumerate(("Hx", "Hy", "Hz")):
+            assert np.max(np.abs(np.array(h)[0, k] - np.asarray(getattr(q, name)))) < 1e-10 * h_max
+        assert abs(yee_inner_product(q, q) + np.conj(yee_inner_product(m, m))) < 1e-12
+
+
+def test_pair_rule_makes_the_set_independent_of_the_member_at_the_cut():
+    """A mode count that cuts a complex pair (the k nearest modes of the 0.2 um strip, where the k-th and the
+    (k+1)-th are the two members): set A holds one member, set B the other (as two search spaces can give). On the
+    step to the 0.4 um strip (its nearest modes, at least 20, no pair cut), the reflection and transmission of the
+    k - 1 modes that A and B share differ with "as_solved"; "both" (k + 1 modes) and "neither" (k - 1 modes) give the
+    same |S| for A and B (within 1e-10; "both": the whole S-matrix, with the modes sorted by neff)."""
+    from meow_gpu.interface import _is_complex, complete_complex_pairs
+    left, right = _pair_case()
+    q = next(q for q in range(20, len(right)) if len(complete_complex_pairs(right[:q], "both")) == q)
+    right = right[:q]                                         # no pair cut on the right
+    k = next(i for i in range(1, len(left)) if _is_complex(left[i - 1]) and _is_complex(left[i])
+             and abs(complex(left[i].neff) + np.conj(complex(left[i - 1].neff))) < 1e-9 * abs(left[i].neff)
+             and i >= 8)
+    set_a, set_b = left[:k], left[:k - 1] + [left[k]]
+
+    def abs_s(modes, common=True):
+        r_ll, t_lr, _, _ = interface_blocks(modes, right)
+        if common:                                            # the excitations of the k - 1 shared modes
+            return np.abs(np.vstack([r_ll[:k - 1, :k - 1], t_lr[:, :k - 1]]))
+        order = np.lexsort((np.imag([m.neff for m in modes]), np.real([m.neff for m in modes])))
+        return np.abs(np.vstack([r_ll[np.ix_(order, order)], t_lr[:, order]]))
+
+    change = np.max(np.abs(abs_s(set_a) - abs_s(set_b)))
+    assert change > 1e-8, change                              # the choice of the member changes the result
+    for rule, n in (("both", k + 1), ("neither", k - 1)):
+        a, b = complete_complex_pairs(set_a, rule), complete_complex_pairs(set_b, rule)
+        assert len(a) == len(b) == n
+        assert np.max(np.abs(abs_s(a) - abs_s(b))) < 1e-10, rule
+        assert np.max(np.abs(abs_s(a, False) - abs_s(b, False))) < 1e-10, rule
+    same = complete_complex_pairs(set_a, "as_solved")
+    assert len(same) == len(set_a) and all(x is y for x, y in zip(same, set_a))
+    with pytest.raises(ValueError, match="pairs"):
+        complete_complex_pairs(set_a, "one")
+    with pytest.raises(ValueError, match="pairs"):
+        post_process_eigenmodes(set_a, pairs="one")
+
+
+def test_pair_rule_is_not_applied_with_lossy_media():
+    """A lossy core (n = 3.476 + 0.01i): the operator is complex and the eigenvalues have no exact partners, so the
+    rule leaves the set as it is, also when a complex mode has no partner."""
+    from meow_gpu.interface import _is_complex, complete_complex_pairs
+    cs = cross_section(0.2, n_core=N_SI + 0.01j, dx=0.1, x=(-0.4, 0.4), y=(-0.3, 0.3))
+    modes = post_process_eigenmodes(_raw_all_modes(cs)[1], pairs="as_solved")
+    assert sum(_is_complex(m) for m in modes) > 10
+    for rule in ("both", "neither"):
+        got = complete_complex_pairs(modes[:7], rule)
+        assert len(got) == 7 and all(x is y for x, y in zip(got, modes[:7]))

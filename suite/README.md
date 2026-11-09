@@ -207,9 +207,12 @@ The case (`bench/eme_fdtd_taper.py`; textbook indices, constant over the band: S
 wavelengths from 1.50 to 1.60 um. The taper is short, so about 9 % of the power goes into higher modes (T00 near 0.91):
 the comparison tests the mode coupling, not only a transmission near 1.
 
-The EME rows of this section use the mode sets of the meow-gpu solver, which lack some modes above cutoff
-(about 10 of the 40 nearest eigenvalues; `meow_gpu/README.md`, the first open item); how much this changes T00
-is not known.
+The EME rows of this section use the mode sets of the meow-gpu solver of that day. The eigenvalues that this solver
+did not give (about 10 of the 40 nearest) are spurious modes of the PEC walls (decoupled unknowns of the operator;
+tidy3d excludes them too), so these sets are the physical modes nearest the target: the meow_gpu bench rows of the
+same interfaces (`meow-interface.jsonl`, which give the values of this section again, for example 0.8761 and 0.8980
+at 1.55 um and 10 modes) and the rows of the final solver of the tenth wave (`meow-interface-6.jsonl`) agree within
+7.9e-12 up to 40 modes (`meow_gpu/README.md`, "The modes of the PEC walls" and "Scope: the mode sets").
 
 Results: the rows of `benchmarks/2026-11-08/suite-eme-fdtd-taper.jsonl` (the commands below; RX 7900 XT, shared
 computer). T00 at 1.50, 1.525, 1.55, 1.575 and 1.60 um.
@@ -320,6 +323,52 @@ non-dispersive indices, and gives only the fundamental-mode coefficient (TE2 and
 older adapter `photonsuite.fdtd` puts its input detector 1.0 um into the device, on the end of a 1.0 um first segment
 in `bench/fdtd_taper*.py`: its overlap ratio `transmission` sees the start of the taper there (its calibrated T00 uses
 the input flux, which does not depend on the plane); not changed.
+
+### Metal side walls: the closed window of the EME in the FDTD (`walls="pec"`, 2026-11-08 night)
+
+The EME window has PEC walls; the FDTD above has a PML outside the same window. `fdtd_avg.mode_transmission(...,
+walls="pec")` puts metal walls (perfect electric conductors) on the window edges and the PML only at the two ends
+along z, so the two methods solve the same closed problem:
+
+- Position. fdtdx sets the tangential E of the first and the last cell layer of a PEC face to zero, and fdtd_gpu
+  puts the tangential components of a cell in the plane through its center, so the walls are the center planes of
+  these layers. The cell has round(W / dx) + 1 cells across a window of width W: the walls are on the window edges
+  when W / dx is a whole number, else up to dx / 2 from them (`wall_positions`; the 1.82 um height of the window
+  of `bench/eme_fdtd_taper.py` is a whole number of cells only at 50 and 100 cells per um: the y walls are 0.0067 um
+  outside each edge at 30 cells per um, 0.0025 um outside at 40 and 80, and 0.0017 um inside at 60; the rows give
+  "walls_um").
+- Check (`tests/test_fdtd_avg_walls.py`): the TE01 mode of a metal box 0.4 x 1.0 um filled with SiO2 (20 cells per
+  um) has an exact dispersion on the Yee grid; the FDTD phase index equals it for the wall distance 1.0 um within
+  2e-4 at 1.50, 1.55 and 1.60 um, and the value for walls on the cell faces (1.05 um) is more than 1e-2 away. A
+  straight strip with PEC walls transmits T00 within 3e-3 of 1. The cell shapes and the wall positions are checked
+  at 30 and 50 cells per um.
+- Run time. In the closed window the modes near their cutoff frequency ring for a long time (zero group velocity),
+  so the field at the stop point does not decay by 1e-7, and each run stops at `max_time` (`decayed` False in the
+  row). The bench option `--max-time` sets it; compare T00 at two run times. On the straight strip of the test, T00
+  at 60 and 120 um/c after the source agrees within 1e-4 at 1.55 and 1.60 um; at 1.50 um, near a cutoff frequency
+  of that window, the test checks only T00 within 3e-3 of 1.
+- Grid. With walls="pec" the cell has an odd or even number of cells across in another way than with the PML, so
+  the shape edges are at other places in the cells (on a face or on a center). The double step reacts to this at
+  the 1e-3 level (meow_gpu/README.md, the double step). `--pec-grid` (with the PML) makes the side PML 0.5 / res
+  thicker (`side_pml`), which gives the same parity of cells across as walls="pec"; the row gives
+  "pec_grid_aligned".
+
+Results on the double step of the EME rows (`--length 0.1 --segments 1`;
+`benchmarks/2026-11-08/suite-eme-fdtd-pec.jsonl`, 12 rows; the table and the commands: `meow_gpu/README.md`, "The
+double step with metal walls in the FDTD"):
+
+- With metal walls, 60, 80 and 100 cells per um give T00 within 2.2e-4, 1.4e-4, 2.5e-4, 2.9e-4 and 8.7e-4 of each
+  other (1.50 to 1.60 um; 0.5571 at 1.55 um and 100 cells per um); 30 to 50 cells per um differ from 100 by -0.0035
+  to +0.0016. T_flux is 0.99993 to 1.00003 at 100 cells per um (nothing leaves through the sides).
+- No run decays (`decayed` false); at 30 cells per um, 100 and 400 um/c after the source give the T00 of 200 um/c
+  within 2.2e-4 and 5e-5. With the PML, the straight runs of the calibration also go to `max_time` (`--pec-grid`
+  rows: `decayed` true, false, false).
+- On the same grid (`--pec-grid`), the metal walls give T00 0.0013 to 0.0036 below the PML (30 to 60 cells per um).
+  The PML runs on the two grids (half a cell apart) differ by up to 0.0042 at 30 and 40 cells per um: the FDTD error
+  of the PML rows above (`suite-eme-fdtd-double-step.jsonl`) was up to about 0.004, and their non-monotonic change
+  with the resolution comes from the places of the step edges in the cells.
+- The EME stays above the FDTD with the same walls (by +0.0049 to +0.0120 at 40 to 120 modes): the walls are not the
+  cause of the gap; the EME is not converged in the mode count (`meow_gpu/README.md`).
 
 ## A PIN phase shifter with self-heating (`photonsuite.pin`)
 

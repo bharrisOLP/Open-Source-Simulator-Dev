@@ -38,6 +38,18 @@ meow's interface (meow 0.15, ``compute_interface_s_matrix``) tests both equation
 is not unitary: with 10 to 40 modes the power of the 0.5 to 2.0 um taper of photonsuite is 1.008 to 1.012 of the
 input, and meow corrects that afterwards (TSVD and a passivity rule).
 
+Complex pairs at the cut (``complete_complex_pairs``; the step ``pairs`` of ``post_process_eigenmodes``). In a
+closed window with real permittivities the operator of the mode solver is real, so its complex eigenvalues come in
+conjugate pairs: on the branch that decays in +z the two members have neff and -conj(neff). They are at the same
+distance from the (real) target of the solver, so a mode count can cut a pair: the set then holds one member, and
+which one depends on the iteration path (a change of the preconditioner or of the start block). The rule makes the
+set a function of the eigenvalues only: "both" (the default) adds the missing member, "neither" removes the member
+without its partner, "as_solved" keeps the set of the solver. The missing member needs no solve: the operator and
+the relations that give E_z and H from E_t (``fde.operator.fields``) have real coefficients except the factor
+i neff and the factor -i / eta0 of the solver's H, and conj(i neff) = i (-conj(neff)); so if (neff, E, H) is a mode
+of a real operator, then (-conj(neff), conj(E), -conj(H)) is the other member (the time reversal E -> conj(E),
+H -> -conj(H) of the field equations with a real permittivity, then the mirror z -> -z of the z-invariant guide).
+
 Limits: straight guides without PML only (the product of a bend or of a PML window needs the coordinate stretch
 of the solver; ``ValueError``). Modes below cutoff (complex neff) carry no power; for them S is the matrix of the
 unconjugated amplitudes. With such modes in a truncated set, P is complex and the proof above does not hold: the
@@ -157,7 +169,87 @@ def _is_copy(a, b, degenerate_tol: float) -> bool:
     return bool(abs(np.vdot(ea, eb)) > (1.0 - 1e-6) * np.linalg.norm(ea) * np.linalg.norm(eb))
 
 
-def post_process_eigenmodes(modes, max_imag_neff: float | None = None, degenerate_tol: float = 1e-9):
+PAIRS = ("both", "neither", "as_solved")
+PAIR_TOL = 1e-7          # relative: two members of a pair have neff and -conj(neff) within this
+
+
+def _is_complex(mode, tol: float = 1e-9) -> bool:
+    """neff has a real and an imaginary part (a member of a complex pair; a purely imaginary neff is its own
+    partner)."""
+    n = complex(mode.neff)
+    return abs(n.imag) > tol * abs(n) and abs(n.real) > tol * abs(n)
+
+
+def _real_operator(mode) -> bool:
+    """The mode solver had a real operator: real permittivities (no loss or gain), and no PML (the interface refuses
+    a PML window)."""
+    return all(np.all(np.imag(np.asarray(getattr(mode.cs, k))) == 0) for k in ("nx", "ny", "nz"))
+
+
+def conjugate_partner(mode):
+    """The other member of the complex pair of ``mode`` (a mode of a real operator): neff -> -conj(neff), E ->
+    conj(E), H -> -conj(H) (module docstring). It decays in +z if ``mode`` does, and <partner, partner> =
+    -conj(<mode, mode>) in the Yee product (``complete_complex_pairs`` normalizes it)."""
+    import meow as mw
+
+    return mw.Mode(neff=-np.conj(complex(mode.neff)), cs=mode.cs,
+                   **{n: (1 if n[0] == "E" else -1) * np.conj(np.asarray(getattr(mode, n))) for n in _FIELDS})
+
+
+def complete_complex_pairs(modes, rule: str = "both", pair_tol: float = PAIR_TOL) -> list:
+    """Apply a rule for a complex pair that the mode count cuts (module docstring). ``modes``: the modes of one
+    cross-section after the branch rule (each decays in +z), for example the result of
+    ``post_process_eigenmodes(..., pairs="as_solved")``. The modes with complex neff are grouped by neff (relative
+    ``pair_tol``); a group whose partner group (neff -> -conj(neff)) has fewer modes is a pair cut by the count:
+
+    - "both": the conjugate partners of the larger group replace the smaller group (for a single mode: the missing
+      member is added). The new modes are normalized as in ``post_process_eigenmodes`` and come after the others.
+    - "neither": both groups are removed.
+    - "as_solved": no change.
+
+    Not applied (the list comes back unchanged) when the permittivity is not real: then the eigenvalues have no exact
+    partners. A degenerate group of complex modes with a partner group of the same size is not checked further."""
+    from meow.mode import normalize, zero_phase
+
+    if rule not in PAIRS:
+        raise ValueError(f"pairs must be one of {PAIRS}, not {rule!r}")
+    modes = list(modes)
+    if rule == "as_solved" or not modes or not _real_operator(modes[0]):
+        return modes
+    groups: list[list[int]] = []
+    for i, m in enumerate(modes):
+        if not _is_complex(m):
+            continue
+        for g in groups:
+            if abs(complex(m.neff) - complex(modes[g[0]].neff)) < pair_tol * abs(m.neff):
+                g.append(i)
+                break
+        else:
+            groups.append([i])
+    done, drop, add = set(), set(), []
+    for k, g in enumerate(groups):
+        if k in done:
+            continue
+        done.add(k)
+        target = -np.conj(complex(modes[g[0]].neff))
+        other = next((j for j, h in enumerate(groups) if j not in done
+                      and abs(complex(modes[h[0]].neff) - target) < pair_tol * abs(target)), None)
+        h = [] if other is None else groups[other]
+        if other is not None:
+            done.add(other)
+        if len(g) == len(h):
+            continue
+        big, small = (g, h) if len(g) > len(h) else (h, g)
+        if rule == "neither":
+            drop |= set(g) | set(h)
+        else:
+            drop |= set(small)
+            add += [normalize(zero_phase(conjugate_partner(modes[i])), yee_inner_product) for i in big]
+    return [m for i, m in enumerate(modes) if i not in drop] + add
+
+
+def post_process_eigenmodes(modes, max_imag_neff: float | None = None, degenerate_tol: float = 1e-9,
+                            pairs: str = "both"):
     """The modes for ``compute_interface_s_matrix``. No Gram-Schmidt: the modes stay eigenmodes (with their own neff),
     and the interface uses their Gram matrices. Steps:
 
@@ -177,9 +269,14 @@ def post_process_eigenmodes(modes, max_imag_neff: float | None = None, degenerat
     - A degenerate cluster of modes above cutoff (|neff_i - neff_j| < degenerate_tol |neff|, real neff): a real
       basis of their subspace, orthonormal in the Yee product (``_real_orthonormal``), so that |S|^2 is their power.
       A degenerate cluster below cutoff is not changed (the interface uses its Gram matrix).
+    - ``pairs``: the rule for a complex pair that the mode count cuts (``complete_complex_pairs``): "both" (the
+      default; the missing member is added, so the set can have one mode more than the solver gave), "neither" or
+      "as_solved" (the set of the solver; up to 2026-11-08 the only behavior).
     The interface needs a window without PML, so there are no PML modes to remove."""
     from meow.mode import normalize, zero_phase
 
+    if pairs not in PAIRS:
+        raise ValueError(f"pairs must be one of {PAIRS}, not {pairs!r}")
     modes = [_flip(m) if _wrong_branch(m) else m for m in modes if _usable(m)]
     if max_imag_neff is not None:
         modes = [m for m in modes if abs(np.imag(m.neff)) <= max_imag_neff]
@@ -199,7 +296,7 @@ def post_process_eigenmodes(modes, max_imag_neff: float | None = None, degenerat
             cluster = _real_orthonormal(cluster)
         out += cluster
         i = j
-    return out
+    return complete_complex_pairs(out, pairs)
 
 
 def _usable(mode) -> bool:

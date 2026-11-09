@@ -561,9 +561,33 @@ In photonsuite: `photonsuite.eme.transmission(..., interface="conserving")` (the
   the Yee product (the eigensolver gives any basis of the cluster, often with complex coefficients, and then |S|^2 is
   not the power); a degenerate cluster below cutoff is not changed. Removed: modes with fields that are not finite or
   with a self-product of almost zero, and copies of a kept mode (the same neff and parallel E_t fields; a copy makes
-  the interface system singular, and a singular system raises `ValueError`).
+  the interface system singular, and a singular system raises `ValueError`). Last, the rule for a complex pair that
+  the mode count cuts (`pairs`, below).
 
-**Checks** (`tests/test_interface.py`, 15 tests, mixed precision):
+**Complex pairs at the cut** (`complete_complex_pairs`; `post_process_eigenmodes(modes, pairs=...)`; 2026-11-08
+night). In a closed window with real permittivities the operator of the solver is real, so its complex eigenvalues
+come in conjugate pairs; on the branch that decays in +z the two members have neff and -conj(neff). The two members
+have the same distance from the (real) target, so a mode count can cut a pair: the set then holds one member, and
+which one depends on the iteration path (the search space, the preconditioner, the start block; "Scope", below: the
+80-mode taper rows changed by up to 2.2e-4 from this choice). The rule makes the set a function of the eigenvalues:
+
+- "both" (the default): the missing member is added, so a cell can have one mode more than the solver gave. It needs
+  no solve: the operator and the relations of `fde.operator.fields` (E_z and H from E_t) have real coefficients except
+  the factor i neff and the factor -i / eta0 of the solver's H, so (-conj(neff), conj(E), -conj(H)) is the other
+  member (the time reversal of the field equations, then the mirror z -> -z). It is normalized as the other modes.
+- "neither": the member without its partner is removed (one mode fewer).
+- "as_solved": the set of the solver (the behavior up to this change).
+
+A group of degenerate complex modes is handled by its size (the conjugates of the larger group replace the smaller
+one, or both go). With a complex permittivity (loss or gain) the eigenvalues have no exact partners, and the rule
+changes nothing. The EME rows of this README up to `meow-interface-6.jsonl` came from the sets of the solver
+("as_solved"); rows of a mode count without a cut pair do not change. The effect on T00 (`meow-interface-7.jsonl`,
+the double step, `--pair-variants as_solved,neither`): a pair was cut in one cell at 120 modes (1.50 and 1.525 um)
+and at 200 modes (1.50 um); "both" changes T00 by 2.4e-9, 1.8e-9 and 0, "neither" by 1.1e-8, 1.2e-8 and 1e-16. On
+the taper at 60 and 80 modes (the changes of up to 2.2e-4 of "Scope", both search spaces): not measured (the rows
+did not run, "The double step with metal walls in the FDTD").
+
+**Checks** (`tests/test_interface.py`, 18 tests, mixed precision):
 
 - A lossless step (Si strip 0.5 to 1.0 um, 8 modes, all above cutoff): S^H S = I and S = S^T within 1e-7. On the
   same eigenmodes, meow's interface without a passivity rule has a singular value above 1.001, and meow's product
@@ -595,9 +619,19 @@ In photonsuite: `photonsuite.eme.transmission(..., interface="conserving")` (the
   symmetrization).
 - The solver at 60 modes on the first cell of the taper (0.02 um grid): each mode is an eigenpair of the assembled
   operator (relative residual below 1e-9, an ARPACK eigenvalue), no copies, and each complex mode has its conjugate
-  eigenvalue in the ARPACK spectrum (a complex pair); `post_process_eigenmodes` keeps all 60. (`tests/test_walls.py`
+  eigenvalue in the ARPACK spectrum (a complex pair); `post_process_eigenmodes(..., pairs="as_solved")` keeps all 60.
+  With "both" the set has 60 modes plus one for each member without its partner, and each added member is an
+  eigenpair (residual below 1e-9) with an ARPACK eigenvalue; "neither" has 60 minus that count. (`tests/test_walls.py`
   checks that the solver gives the nearest eigenvalues; "The modes of the PEC walls".)
-- Errors: two different grids, a PML window (on either side).
+- The conjugate partner: in the complete set of the 0.2 um strip (8 x 6 grid) each complex mode has its partner, and
+  `conjugate_partner` gives it: neff within 1e-10, parallel E_t, an eigenpair of the assembled operator (residual
+  1e-10 of |target|), E_z and H as `fields` gives them from E_t (1e-10), and <m', m'> = -conj(<m, m>).
+- A cut through a pair (the k nearest modes of the 0.2 um strip, where the k-th and the (k+1)-th are the two
+  members; set A with one member, set B with the other, as two search spaces can give; the step to the 0.4 um strip
+  with its nearest modes without a cut): with "as_solved" the |S| entries of the k - 1 shared modes differ between A
+  and B (more than 1e-8); with "both" (k + 1 modes) and "neither" (k - 1 modes) A and B give the same |S| within
+  1e-10. A lossy core (n = 3.476 + 0.01i): the rule changes nothing.
+- Errors: two different grids, a PML window (on either side), an unknown rule of `pairs`.
 
 `suite/tests/test_eme.py` (`test_conserving_interface_keeps_the_power`): a 0.5 to 1.2 um step in photonsuite sends
 the input power into the kept modes within 1e-6 (meow's interface without a passivity rule: more than 1 + 1e-4); a
@@ -647,8 +681,8 @@ The probable cause of the changes of the taper rows with modes below cutoff (a r
 in all 22 cells, the 80 eigenvalues of the matrix without the wall unknowns nearest the target (sorted distances
 within 7.9e-13 of |target|), and the two sets differ only in cells 5 and 18, by the member of a complex pair at the
 cut (the 80th and the 81st eigenvalue have the same distance). So T00 at 60 and 80 modes depends on that choice at
-the 1e-4 level; a rule for a pair at the cut (keep both members or neither) is a possible next step. The changes
-are smaller than the change of T00 from 60 to 80 modes (0.0027 to 0.0041).
+the 1e-4 level. The changes are smaller than the change of T00 from 60 to 80 modes (0.0027 to 0.0041). Since
+2026-11-08 night a rule for a pair at the cut keeps both members or neither ("Complex pairs at the cut", above).
 
 The causes (the 4 `--diag` rows; the taper, 1.55 um, 10 / 20 / 30 / 40 modes):
 
@@ -730,7 +764,8 @@ against 22.7 to 43.5 s of the other 120-mode rows of the double step, and 189 ra
 both reruns (216 to 230 at the other wavelengths). The bench rows of that run did not record the convergence; since
 2026-11-08 evening `bench_interface.py` writes "converged", "not_converged_cells" and "residual_max" into each row.
 
-The EME and the FDTD do not agree on the double step, and the cause is not known:
+With the PML in the FDTD (the rows above), the EME and the FDTD did not agree on the double step; the next part
+("The double step with metal walls in the FDTD") repeats the comparison with the walls of the EME in the FDTD:
 
 - With 40 modes (all above cutoff, power conserved) the EME is above the FDTD (60 cells per um) by +0.0040,
   +0.0068, +0.0085, +0.0082, +0.0058. The FDTD changes by up to 0.0038 between 30 and 60 cells per um, and not
@@ -754,9 +789,65 @@ The EME and the FDTD do not agree on the double step, and the cause is not known
   modes in the default window. The larger window has more modes above cutoff, so at 40 and 80 modes it is farther
   from convergence in the mode count (the default window gave 0.6055 and 0.6058 at 10 and 20 modes). These rows
   cannot show the effect of the walls; it is not known.
-- Not tested: the walls (their reflection of the field; not the wall modes of the next part), the mode truncation
-  and the FDTD error. The gap of 0.0040 to 0.0085 at 40 modes (0.0040 to 0.0103 over 40 to 120 modes) is not
-  explained.
+- These rows did not test the walls (their reflection of the field; not the wall modes of "The modes of the PEC
+  walls"), the mode truncation and the FDTD error. The gap of 0.0040 to 0.0085 at 40 modes (0.0040 to 0.0103 over
+  40 to 120 modes) was not explained by them.
+
+**The double step with metal walls in the FDTD** (2026-11-08 night; `benchmarks/2026-11-08/suite-eme-fdtd-pec.jsonl`,
+12 rows, and `meow-interface-7.jsonl`, 10 rows; the commands are at the end of this part). The FDTD gets the closed
+window of the EME: `photonsuite.fdtd_avg.mode_transmission(..., walls="pec")` puts metal walls (PEC) on the window
+edges and the PML only at the two ends along z (`suite/README.md`, "Metal side walls"). The walls are exact at 50 and
+100 cells per um; at 30, 40, 60 and 80 the y walls are up to 0.0067 um from the window edges (`walls_um` in the
+rows). T00 at 1.50, 1.525, 1.55, 1.575 and 1.60 um (subpixel average, `--max-time 200`):
+
+| FDTD, metal walls, cells per um | cells | T00 | T_flux | time (s) |
+|---|---|---|---|---|
+| 30 | 0.69 M | 0.5463, 0.5503, 0.5555, 0.5627, 0.5716 | 0.99996 to 1.00060 | 8.8 |
+| 40 | 1.6 M | 0.5494, 0.5534, 0.5585, 0.5657, 0.5760 | 0.99986 to 1.00027 | 22.7 |
+| 50 | 3.1 M | 0.5473, 0.5513, 0.5564, 0.5636, 0.5745 | 0.99991 to 1.00018 | 57.6 |
+| 60 | 5.4 M | 0.5483, 0.5524, 0.5573, 0.5644, 0.5757 | 0.99990 to 1.00011 | 134.3 |
+| 80 | 12.8 M | 0.5485, 0.5524, 0.5573, 0.5644, 0.5748 | 0.99994 to 1.00006 | 504.2 |
+| 100 | 25.0 M | 0.5483, 0.5523, 0.5571, 0.5641, 0.5751 | 0.99993 to 1.00003 | 1181.6 |
+
+(The time is the FDTD loop of the three runs, `fdtd_seconds`; peak RSS 5.45 GiB at 100 cells per um.)
+
+- Run time. In the closed window no run decays by 1e-7 (`decayed` false in all rows; `suite/README.md`): each run
+  stops at `max_time` after the source. At 30 cells per um, 100 and 400 um/c give the T00 of 200 um/c within 2.2e-4
+  (100, at 1.60 um; 1e-4 or less at the other wavelengths) and 5e-5 (400).
+- Convergence. 60, 80 and 100 cells per um agree within 2.2e-4, 1.4e-4, 2.5e-4, 2.9e-4 and 8.7e-4 (1.50 to 1.60
+  um). 30, 40 and 50 cells per um differ from 100 by -0.0035 to +0.0016, not monotonically. The FDTD with metal walls
+  is known to about 3e-4 at 1.50 to 1.575 um and 9e-4 at 1.60 um (the spread of the last three rows; no order is
+  fitted).
+- The walls alone. With `--pec-grid` the cell count across of the PML run has the same parity (odd or even) as that
+  of the run with walls, so the step edges have the same places in the cells (on a face or on a center). On that
+  grid the metal walls give a T00 0.0013 to 0.0036 below the PML (30 to 60 cells per um, all five wavelengths; PML
+  rows 0.5483 to 0.5780). The walls of the EME thus move the FDTD away from the EME: they are not the cause of the
+  gap.
+- The grid alone. The same PML runs on the two grids (`--pec-grid` against `suite-eme-fdtd-double-step.jsonl`; the
+  grids differ by half a cell across) differ by -0.0034 to +0.0042 at 30 and 40 cells per um, -0.0004 to +0.0002 at
+  50 and +0.0016 to +0.0019 at 60. This is the non-monotonic change of the earlier PML rows: the FDTD error of those
+  rows was up to about 0.004.
+- The gap with the same walls. The EME (40 to 120 modes, the rows of the table above, `meow-interface-6.jsonl`) is
+  above the FDTD with metal walls at 100 cells per um by +0.0049 to +0.0120 (40 modes: +0.0049, +0.0080, +0.0105,
+  +0.0103, +0.0059), against +0.0040 to +0.0103 above the PML rows at 60 cells per um. The gap does not close; with
+  equal walls it is larger.
+- More modes (`meow-interface-7.jsonl`; conserving interface, pairs "both"; all solves converged, residual 1e-10 or
+  less; peak RSS 5.53 GiB). At 1.50 um, T00 = 0.5532, 0.5561, 0.5575, 0.5587, 0.5513 and 0.5485 at 40, 80, 120,
+  160, 200 and 240 modes: above the FDTD with metal walls (60 to 100 cells per um) by +0.0047 to +0.0049, +0.0076 to
+  +0.0078, +0.0090 to +0.0092, +0.0102 to +0.0104, +0.0028 to +0.0030, and -0.0000 to +0.0002. At 1.525 um, T00 =
+  0.5603, 0.5605, 0.5637 and 0.5646 at 40 to 160 modes: +0.0079 to +0.0124 above. The rows of 40, 80 and 120 modes
+  give the rows of `meow-interface-6.jsonl` again within 2.4e-9 (the pair rule, below; "as_solved" gives them within
+  6e-14).
+- The cause, as far as the rows show it. The FDTD with the walls of the EME is converged to about 3e-4 (9e-4 at
+  1.60 um), and the walls move it away from the EME. What stays is the EME, which is not converged in the mode
+  count: at 1.50 um its T00 rises by 0.0055 from 40 to 160 modes and then falls by 0.0102 to 240 modes. At 240 modes
+  it agrees with the FDTD within 2e-4, but this is not a converged value: the step from 200 to 240 modes moved T00 by
+  0.0028. The probable cause of the gap is thus the mode truncation of the EME; why it converges so slowly and not
+  monotonically is not tested. The EME grid was checked at 40 modes only (0.01 against 0.02 um: 1.6e-4, above).
+- Missing rows. The series stopped during the 200-mode row at 1.525 um: the GPU computer stopped answering at about
+  22:40 EST (the cause is not known; the rows of 200 and 240 modes at 1.50 um ran before it, and the peak RSS of the
+  process was 5.53 GiB). Not run: 200 and 240 modes at 1.525 um, all mode counts at 1.55, 1.575 and 1.60 um, a
+  320-mode row, and the pair-rule rows of the taper (below).
 
 **The modes of the PEC walls** (2026-11-08 evening; `tests/test_walls.py`, `bench/solver_vs_arpack.py`). The ninth
 wave (`meow-solver-arpack.jsonl`: the first and the last cell of the taper, 0.5 and 2.0 um strips, 1.55 um, the
@@ -910,6 +1001,24 @@ GPU_RUN_TIMEOUT=3600 bash tools/gpu_run.sh meow_gpu $B --modes 60,80 --interface
 GPU_RUN_TIMEOUT=3600 bash tools/gpu_run.sh meow_gpu $B --length 0.1 --segments 1 --modes 10,20,40 $W
 GPU_RUN_TIMEOUT=3600 bash tools/gpu_run.sh meow_gpu $B --length 0.1 --segments 1 --modes 60,80,120 \
   --interfaces conserving $W
+```
+
+The double step with metal walls (`suite-eme-fdtd-pec.jsonl`, 12 rows, in this order, then `meow-interface-7.jsonl`,
+10 rows; the second command stopped after 10 rows, see "Missing rows"). The last three commands did not run:
+
+```bash
+F="env PYTHONPATH=../fdtd_gpu/src python bench/eme_fdtd_taper.py fdtd --length 0.1 --segments 1"
+for r in 30 40 50 60 80; do bash tools/gpu_run.sh suite $F --resolution $r --walls pec --max-time 200; done
+for t in 100 400; do bash tools/gpu_run.sh suite $F --resolution 30 --walls pec --max-time $t; done
+for r in 30 40 50 60; do bash tools/gpu_run.sh suite $F --resolution $r --pec-grid; done
+GPU_RUN_TIMEOUT=3600 bash tools/gpu_run.sh suite $F --resolution 100 --walls pec --max-time 200
+GPU_RUN_TIMEOUT=3600 bash tools/gpu_run.sh meow_gpu $B --length 0.1 --segments 1 --modes 40,80,120,160,200,240 \
+  --interfaces conserving --pair-variants as_solved,neither $W
+bash tools/gpu_run.sh meow_gpu $B --length 0.1 --segments 1 --modes 320 --interfaces conserving --wavelengths 1.55
+GPU_RUN_TIMEOUT=3600 bash tools/gpu_run.sh meow_gpu $B --modes 60,80 --interfaces conserving \
+  --pair-variants as_solved,neither $W
+GPU_RUN_TIMEOUT=3600 bash tools/gpu_run.sh meow_gpu $B --modes 60,80 --interfaces conserving \
+  --pair-variants as_solved,neither --search-space full $W
 ```
 
 Limits:

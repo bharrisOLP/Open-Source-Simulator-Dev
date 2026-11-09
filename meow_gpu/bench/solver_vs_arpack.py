@@ -26,8 +26,9 @@ precision "mixed", a new solver for each line (cold start), after one solve of t
 - arpack_distance_max: the largest distance of a solver eigenvalue from the nearest eigenvalue of A[R, R];
 - iterations, matvecs, matvecs_hi, solve_s (the eigen solve and the fields, no post-processing), polish;
 - above_cutoff, below_cutoff, complex, re_negative, growing: counts of the raw solver modes; kept and pairs_complete:
-  the modes after post_process_eigenmodes, and how many of its complex modes have the other member of their pair
-  (-conj(neff)) in the set; copies: pairs of solver modes with the same neff and parallel E_t fields;
+  the modes after post_process_eigenmodes(pairs="as_solved"), and how many of its complex modes have the other
+  member of their pair (-conj(neff)) in the set; copies: pairs of solver modes with the same neff and parallel E_t
+  fields;
 - same_as_deflated (the "full" lines, when both ran): the largest difference of the sorted distances |lambda -
   target| of the two search spaces (relative); conjugate_swaps: eigenvalues of this line whose conjugate (not the
   value) is in the "deflated" set (a cut through a complex pair: both members have the same distance);
@@ -163,7 +164,7 @@ def main():
                 dist = np.sort(np.abs(lam - target)) - np.sort(np.abs(ref_rest - target))
                 n = [complex(m.neff) for m in raw]
                 small = [abs(x.imag) <= tol * abs(x) for x in n]
-                got = post_process_eigenmodes(raw)
+                got = post_process_eigenmodes(raw, pairs="as_solved")    # the set of the solver (no pair rule)
                 ng = [complex(m.neff) for m in got]
                 cplx = [x for x in ng if abs(x.imag) > tol * abs(x) and abs(x.real) > tol * abs(x)]
                 row = {"line": "solver", "search": search, "width_um": w, "step_um": a.step,

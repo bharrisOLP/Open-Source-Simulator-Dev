@@ -3,7 +3,7 @@ power-conserving interface of meow_gpu.interface, with the same modes.
 
     python bench/bench_interface.py [--modes 10,20,30,40] [--wavelengths 1.55] [--diag]
         [--interfaces meow_invert,meow_none,conserving] [--max-imag-neff 1.0] [--window=-2,2,-0.8,1.02]
-        [--cascade star] [--max-gb 8]
+        [--cascade star] [--max-gb 8] [--pairs both] [--pair-variants as_solved,neither]
     common: [--length 2] [--segments 20] [--w0 0.5] [--w1 2.0] [--step 0.02]
 
 The device (the same segments as suite/bench/eme_fdtd_taper.py; textbook indices Si 3.476, SiO2 1.444): a Si strip
@@ -22,6 +22,14 @@ P_right and P_left sum |S|^2 from left@0 over all ports of a side; P_right_prop 
 the modes above cutoff (|S|^2 of a mode below cutoff is not a power). Counts over all cells: complex_neff (raw modes
 below cutoff), flipped_raw (raw modes that post_process_eigenmodes puts on the other branch: Im(neff) < 0),
 negative_re_neff (kept modes with Re(neff) < 0: members of complex pairs (neff, -conj(neff)), forward modes).
+--pairs: the rule of the variant "conserving" for a complex pair that the mode count cuts
+(meow_gpu.interface.complete_complex_pairs: "both", the default since 2026-11-08 night, adds the missing member;
+"neither" removes the member without its partner; "as_solved" keeps the set of the solver, the rule of the rows up
+to that day). --pair-variants adds one variant "conserving_<rule>" for each rule, on the same modes (no second
+solve). pair_modes_added and pair_modes_removed count over all cells the modes that "both" adds and that "neither"
+removes (0 when no pair is cut). --search-space full: the search space of 505c4c5 (the preconditioner keeps the
+unknowns of the PEC walls, ``make_preconditioner(deflate_walls=False)``, as in bench/solver_vs_arpack.py), to check
+that a pair rule gives the same T00 from the two iteration paths.
 The rows of benchmarks/2026-11-08/meow-interface.jsonl, -2 and -3 above 40 modes came from the first version of
 post_process_eigenmodes, which removed the modes with Re(neff) < 0 or Im(neff) < 0 (its count: backward_raw).
 With --diag, also the two mixed cases (which change of the two causes the difference), and for each interface of the
@@ -29,9 +37,10 @@ taper: the largest singular value of S, the Gram matrices of the eigenmodes in t
 fields are. Prints one JSON line for each wavelength and mode count (with the peak memory of the process; since
 2026-11-08 evening also "converged" (all cells), "not_converged_cells" and "residual_max" of the mode solves: before,
 a solve that did not converge gave only a warning on stderr); a row that raises prints a JSON line with "error" and
-the end of the traceback (and the traceback on stderr), and the script goes on with the next row. --window moves
-the PEC walls of the closed EME window (the FDTD of photonsuite.fdtd_avg has a PML outside the default window);
-write it with "=" (the value starts with "-").
+the end of the traceback (and the traceback on stderr), and the script goes on with the next row. Since 2026-11-08
+night each row also gives gpu_peak_gb and gpu_limit_gb (the device memory pool of JAX; null without statistics).
+--window moves the PEC walls of the closed EME window (the FDTD of photonsuite.fdtd_avg has a PML outside the
+default window); write it with "=" (the value starts with "-").
 
 Memory: --cascade star (the default since 2026-11-08 afternoon) cascades with the star product of
 meow_gpu.interface.compute_s_matrix. The rows of benchmarks/2026-11-08/meow-interface.jsonl and meow-interface-2.jsonl
@@ -155,8 +164,21 @@ def main():
                     help="star: the star product of meow_gpu.interface (default); sax: meow's SAX cascade (klu)")
     ap.add_argument("--max-gb", type=float, default=8.0,
                     help="refuse a row whose estimated memory (mode fields, SAX cascade) is above this (GiB)")
+    ap.add_argument("--pairs", choices=["both", "neither", "as_solved"], default="both",
+                    help="conserving: the rule for a complex pair that the mode count cuts (default: both)")
+    ap.add_argument("--pair-variants", default="",
+                    help="more conserving variants on the same modes, one per rule (for example as_solved,neither)")
+    ap.add_argument("--search-space", choices=["deflated", "full"], default="deflated",
+                    help="full: the preconditioner of 505c4c5 (keeps the PEC-wall unknowns); default: the solver")
     ap.add_argument("--diag", action="store_true")
     a = ap.parse_args()
+    if a.search_space == "full":
+        import meow_gpu.meow_backend as backend
+        from meow_gpu.fde.eigensolver import make_preconditioner
+        backend.make_preconditioner = lambda q: make_preconditioner(q, deflate_walls=False)
+    bad = [r for r in a.pair_variants.split(",") if r and r not in ("both", "neither", "as_solved")]
+    if bad:
+        ap.error(f"--pair-variants: unknown rules {bad}")
 
     import jax
     jax.config.update("jax_enable_x64", True)
@@ -175,12 +197,24 @@ def main():
                                   "step_um": a.step, "window": list(window), "wavelength": wl, "modes": n_modes,
                                   "error": f"{type(exc).__name__}: {exc}",
                                   "traceback": traceback.format_exc().splitlines()[-6:],
-                                  "max_rss_gb": max_rss_gb()}), flush=True)
+                                  "max_rss_gb": max_rss_gb(), **gpu_memory_gb()}), flush=True)
 
 
 def max_rss_gb() -> float:
     """The peak resident memory of this process (Linux: ru_maxrss in kB)."""
     return round(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 2**20, 2)
+
+
+def gpu_memory_gb() -> dict:
+    """The peak and the limit of the device memory pool of JAX on the first device (GiB; since 2026-11-08 night, after
+    the GPU computer stopped answering during a 200-mode row), or None values where the backend gives no statistics."""
+    try:
+        import jax
+        stats = jax.devices()[0].memory_stats() or {}
+    except Exception:                                  # a backend without statistics: the row still prints
+        stats = {}
+    return {k: (round(stats[n] / 2**30, 2) if n in stats else None)
+            for k, n in (("gpu_peak_gb", "peak_bytes_in_use"), ("gpu_limit_gb", "bytes_limit"))}
 
 
 def one_row(a, wl, n_modes, cells, css, window):
@@ -190,8 +224,8 @@ def one_row(a, wl, n_modes, cells, css, window):
     from meow.eme.interface import overlap_matrix as meow_overlap
     from meow.fde.post_process import filter_modes, normalize_modes
 
-    from meow_gpu.interface import (compute_interface_s_matrices, interface_blocks, overlap_matrix,
-                                    post_process_eigenmodes)
+    from meow_gpu.interface import (complete_complex_pairs, compute_interface_s_matrices, interface_blocks,
+                                    overlap_matrix, post_process_eigenmodes)
     from meow_gpu.meow_backend import GPUModeSolver, compute_modes_gpu, device_summary, post_process_modes
 
     meow_ip = functools.partial(meow_overlap, inner_product=mw.inner_product)
@@ -216,7 +250,10 @@ def one_row(a, wl, n_modes, cells, css, window):
                           f"{n_modes} modes on {nx} x {ny} samples; above --max-gb {a.max_gb}): lower --modes")
     # post-process each cell after its solve and keep the raw modes only for --diag: the modes of 22 cells take
     # about 1.67 MiB per mode on the 0.02 um grid (2.86 GiB for 22 cells x 80 modes, for each list)
+    rules = [r for r in a.pair_variants.split(",") if r and r != a.pairs]
     raw, gs, eig, counts, t_solve, infos = [], [], [], np.zeros(2, int), 0.0, []
+    by_rule = {r: [] for r in rules}         # the other rules share the mode objects of the same base set
+    pair_counts = {"added": 0, "removed": 0}
     for cs in css:
         t0 = time.perf_counter()
         r = compute_modes_gpu(cs, num_modes=n_modes, solver=solver, post_process=lambda ms: ms)
@@ -226,13 +263,19 @@ def one_row(a, wl, n_modes, cells, css, window):
                    sum(np.imag(m.neff) < -1e-9 * abs(m.neff) for m in r)]
         if need_gs:
             gs.append(post_process_modes(r))   # meow's Gram-Schmidt is slow
-        eig.append(post_process_eigenmodes(r, max_imag_neff=a.max_imag_neff))
+        base = post_process_eigenmodes(r, max_imag_neff=a.max_imag_neff, pairs="as_solved")
+        eig.append(complete_complex_pairs(base, a.pairs))
+        for rule in rules:
+            by_rule[rule].append(complete_complex_pairs(base, rule))
+        pair_counts["added"] += len(complete_complex_pairs(base, "both")) - len(base)
+        pair_counts["removed"] += len(base) - len(complete_complex_pairs(base, "neither"))
         if a.diag:
             raw.append(r)
     row = {"case": "SOI taper", "w0": a.w0, "w1": a.w1, "length_um": a.length, "segments": a.segments,
            "step_um": a.step, "window": list(window), "wavelength": wl, "modes": n_modes, "cells": len(cells),
-           "max_imag_neff": a.max_imag_neff,
-           "min_modes_kept": min(len(m) for m in eig),
+           "max_imag_neff": a.max_imag_neff, "pairs": a.pairs, "search_space": a.search_space,
+           "pair_modes_added": pair_counts["added"], "pair_modes_removed": pair_counts["removed"],
+           "min_modes_kept": min(len(m) for m in eig), "max_modes_kept": max(len(m) for m in eig),
            "min_modes_kept_gs": min(len(m) for m in gs) if need_gs else None,
            "complex_neff": int(counts[0]),
            "negative_re_neff": int(sum(np.real(m.neff) < -1e-9 * abs(m.neff) for ms in eig for m in ms)),
@@ -248,6 +291,9 @@ def one_row(a, wl, n_modes, cells, css, window):
         "conserving": (eig, compute_interface_s_matrices),
     }
     variants = {k: v for k, v in variants.items() if k in a.interfaces.split(",")}
+    if "conserving" in a.interfaces.split(","):
+        for rule in rules:
+            variants[f"conserving_{rule}"] = (by_rule[rule], compute_interface_s_matrices)
     if a.diag:
         # the formula of meow (no passivity rule) with the eigenmodes and the Yee product; the conserving
         # formula with the Gram-Schmidt modes and meow's product
@@ -276,6 +322,7 @@ def one_row(a, wl, n_modes, cells, css, window):
         row["max_imag_over_abs_Ex"] = max(re_e)
         row["neff_first_cell"] = [round(float(np.real(m.neff)), 6) for m in raw[0]]
     row["max_rss_gb"] = max_rss_gb()
+    row.update(gpu_memory_gb())
     print(json.dumps(row), flush=True)
 
 

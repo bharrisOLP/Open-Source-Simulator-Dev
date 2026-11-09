@@ -11,7 +11,8 @@ passes other settings to meow.compute_interface_s_matrices. On a short taper the
 0.03: the default passivity correction ("invert") turns the power gain of the truncated interface solve into a loss
 (README, "EME against 3-D FDTD with subpixel averaging"). ``interface="conserving"``: the interface of
 meow_gpu.interface (the modes without Gram-Schmidt, the Yee product, a testing that conserves power for every
-count of modes above cutoff; meow_gpu/README.md, "A power-conserving interface"), cascaded with the star product of
+count of modes above cutoff, both members of a complex pair that the mode count cuts; meow_gpu/README.md, "A
+power-conserving interface"), cascaded with the star product of
 meow_gpu.interface.compute_s_matrix (the same S-matrix as meow's SAX cascade, with memory of the order of the square
 of the mode count; the SAX cascade needs about 12 GiB for 22 cells with 57 modes).
 """
