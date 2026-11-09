@@ -260,6 +260,14 @@ def check_face_currents(dev, s):
     (_, _, _, jn, jp), (_, _, _, jnc, jpc) = dd._fluxes(m, s.psi.ravel(), s.n.ravel()[m.sflat], s.p.ravel()[m.sflat])
     for public, solver in ((f.jn, jn), (f.jp, jp), (f.jnc, jnc), (f.jpc, jpc)):
         assert np.array_equal(public, solver)                     # the arrays of the solver, bit for bit
+    # the arrays are copies: a change of one does not reach the solution or its mesh (review f39279a5164e: area was a
+    # view of mesh.vol); == is the identity (eq=False), so a comparison and a hash do not fail on the arrays
+    own = [v for v in vars(m).values() if isinstance(v, np.ndarray)] + [s.psi, s.n, s.p]
+    for name, v in vars(f).items():
+        if isinstance(v, np.ndarray):
+            assert not any(np.may_share_memory(v, w) for w in own), name
+    g = s.face_currents()
+    assert f == f and f != g and len({f, g}) == 2
     nx, ny = f.shape
     nc = nx * ny
     semi = f.semiconductor.ravel()

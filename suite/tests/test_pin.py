@@ -9,8 +9,10 @@ physics.phase_shifter_ppi with the same heat in the same cells; both parts again
 (the largest index of a 4-mode solve); the signs and the cross-over. The heat through the public face currents of
 charge-gpu is the heat of the private fields (0753ed0) bit for bit. The two-way electro-thermal loop: without a
 temperature rise it gives the 300 K result; it converges (the residual per step); its first step is the logged
-one-pass feedback; its fixed point is that of a root finder (brentq) and does not depend on the damping; the heat
-equals I' V at the converged state."""
+one-pass feedback, also with damping; its fixed point is that of a root finder (brentq) and does not depend on the
+damping; the heat equals I' V at the converged state; other weights of the device temperature move the current less
+than the one pass misses; pin_phase_shifter(coupling="two-way") with a uniform heat and window sides at 300 K equals
+electrothermal + pin_optical with the same options; the options of the loop are checked before the sweep."""
 import dataclasses
 
 import jax
@@ -22,9 +24,9 @@ jax.config.update("jax_enable_x64", True)
 
 from photonsuite.physics import (ConvergenceError, Window, charge_device, phase_shifter_ppi,  # noqa: E402
                                  thermal_problem)
-from photonsuite.pin import (SI, SIO2, PinElectrical, cell_overlap, electrothermal, heat_source,  # noqa: E402
-                             pin_electrical, pin_optical, pin_phase_shifter, pin_rib, steady_temperature,
-                             to_thermal, uniform_heat)
+from photonsuite.pin import (SI, SIO2, PinElectrical, cell_overlap, device_temperatures,  # noqa: E402
+                             electrothermal, heat_source, pin_electrical, pin_optical, pin_phase_shifter, pin_rib,
+                             steady_temperature, to_thermal, uniform_heat)
 
 XS = pin_rib()
 OPTICS = Window(-1.5, 1.5, -0.5, 0.9, 0.02)
@@ -385,7 +387,8 @@ def test_the_loop_converges_to_a_consistent_state(electrical, result, two_way):
         # energy: the heat integral is I' V at the converged state (on the charge cells and on the thermal grid)
         assert abs(heat_source(el.solutions[k]).total.sum() / r.power[k] - 1) < 1e-9
         assert abs(r.heat[k] / r.power[k] - 1) < 1e-9
-    # the feedback raises the current, the carrier change and the heat; the 0 V reference stays at 300 K
+    # at 0.9 to 1.2 V (1 ns) the feedback raises the current, the carrier change and the heat (the logged rows: the
+    # carrier change falls at 1.25 and 1.3 V, and at 1.3 V with 10 ns); the 0 V reference stays at 300 K
     assert np.all(r.current > result.current) and np.all(r.rise_core > result.rise_core)
     assert np.all(r.dneff_carrier.real < result.dneff_carrier.real)
     assert np.all(r.dneff_thermal.real > result.dneff_thermal.real)
@@ -439,6 +442,83 @@ def test_the_damping_does_not_change_the_fixed_point(electrical, two_way):
     assert d.iterations[0] > el.loop.iterations[0] and abs(d.residual[0]) <= d.tol
     assert abs(d.temperature[0] - el.loop.temperature[0]) < 2.5e-4
     assert np.all(np.abs(h[1:, 3]) < np.abs(h[:-1, 3]))
+    # step 1 is not damped: the one-pass feedback, the same as without damping and as the logged bench
+    one = np.array(el.loop.history[0])
+    assert h[1, 0] == h[0, 2] and np.allclose(h[:2, :3], one[:2, :3], rtol=1e-12, atol=0)
+    assert np.allclose(h[:2, 3], one[:2, 3], rtol=0, atol=1e-9)
+    assert abs(h[1, 1] / h[0, 1] - 1 - LOGGED_ONE_PASS[0.9]) < 1e-8
+
+
+def test_the_weight_of_the_device_temperature(two_way, result):
+    # the loop gives all the Si one temperature, the area mean of the field; other means of the same converged field
+    # (weighted by the heat or the recombination of each cell, the intrinsic zone) and the min and the max of the Si
+    # (a bracket): one solve at each from the converged solution, 1.2 V (1 ns)
+    from charge_gpu import drift_diffusion as dd
+
+    el, r = two_way
+    k, v = 3, 1.2
+    dev, sol = el.device, el.solutions[k]
+    t = device_temperatures(dev, sol, r.temperatures[k])
+    assert abs(t["area"] - el.loop.temperature[k]) <= el.loop.tol                # the choice of the loop
+    assert t["area"] == pytest.approx(300.0 + r.rise_semiconductor[k], abs=1e-9)
+    assert all(t["min"] < t[w] < t["max"] for w in ("area", "heat", "recombination", "intrinsic"))
+    change = {}
+    for name, temp in t.items():
+        s = dd.solve(dataclasses.replace(dev, T=temp), 0.0, v, guess=sol, tau_n=1e-9, tau_p=1e-9)
+        assert s.converged
+        change[name] = s.current / result.current[k] - 1
+    loop_change = sol.current / result.current[k] - 1
+    miss = loop_change - (el.loop.history[k][1][1] / result.current[k] - 1)        # the one pass misses this
+    print(f"1.2 V: T (K) {', '.join(f'{n} {x:.3f}' for n, x in t.items())}; I' change against one-way (%): "
+          f"the loop {100 * loop_change:.3f}, {', '.join(f'{n} {100 * x:.3f}' for n, x in change.items())}; "
+          f"the one pass misses {100 * miss:.3f} points")
+    assert change["min"] < loop_change < change["max"]                              # I' rises with T
+    for name in ("heat", "recombination", "intrinsic"):
+        assert abs(change[name] - loop_change) < abs(miss), name
+
+
+def test_pin_phase_shifter_two_way_to_the_end(electrical, two_way):
+    # the public call with coupling="two-way", I' V uniform in the intrinsic zone (heat=<tags>) and both window sides
+    # at 300 K with the slab to the window sides (the heat path of --heat-sink), at 1.0 V: equal to electrothermal +
+    # pin_optical with the same options; the converged T is the mean rise that pin_optical finds with these options,
+    # so the options reach the loop (the positional call of pin_phase_shifter)
+    sink = pin_rib(slab_half_width=5.0)
+    kw = dict(heat=("slab", "core"), side_temperature=300.0)
+    r = pin_phase_shifter(sink, OPTICS, CHARGE, THERMAL, 1.55, [1.0], core_tag="core", coupling="two-way", **kw)
+    el = electrothermal(sink, THERMAL, one_bias(electrical, 1), **kw)
+    ref = pin_optical(sink, OPTICS, THERMAL, 1.55, el, core_tag="core", **kw)
+    loop = r.electrical.loop
+    print(f"two-way, heat in the intrinsic zone, sides at 300 K, 1.0 V: T {loop.temperature[0]:.6f} K "
+          f"({loop.iterations[0]} solves), electrothermal {el.loop.temperature[0]:.6f} K ({el.loop.iterations[0]} "
+          f"solves); adiabatic sides and the "
+          f"heat density {two_way[0].loop.temperature[1]:.6f} K; dneff {r.dneff[0].real:.6e} against "
+          f"{ref.dneff[0].real:.6e}")
+    assert r.heat_model == "slab,core" and loop is not None
+    assert abs(loop.temperature[0] - el.loop.temperature[0]) < 2e-4
+    assert abs(300.0 + r.rise_semiconductor[0] - loop.temperature[0]) <= loop.tol
+    assert r.current[0] == pytest.approx(ref.current[0], rel=1e-5)
+    assert abs(r.dneff[0] - ref.dneff[0]) < 1e-4 * abs(ref.dneff[0])
+    assert abs(r.heat[0] / r.power[0] - 1) < 1e-9
+    # the heat path makes the device cooler than the default thermal model
+    assert loop.temperature[0] < two_way[0].loop.temperature[1] - 1.0
+
+
+def test_the_options_of_the_loop_are_checked_before_the_sweep(monkeypatch):
+    import photonsuite.pin as pin
+
+    def no_sweep(*a, **k):
+        raise AssertionError("the sweep ran")
+
+    monkeypatch.setattr(pin, "pin_electrical", no_sweep)
+    for kw, match in ((dict(mobility=(0.1, 0.04)), "mobility"), (dict(loop_tol=0.0), "tol"),
+                      (dict(loop_damping=1.5), "damping"), (dict(loop_max_iter=0), "max_iter"),
+                      (dict(coupling="both"), "coupling")):
+        with pytest.raises(ValueError, match=match):
+            pin_phase_shifter(XS, OPTICS, CHARGE, THERMAL, 1.55, [0.9], **{"coupling": "two-way", **kw})
+    with pytest.raises(ValueError, match="1.55 um"):
+        pin_phase_shifter(XS, OPTICS, CHARGE, THERMAL, 1.31, [0.9])
+    with pytest.raises(AssertionError, match="the sweep ran"):        # a user mobility is allowed one-way
+        pin_phase_shifter(XS, OPTICS, CHARGE, THERMAL, 1.55, [0.9], mobility=(0.1, 0.04))
 
 
 def test_input_checks_of_the_loop(electrical):

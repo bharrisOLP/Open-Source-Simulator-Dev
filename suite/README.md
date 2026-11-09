@@ -220,16 +220,27 @@ FDTD (subpixel averaging; the times are the FDTD loops of the three runs):
 |---|---|---|---|---|---|
 | 30 | 1.8 M | 0.9082, 0.9129, 0.9171, 0.9207, 0.9238 | 1.0017 to 1.0029 | 0.9864 / 0.9901 | 9.6 s |
 | 40 | 4.3 M | 0.9032, 0.9081, 0.9125, 0.9163, 0.9197 | 1.0005 to 1.0014 | 0.9923 / 0.9944 | 28.6 s |
-| 50 | 8.3 M | 0.9012, 0.9063, 0.9109, 0.9150, 0.9185 | 0.99996 to 1.0006 | 0.9950 / 0.9964 | 86.2 s |
+| 50 | 8.3 M | 0.9012, 0.9063, 0.9109, 0.9150, 0.9185 | 0.99996 to 1.0006 | 0.9950 / 0.9964 | 86.1 s |
 | 60 | 14.4 M | 0.9008, 0.9058, 0.9103, 0.9143, 0.9178 | 0.9996 to 1.0002 | 0.9966 / 0.9975 | 172.7 s |
 
 - Convergence: the change of T00 from 30 to 40, 40 to 50 and 50 to 60 cells per um is -0.0041 to -0.0050,
   -0.0012 to -0.0020 and -0.0004 to -0.0008 (over the band): faster than first order, but the ratios of the steps
   scatter (1.6 to 5.5 for the last two), so no single order fits. A second-order extrapolation from 50 and 60 gives
-  0.9000, 0.9047, 0.9090, 0.9128, 0.9161, within 0.0017 of the res-60 values: the FDTD limit is known to about 2e-3.
-- Power: T_flux goes to 1 (0.9996 to 1.0002 at res 60), so the taper radiates little; the rest of the power is in the
-  higher modes. The straight guides of the calibration transmit 0.99984 and 0.99996 of the flux.
+  0.9000, 0.9047, 0.9090, 0.9128, 0.9161, within 0.0017 of the res-60 values; a first-order extrapolation gives
+  0.8990, 0.9034, 0.9074, 0.9109, 0.9140, up to 0.0037 below them (the ratio of the last two steps falls to 1.59 at
+  1.60 um, near the first-order value 1.50). So the FDTD limit is known to about 2e-3 to 4e-3 (0.907 to 0.909 at
+  1.55 um).
+- Power: T_flux goes to 1 (0.9996 to 1.0002 at res 60): little power leaves through the side PML between the two
+  planes. The rest of the power crosses the output plane, 0.5 um after the taper: in the higher modes, and as
+  radiation that has not left the window there (not separated; only TE0 is measured). The straight guides of the
+  calibration transmit 0.99984 and 0.99996 of the flux.
 - The mode factor: b goes to 1 at about second order; b_in / b_out changes T00 by 0.37 % (res 30) to 0.09 % (res 60).
+- The flux of the grid: T00 is a ratio of mode powers on the Yee grid (|a|^2 / b is the flux of the mode on the
+  grid), and the Yee flux has its own grid error, larger for the 2.0 um guide (neff 2.82) than for the 0.5 um guide
+  (2.45). T_flux at 1.55 um, 1.00265, 1.00127, 1.00056, 1.00015 at res 30 to 60, is near 1 + 3.0 / res^2 - 0.0007
+  (a fit through res 30 and 60; within 1e-4 at res 40 and 50). If the mode powers have the same error, T00 is high
+  by about 0.3 % at res 30 and 0.08 % at res 60, about one third of the change of T00 from res 30 to 60. This bias
+  goes to 0 at second order, so the extrapolations include it.
 - The FDTD and the EME see the same cross-sections: the TE0 index of the fdtdx mode solver at the planes (1.55 um,
   res 30 to 60) is 2.4460, 2.4479, 2.4505, 2.4468 (0.5 um strip) and 2.8207, 2.8243, 2.8260, 2.8232 (2.0 um);
   meow-gpu (`bench/taper_modes.py`, grids 0.04, 0.02, 0.01 um) gives 2.4518, 2.4436, 2.4450 and 2.8252, 2.8194,
@@ -239,8 +250,8 @@ FDTD (subpixel averaging; the times are the FDTD loops of the three runs):
   the taper; it is a probable cause of the change of T00 with the grid (not tested separately).
 - Staircase (`--staircase`, res 40): 0.9019, 0.9069, 0.9115, 0.9156, 0.9193, 0.0004 to 0.0013 below the average.
 
-EME (one cell per segment, 22 cells; 0.02 um grid; times for the five wavelengths 44 s at 10 modes, 105 s at 20, 198 s
-at 30, 300 s at 40):
+EME (one cell per segment, 22 cells; 0.02 um grid; times for the five wavelengths 43.7 s at 10 modes, 105.1 s at 20,
+199.0 s at 30, 296.5 s at 40):
 
 | meow interface setting | modes | T00 | power in the right modes |
 |---|---|---|---|
@@ -256,19 +267,24 @@ at 30, 300 s at 40):
 Agreement and its causes:
 - At 1.55 um the EME differs from the FDTD (0.9103 at res 60) by -0.034 and -0.031 with the meow defaults (10 and 20
   modes), -0.018 with "clip", and -0.012, -0.005, +0.004, +0.009 without a correction (10, 20, 30, 40 modes). The
-  FDTD is converged to about 2e-3; the EME is not converged.
+  FDTD limit is known to about 2e-3 to 4e-3 (above); the EME is not converged.
 - The EME is limited by its interfaces, not by its grid or its cells. Without a correction the kept modes carry 0.8
-  to 1.2 % more power than the input: the overlap solve of meow with a truncated set of modes in the closed window
-  (PEC walls; the box modes stand for the radiation) does not conserve power. "invert" replaces each singular value
-  1 + d of an interface by 1 / (1 + d), so the gain becomes a loss of the same size and T00 falls by 0.022 (10
-  modes) and 0.026 (20 modes); "clip" removes only the gain. With more modes the uncorrected T00 rises (0.898,
+  to 1.2 % more power than the input (the rows). The cause was found later, with tests (`meow_gpu/README.md`, "A
+  power-conserving interface"): meow tests both continuity equations with the modes of the left guide, which
+  conserves power only for a complete set of modes (on a lossless step, meow's interface without a passivity rule has
+  a singular value above 1.001), and the eigenmodes are not orthogonal in its inner product. "invert" replaces each
+  singular value 1 + d of an interface by 1 / (1 + d), so the gain becomes a loss of the same size and T00 falls by
+  0.022 (10 modes) and 0.026 (20 modes); "clip" removes only the gain. With more modes the uncorrected T00 rises (0.898,
   0.905, 0.915, 0.919 at 10 to 40 modes) and the power error stays near 1 %: no convergence up to 40 modes. The
   FDTD value is between the 20- and the 30-mode values. Almost no truncation of the solve (rcond 1e-8) is unstable.
 - The EME grid: 0.04 to 0.02 um changes T00 at 1.55 um by +0.0022 (20 modes, "invert"; 0.8769 against 0.8791), 0.02
   to 0.01 um by +0.0007 ("none", 20 modes; 0.9060 against 0.9053).
-- The slope over the band: from 1.50 to 1.60 um the FDTD T00 rises by 0.0169 (res 60; 0.0156 at res 30), the EME by
-  0.0078 to 0.0113 (all rows above but the unstable one). The slopes differ by about 0.007, more than the FDTD
-  slope changes with the grid (0.0013).
+- The slope over the band: from 1.50 to 1.60 um the FDTD T00 rises by 0.0169 (res 60), the EME by 0.0078 to 0.0113
+  (all rows above but the unstable one). The slopes differ by about 0.007, more than the FDTD slope changes with the
+  grid (0.0156, 0.0165, 0.0173, 0.0169 at res 30 to 60: a range of 0.0017). The end points hide a dip: the 20-mode
+  EME rows are not monotonic (with the 0.02 um grid T00 falls from 1.55 to 1.575 um, for example 0.8791 to 0.8784
+  with "invert"; with the 0.04 um grid from 1.575 to 1.60 um); the 10-, 30- and 40-mode rows rise at each step. The
+  cause is not checked (a change of the kept set of modes with the wavelength is possible).
 - The earlier comparison on the 10 um taper (above: EME 0.9912 with "invert", FDTD 0.9961, and the EME lost 0.6 % of
   the power) has the sign of the same interface loss; it is not repeated here.
 
@@ -290,6 +306,13 @@ Tests (`tests/test_fdtd_avg.py`): the staircase of the adapter equals the suite'
 (three segments: a Rect, a sloped Polygon, a fill order), the averaged eps along the propagation axis keeps the
 area of each cross-section to 2e-3, the planes must stay off the segment ends, and a straight guide at 20 cells per um
 gives T00 within 3e-3 of 1, T_flux within 1e-2, 0.9 < b < 1.01 and a phase index within 0.05 of the mode solver.
+The calibrated path (`calibrate=True`, the default; the bench rows use it) on the same straight guide: b_in and b_out
+are |alpha|^2 / P of the two calibration runs (the same simulation as the device run here): b_out equals the b of the
+device run in all digits (test print), b_in equals b_out within the test bound 1e-5 (b_in 0.9666, 0.9687, 0.9704
+at 1.50, 1.55, 1.60 um); T00 is within 3e-3 of 1 (test print: 5.6e-4 or less) and the input mode share within 5e-3
+(3.1e-4 or less). Parity "tm" on the same strip (a taller window, y -1.2 to 1.4 um): the source and the monitors
+take TM0 (test print: neff 1.8424, 1.7771, 1.7196; TE0 is 2.45 at 1.55 um), with the same bounds as TE (T00 - 1:
+1.4e-3 or less; b 1.0003 to 1.0026). The taper against the EME is not a test (the rows above).
 `tests/test_eme.py`: one cell per segment on a straight guide (T within 1e-4 of 1).
 
 Limits: the EME has no converged value on this taper (its interface treatment, above); the FDTD runs in float32, with
@@ -363,14 +386,17 @@ t.electrical.loop.temperature, t.electrical.loop.iterations, t.electrical.loop.h
    the steady temperature over the Si cells of the charge window:
    - G(T) = 300 K + the mean rise of the heat of the drift-diffusion solution at T (the heat and the thermal model
      of steps 2 and 3);
-   - T_1 = G(300 K) (step 1 is the one-pass feedback of `--device-temperature`), then
+   - T_1 = G(300 K) for every damping (step 1 is the one-pass feedback of `--device-temperature`), then
      T_k+1 = T_k + damping (G(T_k) - T_k) (default damping 1: no damping), each step a Newton solve at
      `Device.T` = T_k from the last solution;
    - stop when |G(T_k) - T_k| <= `loop_tol` (default 1e-4 K); ConvergenceError after `loop_max_iter` (30) solves.
 
    The returned solutions are those at the converged T; steps 2 to 5 use them as they are. The carrier change is
-   from the carriers at 0 V and 300 K (the unbiased device). The loop converges when the gain dG/dT (the rise
-   times the relative change of the current per K) is below 1; here it is 0.001 to 0.107 (below).
+   from the carriers at 0 V and 300 K (the unbiased device). The loop converges when the gain G' = dG/dT (the rise
+   times the relative change of the current per K) is below 1 in size; here it is 0.001 to 0.107 (below). A damped
+   step multiplies the residual by about 1 - damping (1 - G'). The feedback here is positive (a hotter device
+   carries more current), so damping < 1 only makes the loop slower. Damping helps for a negative gain (an
+   oscillation); for G' >= 1 (thermal runaway) no damping converges.
 
 Results: the rows of `benchmarks/2026-11-08/suite-pin.jsonl` (the commands below; RX 7900 XT, shared computer).
 `pin_rib`, the windows of the snippet, the fundamental mode at 1.55 um (neff = 2.58936 at 0 V), dneff from 0 V.
@@ -437,15 +463,17 @@ bounds are larger):
 | the carrier part, 0.9 to 1.2 V | the first-order perturbation (`switching.index_weights` times the complex dn) | 7.1e-5, 1.5e-4, 2.4e-4, 3.2e-4: a second-order difference (the error divided by \|dneff\| changes by less than 10 %) |
 | the thermal part | the same | 1.0e-5, 4.7e-5, 1.3e-4, 2.8e-4 (the same) |
 | both changes in one solve | the sum of the two parts | the cross term is 2.4e-5 to 6.3e-4 of \|dneff_carrier\| |
-| dn/dT = 0 (all materials), 1.1 V | no heat: dneff_thermal = 0, dneff = dneff_carrier | 6.0e-14 or less; 4.6e-12 or less; the carrier part of the four-bias run to 7.8e-12 or less (three runs) |
-| no plasma dispersion (`plasma` gives 0), 1.1 V | no carriers: dneff_carrier = 0, dneff = dneff_thermal | 3.0e-13 or less; 4.7e-11 or less; the thermal part of the four-bias run to 1.6e-11 or less (three runs) |
+| dn/dT = 0 (all materials), 1.1 V | no heat: dneff_thermal = 0, dneff = dneff_carrier | 6.0e-14 or less; 5.4e-12 or less; the carrier part of the four-bias run to 7.8e-12 or less (four runs) |
+| no plasma dispersion (`plasma` gives 0), 1.1 V | no carriers: dneff_carrier = 0, dneff = dneff_thermal | 3.0e-13 or less; 4.7e-11 or less; the thermal part of the four-bias run to 1.6e-11 or less (four runs) |
 | the heat of `heat_source` from the public face currents, 0.9 to 1.2 V, at 300 K and at the loop temperatures | the heat of 0753ed0 (the private `_fluxes` and mesh fields of charge-gpu; its code is in the test) | the same arrays and the same J . E, bit for bit |
-| the two-way loop with the temperature rise forced to 0 (the steady temperature gives 300 K everywhere), 0.9 to 1.2 V | the 300 K (one-way) result | one solve per bias at 300 K; I' 4.0e-14, n and p 4.0e-15, psi 9.5e-15 V; dneff_carrier at 1.1 V 2.8e-12 |
+| the two-way loop with the temperature rise forced to 0 (the steady temperature gives 300 K everywhere), 0.9 to 1.2 V | the 300 K (one-way) result | one solve per bias at 300 K; I' 4.0e-14, n and p 4.0e-15, psi 9.5e-15 V; dneff_carrier at 1.1 V 2.8e-12 and 4.4e-12 (two runs) |
 | the two-way loop, 0.9 to 1.2 V: G(T) - T per step | convergence | 0.9 V: 8.0e-1, 1.5e-2, 2.7e-4, 5.1e-6 K (3 solves); 1.0 V: 3.6, 1.6e-1, 7.4e-3, 3.3e-4, 1.5e-5 K (4); 1.1 V: to 1.0e-5 K (5); 1.2 V: 22, 1.4, 8.5e-2, 5.1e-3, 3.0e-4, 1.8e-5 K (5) (test: the ratio of two steps below 0.2) |
 | its first step (the device at 300 K plus the rise of the 300 K heat) | the one-pass feedback of the logged bench (`I_hot_rel` of `suite-pin.jsonl`, 0.9 to 1.2 V) | within the test bound 1e-8 (not printed) |
 | the converged state | its own heat (the mean rise of the Si that `pin_optical` finds again); the heat integral against I' V; `Device.T` of the solution (V_T) | within 1e-4 K (the stop rule); within 1e-9 (test bound, not printed; the identity of the checks above); V_T of T exactly |
 | the fixed point at 1.2 V | `scipy.optimize.brentq` on G(T) - T, with G from fresh solves at T (from the 300 K solution) and the mean of `charge_gpu.temperature.mean_temperature` | 323.62433 K against 323.62431 K: 1.9e-5 K (brentq: 6 solves; the loop: 5) |
-| damping 0.5 at 0.9 V | the loop without damping | 300.81087 K against 300.81093 K: 5.9e-5 K (the stop rule: the last residual 6.3e-5 K); 14 solves against 3 |
+| damping 0.5 at 0.9 V (from step 2; step 1 is not damped) | the loop without damping | 300.81087 K against 300.81093 K: 6.3e-5 K (the stop rule: the last residual 6.7e-5 K); 9 solves against 3; step 1 the same as without damping and as the logged one pass (test bounds 1e-12 and 1e-8, not printed) |
+| other weights of the device temperature, 1.2 V: the converged field weighted by the heat or by the recombination of each cell, the mean of the intrinsic zone, the min and the max of the Si (`pin.device_temperatures`; one solve at each from the converged solution) | the loop (the area mean, 323.624 K): I' +6.789 % against one-way; the one pass misses 0.408 points | 323.797, 323.624, 323.533, 322.293 and 324.961 K: I' +6.836, +6.789, +6.764, +6.428 and +7.149 %; the three weights move the change by 0.047 points or less (test: less than the miss of the one pass) |
+| `pin_phase_shifter(coupling="two-way")` to the end, `heat=("slab", "core")`, both window sides at 300 K and the slab to the sides, 1.0 V | `electrothermal` + `pin_optical` with the same options | T 301.433661 K, the same (3 solves each; 303.815121 K with adiabatic sides and the heat density); dneff the same in 7 digits; the converged T is the mean rise that `pin_optical` finds with these options (within 1e-4 K) |
 
 Also tested: the errors for biases that are not positive and increasing, for a charge window without a p and an n
 contact, for a wavelength other than 1.55 um with the default plasma dispersion, for a heat source outside the
@@ -454,8 +482,10 @@ that does not converge (ConvergenceError); `crossover()` at an exact zero on a b
 values); the thermal options of `pin_rib` do not change the charge Device; the mode is the largest index of a
 4-mode solve (2.589362; the next is 2.199027); the loop: ConvergenceError when one solve is the limit (1.2 V),
 ValueError for tol <= 0, a damping outside (0, 1], max_iter < 1, a PinElectrical without the lifetime, a user
-mobility (a value at one temperature), and an unknown `coupling`. Time of a run of the 21 tests: 53.5 s (the
-drift-diffusion sweep to 1.2 V on the CPU of the GPU computer: about 19 s; peak RSS 1.95 GiB).
+mobility (a value at one temperature), and an unknown `coupling`; `pin_phase_shifter` refuses these loop options,
+an unknown `coupling` and a wavelength other than 1.55 um with the default plasma dispersion before the
+drift-diffusion sweep (a user mobility stays allowed one-way). Time of a run of the 24 tests: 73.5 s (the
+drift-diffusion sweep to 1.2 V on the CPU of the GPU computer: about 19 s; peak RSS 1.97 GiB).
 
 The bench `bench/pin_self_heating.py` writes one JSON row per bias (also the Joule and recombination parts, the
 first-order values and the rise of the Si) and one row per run with the cross-over. Its options: `--tau`
@@ -466,8 +496,10 @@ rise of the Si: the size of the feedback that the workflow leaves out), and the 
 substrate D um deep; default 3) and `--heat-sink` (a crude heat path to the contacts: the p+ and n+ slab continues
 to the window sides, and both window sides are at 300 K over their whole height; the carriers do not change), and
 `--two-way` (the loop of step 6, with `--loop-tol` and `--damping`; the rows also give the loop record and the
-one-way values of the same run). The rows of `benchmarks/2026-11-08/suite-pin.jsonl` come from these commands, in
-this order (from the repository folder on the GPU computer):
+one-way values of the same run), and `--weights` (with `--two-way`: the current at the other device temperatures of
+`pin.device_temperatures`, one solve at each from the converged state). The rows of
+`benchmarks/2026-11-08/suite-pin.jsonl` come from these commands, in this order (from the repository folder on the
+GPU computer):
 
 ```bash
 B="python bench/pin_self_heating.py"
@@ -491,6 +523,13 @@ The rows of `benchmarks/2026-11-08/suite-pin-3.jsonl` (the two-way coupling) com
 
 ```bash
 bash tools/gpu_run.sh suite python bench/pin_self_heating.py --two-way --tau 1e-9 1e-8 \
+  --biases 0.8 0.85 0.9 0.95 1.0 1.05 1.1 1.15 1.2 1.25 1.3
+```
+
+The rows of `benchmarks/2026-11-08/suite-pin-4.jsonl` (the weights of the device temperature) come from this command:
+
+```bash
+bash tools/gpu_run.sh suite python bench/pin_self_heating.py --two-way --weights --tau 1e-9 1e-8 \
   --biases 0.8 0.85 0.9 0.95 1.0 1.05 1.1 1.15 1.2 1.25 1.3
 ```
 
@@ -565,33 +604,50 @@ the loop; the one-way values of 0.8 to 1.2 V are those of the first table; one-w
   CPU of the GPU computer.
 - The converged current is 0.361 % (0.8 V) to 7.153 % (1.15 V) above the one-way current; the one pass gives
   0.360 % to 6.689 %, so it misses up to 0.46 percentage points (1.15 V).
-- The two parts grow by different amounts: at 1.0 V the carrier change by 1.93 %, the thermal change by 4.66 %, so
-  the net change stays within 0.13 % of the one-way value (L_pi 0.847 mm against 0.846 mm), and P_pi rises by
-  4.9 % (the current rises by 4.7 %). The thermal part grows more than the carrier part at every bias (dneff_thermal /
-  |dneff_carrier| 0.442 against 0.430 at 1.0 V, 1.263 against 1.189 at 1.2 V), so the net change near the
-  cross-over changes much: at 1.15 V it has the other sign (+5.2e-5 against -1.1e-4).
+- The two parts change by different amounts: at 1.0 V the carrier change grows by 1.93 %, the thermal change by
+  4.66 %, so the net change stays within 0.13 % of the one-way value (L_pi 0.847 mm against 0.846 mm), and P_pi
+  rises by 4.9 % (the current rises by 4.7 %). The thermal part grows at every bias (+0.36 % to +7.12 %). The
+  carrier part grows up to 1.2 V (+0.55 %) and falls above, although the current rises (-0.74 % at 1.25 V, -2.39 %
+  at 1.3 V; the cause is not separated: the temperature model of charge-gpu changes the lifetimes, the mobility and
+  n_i together). dneff_thermal / |dneff_carrier| is larger than one-way at every bias (0.442 against 0.430 at 1.0 V,
+  1.263 against 1.189 at 1.2 V), so the net change near the cross-over changes much: at 1.15 V it has the other sign
+  (+5.2e-5 against -1.1e-4).
 - The cross-over moves 11.8 mV lower: 1.1455 V, 61.85 A/m, 70.85 W/m (between 1.1 and 1.15 V) against 1.1573 V,
   62.54 A/m, 72.38 W/m one-way: a shift of the same size as that of the wider thermal windows above (9.5 to 13 mV
   higher), in the other direction.
-- Lifetimes 10 ns (the same command; `tau_s` 1e-8): 1 to 6 solves (the last residual 1.6e-6 to 9.1e-5 K); the
-  gain is 0.0010 at 0.8 V and 0.075 to 0.107 from 1.05 to 1.25 V. The converged current is 0.096 % (0.8 V) to
-  11.892 % (1.15 V) above the one-way current, against 0.096 % to 10.663 % of the one pass (up to 1.23 percentage
-  points less, at 1.15 V). T is 325.21 K at 1.15 V and 366.89 K at 1.3 V. Below the cross-over the shortest L_pi is
-  0.366 mm at 1.05 V (P_pi 14.37 mW; one-way 0.362 mm, 12.98 mW). The cross-over moves 20.6 mV lower: 1.1854 V,
+- Lifetimes 10 ns (the same command; `tau_s` 1e-8): 1 to 6 solves (the last residual 1.6e-6 to 9.1e-5 K); the gain is
+  0.0010 at 0.8 V and 0.075 to 0.107 from 1.05 to 1.25 V. The converged current is 0.096 % (0.8 V) to 11.892 % (1.15
+  V) above the one-way current, against 0.096 % to 10.663 % of the one pass (up to 1.23 percentage points less, at
+  1.15 V). T is 325.21 K at 1.15 V and 366.89 K at 1.3 V. The thermal part grows at every bias (+0.09 % to +11.96 %);
+  the carrier part grows up to 1.25 V (+0.16 %) and falls at 1.3 V (-1.96 %). Below the cross-over the shortest L_pi
+  is 0.366 mm at 1.05 V (P_pi 14.37 mW; one-way 0.362 mm, 12.98 mW). The cross-over moves 20.6 mV lower: 1.1854 V,
   125.4 A/m, 148.7 W/m (between 1.15 and 1.2 V) against 1.2060 V, 128.3 A/m, 154.7 W/m one-way; at 1.2 V the net
-  change has the other sign (+3.9229e-4 against -1.9330e-4). At 1.3 V: net dneff +4.4708e-3 (one-way
-  +3.5577e-3), L_pi 0.173 mm, P_pi 51.4 mW, a core rise of 66.10 K (62.10 K one-way). The loop takes 20.9 s
-  (47 solves); each lifetime of the command takes 49.9 to 51.4 s (the 300 K sweep about 20 s), peak RSS
-  1.91 and 2.00 GiB.
+  change has the other sign (+3.9229e-4 against -1.9330e-4). At 1.3 V: net dneff +4.4708e-3 (one-way +3.5577e-3), L_pi
+  0.173 mm, P_pi 51.4 mW, a core rise of 66.10 K (62.10 K one-way). The loop takes 20.9 s (47 solves); each lifetime
+  of the command takes 49.9 to 51.4 s (the 300 K sweep about 20 s), peak RSS 1.91 and 2.00 GiB.
 - The rise is not uniform over the Si of the charge window: max - min is 0.013 K at 0.8 V and 4.54 K at 1.3 V
   (1 ns), 7.36 K at 1.3 V (10 ns), 8 % to 13 % of the mean rise at every bias of both lifetimes. The loop gives
-  all the Si the mean temperature.
+  all the Si the mean temperature (other weights: "Limits", below).
 
 Limits:
 - Coupling: by default one-way (the carriers at 300 K; the bias scale of the first tables is that of a device at
   300 K). The two-way loop gives the device one temperature, the mean of the Si: charge-gpu has no temperature
   field (a field needs the thermoelectric terms of the current equations), and the field varies by 8 % to 13 % of
-  the mean rise over the Si (above). The temperature models of charge-gpu (n_i of Misiakos and Tsamakis above
+  the mean rise over the Si (above). The choice of the mean changes little
+  (`benchmarks/2026-11-08/suite-pin-4.jsonl`, `--weights`: at the converged state of each bias, one solve at the
+  temperature of each other weight; the change of the current against one-way):
+  - The means weighted by the heat or by the recombination of each cell and the mean of the intrinsic zone move the
+    change by 0.047 percentage points or less at 1 ns (the largest: the heat weight at 1.2 V, +6.836 % against
+    +6.789 %) and by 0.30 points or less at 10 ns (the heat weight at 1.1 V, +11.547 % against +11.252 %).
+  - This is less than the one pass misses at every bias but 0.8 and 0.85 V (1 ns) and 0.8 V (10 ns), where both
+    are below 0.025 points.
+  - The min and the max of the Si (a bracket of every weight; 2.2 K below to 2.4 K above the loop temperature at
+    1 ns, 2.5 K below to 4.9 K above at 10 ns) give -0.43 to +0.38 points at 1 ns and -0.46 to +0.94 points at
+    10 ns.
+  - The test print of `test_the_weight_of_the_device_temperature` (1.2 V, 1 ns) has the values of the row in all
+    printed digits.
+
+  The temperature models of charge-gpu (n_i of Misiakos and Tsamakis above
   340 K is an extrapolation; the mobility of Arora et al.; tau ~ T^-1/2 is an assumption: `charge_gpu/README.md`)
   set the size of the feedback; the plasma dispersion keeps the 300 K coefficients of Soref and Bennett.
 - The heat source has no thermoelectric terms: the full model releases about E_g per recombination and has

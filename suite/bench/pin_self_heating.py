@@ -17,9 +17,15 @@ change of the current (the size of the electro-thermal feedback that the workflo
 --two-way: the self-consistent loop (pin.electrothermal: the drift-diffusion at 300 K plus the mean rise of the Si
 that its own heat makes, to |residual| <= --loop-tol K, with --damping); the rows give the two-way values, the loop
 record (the device temperature, the solves, the residual per step, the spread of the rise over the Si, the one-pass
-current of step 1) and the one-way values of the same run (keys ending in _one_way).
+current of step 1, which is not damped) and the one-way values of the same run (keys ending in _one_way).
+--weights (with --two-way): the size of the choice of the device temperature. At the converged state, the other
+means of pin.device_temperatures (weighted by the heat or the recombination of each cell, the intrinsic zone, the min
+and the max of the Si) and one drift-diffusion solve at each from the converged solution: "weights_T_K" and
+"weights_I_rel_one_way" (the current against the one-way current, as I_rel_one_way).
 
     bash tools/gpu_run.sh suite python bench/pin_self_heating.py --two-way --tau 1e-9 1e-8 \
+        --biases 0.8 0.85 0.9 0.95 1.0 1.05 1.1 1.15 1.2 1.25 1.3
+    bash tools/gpu_run.sh suite python bench/pin_self_heating.py --two-way --weights --tau 1e-9 1e-8 \
         --biases 0.8 0.85 0.9 0.95 1.0 1.05 1.1 1.15 1.2 1.25 1.3
 
 The thermal environment (the default: the window and the substrate +-5 um wide, a substrate 3 um deep with its bottom
@@ -39,8 +45,8 @@ import resource
 import time
 
 import photonsuite  # noqa: F401  (float64 in JAX)
-from photonsuite.physics import Window
-from photonsuite.pin import DRIFT_DIFFUSION, electrothermal, pin_electrical, pin_optical, pin_rib
+from photonsuite.physics import ConvergenceError, Window
+from photonsuite.pin import DRIFT_DIFFUSION, device_temperatures, electrothermal, pin_electrical, pin_optical, pin_rib
 
 WL = 1.55
 BIASES = [0.8, 0.85, 0.9, 0.95, 1.0, 1.05, 1.1, 1.15, 1.2]
@@ -60,10 +66,13 @@ def main():
     ap.add_argument("--heat-sink", action="store_true", help="the slab to the window sides, the sides at 300 K")
     ap.add_argument("--two-way", action="store_true", help="the self-consistent electro-thermal loop")
     ap.add_argument("--loop-tol", type=float, default=1e-4, help="two-way: the stop rule |residual| <= tol (K)")
-    ap.add_argument("--damping", type=float, default=1.0, help="two-way: T_next = T + damping residual")
+    ap.add_argument("--damping", type=float, default=1.0, help="two-way: T_next = T + damping residual (step 2 on)")
+    ap.add_argument("--weights", action="store_true", help="two-way: the current at other device temperatures")
     args = ap.parse_args()
     if args.two_way and args.device_temperature:
         ap.error("--two-way and --device-temperature: the two-way rows give the one-pass current (I_one_pass_rel)")
+    if args.weights and not args.two_way:
+        ap.error("--weights needs --two-way")
     w = args.thermal_half_width
     xs = pin_rib(substrate_half_width=w, substrate=args.substrate_depth,
                  slab_half_width=w if args.heat_sink else None)
@@ -121,6 +130,17 @@ def main():
                            dneff_thermal_one_way=float(one.dneff_thermal[k].real),
                            dneff_one_way=[one.dneff[k].real, one.dneff[k].imag],
                            L_pi_one_way_mm=float(one.l_pi[k] * 1e3), P_pi_one_way_mW=float(one.p_pi[k] * 1e3))
+            if args.weights:
+                from charge_gpu import drift_diffusion as dd
+                tw = device_temperatures(el.device, sol, r.temperatures[k])
+                rel = {}
+                for name, t in tw.items():
+                    s_w = dd.solve(dataclasses.replace(el.device, T=t), 0.0, float(v), guess=sol, tau_n=tau,
+                                   tau_p=tau)
+                    if not s_w.converged:
+                        raise ConvergenceError(f"drift-diffusion at {v} V and {t:.4f} K ({name}): not converged")
+                    rel[name] = float(s_w.current / one.current[k] - 1)
+                row.update(weights_T_K=tw, weights_I_rel_one_way=rel)
             if args.device_temperature:
                 from charge_gpu import drift_diffusion as dd
                 hot = dataclasses.replace(el.device, T=300.0 + float(r.rise_semiconductor[k]))

@@ -1,6 +1,8 @@
 """The fdtd_gpu adapter (photonsuite.fdtd_avg): the axes and the shapes map to the suite's device (staircase and
-subpixel average), a straight guide transmits 1, and the taper of bench/eme_fdtd_taper.py approaches the EME. Needs
-fdtd_gpu and fdtdx: it runs in the GPU environment and is skipped elsewhere."""
+subpixel average), the planes stay off the segment ends, and a straight guide transmits 1: without the calibration
+of the mode factor b, with it (calibrate=True, the default of mode_transmission), and with the parity "tm". The taper
+of bench/eme_fdtd_taper.py against the EME is not a test (its rows are logged: README). Needs fdtd_gpu and fdtdx: it
+runs in the GPU environment and is skipped elsewhere."""
 import numpy as np
 import pytest
 
@@ -81,4 +83,50 @@ def test_straight_guide_transmits_one():
     assert np.all((share > 0.9) & (share < 1.01))
     # the phase of a_out / a_in gives the index of the FDTD propagation: near the mode solver (the Yee dispersion)
     assert r.run.distance == pytest.approx(1.5, abs=0.05)
+    assert np.all(np.abs(r.run.phase_index(r.wavelengths, r.run.neff_out) - r.run.neff_out) < 0.05)
+
+
+@pytest.fixture(scope="module")
+def calibrated():
+    """A straight guide with calibrate=True: the device run and the two calibration runs are the same simulation."""
+    xs = CrossSection(SIO2, (Rect(-0.25, 0.25, 0.0, 0.22, SI),))
+    return mode_transmission([Segment(0.0, 3.0, xs)], *WIN, [1.5, 1.55, 1.6], 20.0)
+
+
+def test_the_calibrated_path_of_a_straight_guide(calibrated):
+    """Review cfae980e777a: only the bench rows ran calibrate=True. b_in and b_out are |alpha|^2 / P at the output
+    plane of the two calibration runs (straight guides of the input and the output cross-section, the same length,
+    ports and grid). For a straight guide the three runs are the same simulation: b_in = b_out = the b of the device
+    run, and T00 = T00_raw is near 1."""
+    r = calibrated
+    assert len(r.calibration) == 2
+    for b, c in ((r.b_in, r.calibration[0]), (r.b_out, r.calibration[1])):
+        np.testing.assert_array_equal(b, np.abs(c.a_out) ** 2 / c.p_out)
+    b_run = np.abs(r.run.a_out) ** 2 / r.run.p_out
+    print("calibrated straight guide: b_in", r.b_in, "b_out / b of the device run - 1", r.b_out / b_run - 1,
+          "T00 - 1", r.T00 - 1, "input_mode_share - 1", r.input_mode_share - 1)
+    assert np.all((r.b_in > 0.9) & (r.b_in < 1.01))
+    np.testing.assert_allclose(r.b_out, r.b_in, rtol=1e-5, atol=0)
+    np.testing.assert_allclose(r.b_out, b_run, rtol=1e-5, atol=0)
+    np.testing.assert_allclose(r.T00, r.T00_raw * r.b_in / r.b_out, rtol=1e-12, atol=0)
+    assert np.all(np.abs(r.T00 - 1) < 3e-3)
+    assert np.all(np.abs(r.input_mode_share - 1) < 5e-3)        # |a_in|^2 / b_in / P_in: the input is the mode
+
+
+def test_the_tm_parity():
+    """parity "tm" (ODD_Z of fdtd_gpu: E mostly vertical; the run stops on the decay of Ez): the source and the
+    monitors take the TM0 mode of the 0.5 um strip (index about 1.77 at 1.55 um, below the TE0 index 2.45), and a
+    straight guide transmits it. The TM0 field reaches farther into the cladding: in the window of the TE tests
+    (y -0.8 to 1.0 um) T00 was 0.99725 at 1.6 um (test print; 0.99857 in the taller window here)."""
+    xs = CrossSection(SIO2, (Rect(-0.25, 0.25, 0.0, 0.22, SI),))
+    r = mode_transmission([Segment(0.0, 3.0, xs)], WIN[0], (-1.2, 1.4), [1.5, 1.55, 1.6], 20.0, parity="tm",
+                          calibrate=False)
+    b = np.abs(r.run.a_out) ** 2 / r.run.p_out
+    print(f"tm: neff_in {r.run.neff_in}, neff_out {r.run.neff_out}, T00 - 1 {r.T00 - 1}, T_flux - 1 {r.T_flux - 1}, "
+          f"b {b}, phase index {r.run.phase_index(r.wavelengths, r.run.neff_out)}")
+    assert np.all((r.run.neff_out > 1.6) & (r.run.neff_out < 1.9))           # TM0, not TE0
+    assert np.all(np.abs(r.run.neff_in - r.run.neff_out) < 1e-3)
+    assert np.all(np.abs(r.T00 - 1) < 3e-3)
+    assert np.all(np.abs(r.T_flux - 1) < 1e-2)
+    assert np.all((b > 0.9) & (b < 1.01))
     assert np.all(np.abs(r.run.phase_index(r.wavelengths, r.run.neff_out) - r.run.neff_out) < 0.05)

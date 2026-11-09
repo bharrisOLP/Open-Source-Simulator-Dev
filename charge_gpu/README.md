@@ -130,7 +130,9 @@ and the results of `poisson.py` and `rc.py` do not change):
 
   The currents are J / q integrated over the face (1/(m s), per m of device length); `current()` and
   `contact_current()` give the total in A/m. For each contact, the sum of its contact faces is
-  `contact_currents`. Use: the heat source of a solution (`photonsuite.pin`), current paths, cell balances.
+  `contact_currents`. The arrays are copies (a change of one does not change the solution or its mesh), and two
+  `FaceCurrents` are equal only when they are the same object (no comparison of the arrays). Use: the heat source
+  of a solution (`photonsuite.pin`), current paths, cell balances.
 
 ### The continuity steps on the device (`continuity.py`)
 
@@ -308,7 +310,7 @@ the RX 7900 XT). The 1-D junction is the one of `test_junction.py` (1e18 cm^-3 b
 | the same, 0.8 and 0.9 V | high injection: quasi-neutral, below the limit n_i exp(V / 2 V_T) | p - n = the background 1e15 cm^-3 to 5 %; n rises, the index falls, the loss rises |
 | B(x), B'(x), the Jacobian | identities and central differences | 1e-13; 1e-7; 1e-6 |
 | 2-D block with an xmin contact and a ymax contact (L-shaped path), 0.4 V | the contact currents sum to zero | 1.7e-8 of I (round-off; test 1e-7); `x_currents` refuses this device (x faces only) |
-| `face_currents()`, 2-D PIN rib (10 nm cells, contacts 1 um from the center), 0.8 and 0.9 V | the terminal current I' through every column boundary (the sum of the x faces); `contact_currents` (the sum of the contact faces); the continuity equations of each cell (electrons out = R A, holes out = -R A, with `recombination()`); the arrays of the solver | 9.9e-13 and 3.0e-13 of I'; the largest cell residual 1.3e-12 and 1.6e-13 of I' / q (tests 1e-9 and 1e-8); the same arrays, bit for bit (test prints) |
+| `face_currents()`, 2-D PIN rib (10 nm cells, contacts 1 um from the center), 0.8 and 0.9 V | the terminal current I' through every column boundary (the sum of the x faces); `contact_currents` (the sum of the contact faces); the continuity equations of each cell (electrons out = R A, holes out = -R A, with `recombination()`); the arrays of the solver; copies, not views (both devices) | 9.9e-13 and 3.0e-13 of I'; the largest cell residual 1.3e-12 and 1.6e-13 of I' / q (tests 1e-9 and 1e-8); the same arrays, bit for bit (test prints); no array of `FaceCurrents` shares memory with the mesh or the solution, `==` is the identity |
 | `face_currents()`, the L-shaped block, 0.4 V | the current of the y faces through each cut between two rows = the current out of the contact faces above the cut; the cell continuity | 5.1e-8 of I' and 2.9e-8 of I' / q (I' = 7.5e-6 A/m: round-off, as in the row above; test 1e-7) (test prints) |
 | `sweep` with a RuntimeError of the linear solver in one step | the step is halved and the sweep goes on | 0.1 V reached through 0.05 V; `guess=` is refused |
 | `rib_pin` with 20 nm cells | the boundaries must be on cell edges | ValueError (a 20 nm grid made the 90 nm slab 80 nm thick) |

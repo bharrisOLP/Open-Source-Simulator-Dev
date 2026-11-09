@@ -256,6 +256,25 @@ def _heat_and_temperature(xs, thermal, sol, v, heat, xe, ye, t_ambient, top_h, s
     return hs, q, steady_temperature(xs, thermal, q, t_ambient, top_h, side_temperature)
 
 
+def _check_loop(tol, damping, max_iter, options):
+    """The options of electrothermal (pin_phase_shifter checks them before the sweep). options: those of the sweep."""
+    if not tol > 0:
+        raise ValueError("tol: a positive change of the device temperature (K)")
+    if not 0 < damping <= 1:
+        raise ValueError("damping: 0 < damping <= 1")
+    if int(max_iter) < 1:
+        raise ValueError("max_iter: at least 1")
+    if "mobility" in options:
+        raise ValueError("a user mobility is the value at one temperature: the loop needs the temperature model of "
+                         "charge-gpu (no mobility= in pin_electrical)")
+
+
+def _check_plasma(wavelength, plasma):
+    if plasma is None and abs(wavelength - 1.55) > 1e-9:
+        raise ValueError("the default plasma dispersion (Soref and Bennett) is the fit at 1.55 um: give plasma= for "
+                         "another wavelength")
+
+
 @dataclass
 class ElectroThermal:
     """The record of the electro-thermal loop (electrothermal), per bias."""
@@ -266,7 +285,7 @@ class ElectroThermal:
     #                             step; step 0 is the 300 K solution of the sweep (the one-way result), step k the
     #                             k-th solve (step 1 is the one-pass feedback); residual = T from the heat - T
     tol: float                  # K: the stop rule |residual| <= tol
-    damping: float              # T_next = T + damping residual
+    damping: float              # from step 2: T_next = T + damping residual (step 1 is not damped)
     seconds: float              # the time of the loop
 
     @property
@@ -286,11 +305,14 @@ def electrothermal(xs: CrossSection, thermal: Window, electrical: PinElectrical,
     window (the rise_semiconductor of pin_optical); the spread of the field over these cells is in the record.
     The fixed-point iteration, from the 300 K solution of the sweep:
         G(T) = t_ambient + the mean rise of the heat of the solution at T (heat and thermal model of pin_optical)
-        T_1 = G(300 K); then T_k+1 = T_k + damping (G(T_k) - T_k), until |G(T_k) - T_k| <= tol (K)
+        T_1 = G(300 K) for every damping; then T_k+1 = T_k + damping (G(T_k) - T_k), until |G(T_k) - T_k| <= tol (K)
     Each step solves the drift-diffusion at Device.T = T_k from the last solution (Newton; the options of the sweep).
-    Step 1 is the one-pass feedback of the bench (the device at 300 K plus the rise of the 300 K heat). The loop
-    converges when the gain dG/dT (the rise times the relative change of the current per K) is below 1; damping < 1
-    is for a gain near 1. Raises ConvergenceError after max_iter solves, or when a solve does not converge.
+    Step 1 is the one-pass feedback of the bench (the device at 300 K plus the rise of the 300 K heat), also with
+    damping < 1. With the gain G' = dG/dT (the rise times the relative change of the current per K), a damped step
+    multiplies the residual by about 1 - damping (1 - G'). Damping 1 converges for |G'| < 1. Here the feedback is
+    positive (a hotter device carries more current: 0 < G' < 1), and damping < 1 only makes the loop slower. Damping
+    helps for a negative gain (an oscillation; G' <= -1 needs damping < 2 / (1 - G')). For G' >= 1 (thermal runaway)
+    no damping converges. Raises ConvergenceError after max_iter solves, or when a solve does not converge.
 
     Returns a PinElectrical with the converged solutions (the same device, window, biases and 0 V reference at 300 K)
     and .loop (ElectroThermal); pin_optical takes it as it is. heat, t_ambient, top_h and side_temperature must be
@@ -298,17 +320,9 @@ def electrothermal(xs: CrossSection, thermal: Window, electrical: PinElectrical,
     from charge_gpu import drift_diffusion as dd
     from charge_gpu.temperature import T_REF
 
-    if not tol > 0:
-        raise ValueError("tol: a positive change of the device temperature (K)")
-    if not 0 < damping <= 1:
-        raise ValueError("damping: 0 < damping <= 1")
-    if int(max_iter) < 1:
-        raise ValueError("max_iter: at least 1")
+    _check_loop(tol, damping, max_iter, electrical.options)
     if electrical.tau is None:
         raise ValueError("electrical.tau is None: use the PinElectrical of pin_electrical")
-    if "mobility" in electrical.options:
-        raise ValueError("a user mobility is the value at one temperature: the loop needs the temperature model of "
-                         "charge-gpu (no mobility= in pin_electrical)")
     dev = electrical.device
     if dev.T != T_REF:
         raise ValueError(f"the device of pin_electrical must be at {T_REF} K, not {dev.T} K")
@@ -325,8 +339,8 @@ def electrothermal(xs: CrossSection, thermal: Window, electrical: PinElectrical,
         t_dev, s = float(dev.T), sol
         t_new, spread = g(s, v)
         rows = [(t_dev, s.current, t_new, t_new - t_dev)]
-        for _ in range(int(max_iter)):
-            t_dev = t_dev + damping * (t_new - t_dev)
+        for step in range(int(max_iter)):
+            t_dev = t_new if step == 0 else t_dev + damping * (t_new - t_dev)      # step 1: the one-pass feedback
             s = dd.solve(dataclasses.replace(dev, T=t_dev), 0.0, float(v), guess=s, tau_n=electrical.tau,
                          tau_p=electrical.tau, **electrical.options)
             if not s.converged:
@@ -346,6 +360,30 @@ def electrothermal(xs: CrossSection, thermal: Window, electrical: PinElectrical,
     loop = ElectroThermal(np.array(temps), np.array(spreads), np.array(iters), history, float(tol), float(damping),
                           time.perf_counter() - t0)
     return dataclasses.replace(electrical, solutions=sols, loop=loop)
+
+
+def device_temperatures(dev, sol, th, t_ambient: float = 300.0, intrinsic: float = 1e22) -> dict:
+    """Other choices of the one device temperature of charge-gpu (K), from the steady temperature th
+    (physics.Temperature, for example PinPhaseShifter.temperatures[k]) and the solution sol of the same bias: the
+    size of the choice of electrothermal (README, two-way coupling). Each value is t_ambient plus a mean of the rise
+    at the centers of the Si cells of the charge Device dev:
+    "area": the area mean (the choice of electrothermal and of rise_semiconductor);
+    "heat": weighted by the drift-diffusion heat of each cell (heat_source(sol).total; negative round-off set to 0);
+    "recombination": weighted by R A of each cell (where the carriers recombine);
+    "intrinsic": the area mean over the cells with |N_D - N_A| < intrinsic (m^-3; default 1e16 cm^-3);
+    "min" and "max": the lowest and the highest rise (a bracket of every weight)."""
+    _, _, _, _, semi_area, semi_pts = _charge_cells(dev)
+    semi = np.asarray(dev.semiconductor, bool)
+    rise = th.rise(semi_pts)
+    area = semi_area[semi]
+
+    def mean(w):
+        return t_ambient + float(np.sum(w * rise) / np.sum(w))
+
+    return {"area": mean(area), "heat": mean(np.clip(heat_source(sol).total[semi], 0.0, None)),
+            "recombination": mean(np.asarray(sol.recombination())[semi] * area),
+            "intrinsic": mean(area * (np.abs(np.asarray(dev.n_net)[semi]) < intrinsic)),
+            "min": t_ambient + float(np.min(rise)), "max": t_ambient + float(np.max(rise))}
 
 
 def carrier_index(sol, ref, xc, yc, wavelength: float, step: float, sub: int = 8, plasma=None):
@@ -459,9 +497,7 @@ def pin_optical(xs: CrossSection, optics: Window, thermal: Window, wavelength: f
     from photonsuite.switching import index_weights
 
     _require_x64()
-    if plasma is None and abs(wavelength - 1.55) > 1e-9:
-        raise ValueError("the default plasma dispersion (Soref and Bennett) is the fit at 1.55 um: give plasma= for "
-                         "another wavelength")
+    _check_plasma(wavelength, plasma)
     t0 = time.perf_counter()
     dev = electrical.device
     xe, ye, xc, yc, semi_area, semi_pts = _charge_cells(dev)
@@ -524,9 +560,14 @@ def pin_phase_shifter(xs: CrossSection, optics: Window, charge: Window, thermal:
                       loop_damping: float = 1.0, loop_max_iter: int = 30, **kw) -> PinPhaseShifter:
     """pin_electrical, then pin_optical (module docstring). kw goes to charge_gpu.drift_diffusion.sweep.
     coupling: "one-way" (the default: the carriers at 300 K) or "two-way" (electrothermal between the two, with
-    tol=loop_tol (K), damping=loop_damping and max_iter=loop_max_iter; the record in result.electrical.loop)."""
+    tol=loop_tol (K), damping=loop_damping and max_iter=loop_max_iter; the record in result.electrical.loop).
+    The wavelength of the default plasma dispersion and the options of the loop are checked before the
+    drift-diffusion sweep."""
     if coupling not in ("one-way", "two-way"):
         raise ValueError(f"coupling must be 'one-way' or 'two-way', not {coupling!r}")
+    _check_plasma(wavelength, plasma)
+    if coupling == "two-way":
+        _check_loop(loop_tol, loop_damping, loop_max_iter, kw)
     el = pin_electrical(xs, charge, biases, tau, **kw)
     if coupling == "two-way":
         el = electrothermal(xs, thermal, el, heat, t_ambient, top_h, side_temperature, loop_tol, loop_damping,

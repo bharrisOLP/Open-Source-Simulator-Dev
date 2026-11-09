@@ -527,7 +527,7 @@ def _gummel(dev, m: _Mesh, psi, n, p, tau_n, tau_p, tol, max_iter, linear="super
     return psi, n, p, max_iter, False, err, stats
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, eq=False)
 class FaceCurrents:
     """The Scharfetter-Gummel face currents of a solution (DDSolution.face_currents), with the geometry of the faces:
     the numbers of the continuity equations of the solver, not a recomputation.
@@ -543,7 +543,11 @@ class FaceCurrents:
     jnc and jpc are the electron and the hole current from the cell to the contact node (out of the device); the
     node is half a cell from the cell center and has the potential contact_psi and both quasi-Fermi levels at the
     contact voltage contact_voltage. For each contact k, poisson.Q times the sum of jnc + jpc over contact == k is
-    DDSolution.contact_currents[k]."""
+    DDSolution.contact_currents[k].
+
+    The arrays are copies: a change of an array does not change the solution or its mesh. Two FaceCurrents compare
+    equal only when they are the same object (eq=False: the arrays have no single truth value), and the hash is that
+    of the object."""
 
     shape: tuple                 # (nx, ny)
     semiconductor: np.ndarray    # (nx, ny) bool: the cells with carriers
@@ -636,9 +640,10 @@ class DDSolution:
                                                          self.n.ravel()[m.sflat], self.p.ravel()[m.sflat])
         semi = np.zeros(m.n_cells, bool)
         semi[m.sflat] = True
-        return FaceCurrents(shape=tuple(m.shape), semiconductor=semi.reshape(m.shape), area=m.vol.reshape(m.shape),
-                            a=m.fa.copy(), b=m.fb.copy(), axis=np.where(m.fcol >= 0, 0, 1), jn=jn, jp=jp,
-                            contact_cell=m.cflat.copy(), contact=m.cid.copy(), contact_psi=m.cpsi.copy(),
+        return FaceCurrents(shape=tuple(m.shape), semiconductor=semi.reshape(m.shape),
+                            area=m.vol.reshape(m.shape).copy(), a=m.fa.copy(), b=m.fb.copy(),
+                            axis=np.where(m.fcol >= 0, 0, 1), jn=jn, jp=jp, contact_cell=m.cflat.copy(),
+                            contact=m.cid.copy(), contact_psi=m.cpsi.copy(),
                             contact_voltage=np.where(np.asarray(self.contact_kinds)[m.cid] == "n", self.v_n,
                                                      self.v_p),
                             jnc=jnc, jpc=jpc)
