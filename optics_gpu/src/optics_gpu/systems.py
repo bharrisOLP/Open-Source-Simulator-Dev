@@ -4,6 +4,8 @@
   2.5x lens pair of examples/chip_to_fiber_coupling.py with the default values).
 - aberrated_singlet: a plano-convex singlet (R = 10 mm, n = 1.5, 3 mm thick) at 2f-2f with strong spherical
   aberration, and a physical stop of 6 mm diameter (RadialAperture) on its first surface.
+- dispersive_singlet: the same singlet in a glass with dispersion (n_d and V_d of N-BK7), three object heights
+  and the wavelengths F, d and C: axial and lateral color.
 - ideal_relay: two equal ideal thin lenses (f) in a 4f arrangement with a physical stop of radius r_stop on lens 1:
   a perfect imager of the axis point (magnification -1), image-side NA r / sqrt(r^2 + f^2); the image surface
   can be moved by dz after the back focus (a pure defocus).
@@ -42,6 +44,31 @@ def aberrated_singlet(wl: float = 1.55) -> Optic:
     o.set_field_type(field_type="object_height")
     o.add_field(y=0.0)
     o.add_wavelength(value=wl, is_primary=True)
+    o.image_solve()
+    return o
+
+
+def dispersive_singlet(fields=(0.0, 0.5, 1.0)) -> Optic:
+    """The singlet of aberrated_singlet in a glass with dispersion: AbbeMaterial (Optiland's "polynomial" model,
+    its default in 0.6.3) with n_d = 1.5168 and V_d = 64.17 (the catalog values of Schott N-BK7), point objects at
+    the heights `fields` (mm) 40 mm in front of it, the wavelengths F, d and C (0.4861, 0.5876 (primary) and
+    0.6563 um), the image surface at the paraxial focus of d (image_solve). It has axial and lateral color (the
+    lateral color off the axis)."""
+    from optiland.materials import AbbeMaterial
+    from optiland.physical_apertures import RadialAperture
+
+    glass = AbbeMaterial(n=1.5168, abbe=64.17, model="polynomial")
+    o = Optic()
+    o.add_surface(index=0, thickness=40.0)
+    o.add_surface(index=1, radius=10.0, thickness=3.0, material=glass, is_stop=True, aperture=RadialAperture(r_max=3.0))
+    o.add_surface(index=2, radius=np.inf, thickness=1.0)
+    o.add_surface(index=3)
+    o.set_aperture(aperture_type="EPD", value=6.0)
+    o.set_field_type(field_type="object_height")
+    for y in fields:
+        o.add_field(y=float(y))
+    for wl in (0.4861, 0.5876, 0.6563):
+        o.add_wavelength(value=wl, is_primary=wl == 0.5876)
     o.image_solve()
     return o
 

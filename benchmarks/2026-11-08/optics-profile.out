@@ -1,0 +1,35 @@
+{"system": "singlet", "device": "cuda", "pupil": 64, "repeat": 5, "xpp_ms": 0.34040700120385736, "to_dict_ms": 0.01734300167299807, "check_ref_ms": 1.311312007601373, "from_dict_ms": 1.0383929911768064, "check_copy_ms": 13.47690999682527, "five_ms": 12.514420988736674, "aim_ms": 8.974413009127602, "surfaces_5_ms": 2.750195999396965, "main_ms": 12.958755003637634, "call_ms": 9.089963001315482, "call_cold_ms": 12.899712994112633, "time": "2026-11-08T17:54:03-0500", "torch": "2.14.1+rocm7.2", "host_reads": 88, "item_calls": 88, "aten_ops": 2639, "top_ops": [["aten::empty", 207], ["aten::to", 189], ["aten::as_strided", 188], ["aten::mul", 162], ["aten::copy_", 104], ["aten::empty_strided", 100], ["aten::add", 94], ["aten::detach", 90]]}
+{"system": "singlet", "device": "cuda", "pupil": 256, "repeat": 5, "xpp_ms": 0.3459069994278252, "to_dict_ms": 0.01721300941426307, "check_ref_ms": 1.3032470014877617, "from_dict_ms": 1.0669170005712658, "check_copy_ms": 13.278181999339722, "five_ms": 12.494823007727973, "aim_ms": 8.929777992307208, "surfaces_5_ms": 2.7566390053834766, "main_ms": 13.365236998652108, "call_ms": 9.960837996914051, "call_cold_ms": 13.378251998801716, "time": "2026-11-08T17:54:06-0500", "torch": "2.14.1+rocm7.2", "host_reads": 88, "item_calls": 88, "aten_ops": 2639, "top_ops": [["aten::empty", 207], ["aten::to", 189], ["aten::as_strided", 188], ["aten::mul", 162], ["aten::copy_", 104], ["aten::empty_strided", 100], ["aten::add", 94], ["aten::detach", 90]]}
+         56794 function calls (56524 primitive calls) in 0.101 seconds
+
+   Ordered by: cumulative time
+   List reduced from 187 to 25 due to restriction <25>
+
+   ncalls  tottime  percall  cumtime  percall filename:lineno(function)
+       10    0.000    0.000    0.101    0.010 <repo>/.venv-optics/lib/python3.12/site-packages/optiland/rays/ray_aiming/paraxi
+       10    0.001    0.000    0.101    0.010 <repo>/.venv-optics/lib/python3.12/site-packages/optiland/rays/ray_aiming/paraxi
+       30    0.000    0.000    0.086    0.003 <repo>/.venv-optics/lib/python3.12/site-packages/optiland/surfaces/surface_group
+       30    0.003    0.000    0.086    0.003 <repo>/.venv-optics/lib/python3.12/site-packages/optiland/paraxial_path.py:594(b
+       10    0.000    0.000    0.036    0.004 <repo>/.venv-optics/lib/python3.12/site-packages/optiland/fields/field_types/obj
+       10    0.000    0.000    0.030    0.003 <repo>/.venv-optics/lib/python3.12/site-packages/optiland/fields/field_types/bas
+       10    0.000    0.000    0.029    0.003 <repo>/.venv-optics/lib/python3.12/site-packages/optiland/paraxial.py:308(entran
+       10    0.000    0.000    0.029    0.003 <repo>/.venv-optics/lib/python3.12/site-packages/optiland/surfaces/surface_group
+      900    0.001    0.000    0.024    0.000 <repo>/.venv-optics/lib/python3.12/site-packages/optiland/paraxial_path.py:222(_
+     2320    0.001    0.000    0.020    0.000 <repo>/.venv-optics/lib/python3.12/site-packages/optiland/backend/torch_backend/
+      900    0.001    0.000    0.020    0.000 <repo>/.venv-optics/lib/python3.12/site-packages/optiland/backend/utils.py:38(to
+      900    0.001    0.000    0.019    0.000 <repo>/.venv-optics/lib/python3.12/site-packages/optiland/backend/utils.py:25(to
+      850    0.018    0.000    0.018    0.000 {built-in method torch.tensor}
+      900    0.016    0.000    0.016    0.000 {method 'cpu' of 'torch._C.TensorBase' objects}
+      710    0.014    0.000    0.014    0.000 {method 'item' of 'torch._C.TensorBase' objects}
+      120    0.005    0.000    0.012    0.000 <repo>/.venv-optics/lib/python3.12/site-packages/optiland/coordinate_system.py:1
+      420    0.000    0.000    0.011    0.000 <repo>/.venv-optics/lib/python3.12/site-packages/optiland/backend/torch_backend/
+       90    0.000    0.000    0.010    0.000 <repo>/.venv-optics/lib/python3.12/site-packages/optiland/paraxial_path.py:572(_
+       30    0.000    0.000    0.009    0.000 <repo>/.venv-optics/lib/python3.12/site-packages/optiland/paraxial_path.py:248(_
+       30    0.000    0.000    0.009    0.000 {built-in method builtins.all}
+      120    0.000    0.000    0.009    0.000 <repo>/.venv-optics/lib/python3.12/site-packages/optiland/paraxial_path.py:249(<
+       30    0.001    0.000    0.008    0.000 <repo>/.venv-optics/lib/python3.12/site-packages/optiland/paraxial_path.py:536(_
+      240    0.000    0.000    0.006    0.000 <repo>/.venv-optics/lib/python3.12/site-packages/optiland/backend/torch_backend/
+       30    0.001    0.000    0.005    0.000 <repo>/.venv-optics/lib/python3.12/site-packages/optiland/paraxial_path.py:252(t
+      280    0.000    0.000    0.005    0.000 {built-in method builtins.any}
+
+

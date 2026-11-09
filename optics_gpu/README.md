@@ -24,6 +24,9 @@ fit = zernike_fit(wf, 36, "fringe")      # or "noll"; fit.coeffs in waves
 psf = fft_psf(wf, grid_size=1024)        # psf.psf: peak 1 for a perfect pupil (Strehl units); psf.dx in um
 mtf = fft_mtf(wf, psf)                   # mtf.tangential, mtf.sagittal against mtf.freq_tan, mtf.freq_sag (cycles/mm)
 I = huygens_psf(optic, 1.55, x_img_um, y_img_um, device="cuda")   # the second PSF method: the image sum
+
+from optics_gpu.analysis import image_quality       # fields x wavelengths x planes in one batch ("Batches")
+res = image_quality(optic, [(0, 0), (0, 1)], [0.4861, 0.5876, 0.6563], dz=[-50, 0, 50], weights=[1, 2, 1])
 ```
 
 ## Method (`src/optics_gpu/pop.py`)
@@ -411,7 +414,8 @@ Each Optiland call is timed alone: `ScalarFFTPSF` and `ScalarFFTMTF` trace their
   256), and 102 ms for 3.29e6 rays. Up to N = 256 this cost is larger than Optiland's whole FFT PSF or FFT MTF,
   so the GPU path is slower (0.10x to 0.39x for the PSF, 0.20x to 0.54x for the MTF). The cost is in the trace
   step; the rows do not split it into its parts (the copy of the optic and its check rays, the small traces, the
-  launches of Optiland's PyTorch trace).
+  launches of Optiland's PyTorch trace). These rows are of the code of 66da5d3: "Batch timings" below gives the
+  parts of this cost, the changes that cut it, and new rows (the PSF faster from N = 256, the MTF from N = 128).
 - **Faster from N = 512.** The PSF and the MTF are faster on the GPU from N = 512 on: 1.23x and 1.51x at N = 512,
   12.0x and 13.8x at N = 2048. In these rows the crossover is between N = 256 and N = 512. The trace step alone
   is still slower at N = 512 (47.4 ms against 41.2 ms) and faster from N = 1024 (3.85x at 1024, 7.78x at 2048).
@@ -434,6 +438,189 @@ in the review `reviews/2026-11-08-0e8cf1910c4b.md`; not in a logged row). Optila
 `HuygensPSF` runs numba kernels: these rows log `threads` 16 (PyTorch, after that call), so it probably ran with
 16 numba threads (the probable cause in the review record: numba's OpenMP layer sets the shared thread count to the
 CPU count), not with the 4 threads of the other rows.
+
+## Batches: fields, wavelengths, through focus, polychromatic (`src/optics_gpu/analysis.py`, items 7 to 10)
+
+```python
+from optics_gpu.analysis import defocus, fft_mtfs, fft_psfs, image_quality, polychromatic_psf, pupil_wavefronts
+fcd = [0.4861, 0.5876, 0.6563]
+wfs = pupil_wavefronts(optic, [(0, 0), (0, 0.5), (0, 1)], fcd, n_pupil=256, device="cuda")   # wfs[field][wl]
+planes = [defocus(wfs[0][1], dz) for dz in np.linspace(-100, 100, 9)]   # um along z: no new trace
+psfs = fft_psfs(planes, 512)              # all planes in one batched FFT; fft_mtfs(planes, psfs) for the MTFs
+poly = polychromatic_psf(wfs[2], weights=[1, 2, 1])   # one common grid; poly.shift: the lateral color (um)
+res = image_quality(optic, fields, fcd, dz=[-50, 0, 50], weights=[1, 2, 1], n_pupil=256, device="cuda")
+res.psfs[f][i][z].psf, res.mtfs[f][i][z].tangential, res.poly_psfs[f][z].psf, res.poly_mtfs[f][z].sagittal
+```
+
+**The fixed cost of one call.** The code of 66da5d3 made a new PyTorch copy of the optic in each `pupil_wavefront`
+call (`Optic.to_dict`, then `Optic.from_dict`) and traced three times through the copy: the 6 check rays, the chief
+ray with the four marginal rays, and the pupil rays. Each Optiland `trace_generic` call runs the paraxial ray
+aiming, and the aiming builds the paraxial path of the optic (`SurfaceGroup.build_paraxial_path`: the frames of
+all surfaces, with many small device-to-host copies) three times; the surface trace of a few rays also has a fixed
+cost. `bench/profile_wavefront.py` makes these steps again with Optiland's functions and times each one on the GPU
+(the numbers are in "Batch timings" below). Changes (item 7 of the module docstring):
+1. One trace for each block of rays of one wavelength: the check rays and the 5 rays of each field go into the
+   first block with the pupil rays, and the rays of all fields at one wavelength go into the same blocks
+   (`pupil_wavefronts`). `pupil_wavefront` is `pupil_wavefronts` for one field and one wavelength.
+2. The PyTorch copy is kept for each state of the optic and each device (`COPY_CACHE` = 8 copies, the least
+   recently used goes first; the key is the SHA-256 of the pickled `Optic.to_dict()`; `clear_copy_cache()` forgets
+   them). Nothing changes the copy, so its paraxial path is made one time and kept on the copy (Optiland rebuilds
+   it on each call because the geometry of an optic can change; the key changes when the optic changes).
+3. The check rays still go through the original optic (NumPy, one trace for each wavelength with all fields) in
+   each call. Thus a change of the optic that its dictionary does not keep still stops the call with a
+   RuntimeError, as before.
+
+**Through focus** (`defocus(wf, dz)`, item 8). The image plane moves by dz (um) along +z. Each ray of the pupil
+grid is a straight line in image space from its point on the reference sphere; `defocus` finds its point on the
+moved plane and its optical path back to the new reference sphere (center: the chief-ray point on the moved plane;
+radius: the distance from there to the exit-pupil point). This is the calculation of a new trace to the moved image
+surface, without the trace, when the exit-pupil point stays where it is. Optiland's paraxial exit pupil is computed
+in the medium after the image surface. It stays fixed only when that medium has the index of image space at the
+primary wavelength (for example air on both sides). Else it moves with the image surface by dz (1 - n_after /
+n_image), a new trace uses another reference sphere, and `defocus` refuses the wavefront (a ValueError;
+`exit_pupil_fixed` False). For an image space in a glass, give the image surface the same glass as its material.
+To first order in dz the change is the plane-wave (Debye) defocus phase
+n dz (1 - D . D_c) / (N_c lambda); the full form also keeps the change of the reference sphere (for the perfect lens
+the rest is -dz^2 sin^2 u / (2 R') at the edge of the pupil, R' the radius of the new sphere). This rest has the
+same sign for both signs of dz, so the through-focus PSF of `defocus` is not symmetric about the focus, while the
+plane-wave image sum (`image_sum`, `huygens_psf` with dz) is symmetric (the checks below give the size). `defocus`
+needs a flat image surface normal to z (else a ValueError) and keeps the intensities, F and the MTF step of the
+wavefront.
+
+**Polychromatic PSF and MTF** (item 9). `polychromatic_psf(wfs, weights)` gives sum_l v_l PSF_l(x - s_l) on one
+grid: PSF_l in Strehl units, s_l the chief-ray point of wavelength l minus that of the reference wavelength (lateral
+color), v_l = w_l K_l^2 / (lambda_l F_l)^2 normalized to the sum 1 (w_l: the spectral power). With these weights
+each wavelength has the energy w_l sum(I_l), and a system without aberration and lateral color has the peak 1. The
+resampling is exact, not an interpolation: a matrix Fourier transform (two matrix products for each wavelength;
+Soummer et al., Opt. Express 15, 15935 (2007)) evaluates the Fraunhofer sum of the pupil function at the points of
+the common grid. On the grid of `fft_psf` it gives the FFT PSF. The grid must stay inside half the period
+lambda_l F_l (N - 1) of each wavelength (else a ValueError); the default step is the largest that does so.
+`polychromatic_mtf(wfs, psfs, weights)` gives |sum_l u_l OTF_l(nu) exp(-i 2 pi nu s_l)| with u_l = w_l sum(I_l)
+(normalized), OTF_l the complex OTF of the FFT PSF of each wavelength, linearly interpolated between its lags;
+tangential along y, sagittal along x; the default frequencies are those of `fft_mtf` of the reference wavelength.
+
+**One batch** (`image_quality`, item 10): `pupil_wavefronts`, `defocus` for each plane, `fft_psfs` and `fft_mtfs`
+(the FFTs of all fields, wavelengths and planes in one batched `torch.fft.fft2` call, split above `FFT_ELEMENTS`
+= 2^25 complex values, 512 MB), and with weights `polychromatic_psf` and `polychromatic_mtf` for each field and
+plane. Memory: a wavefront keeps 8 float64 and 2 bool N x N arrays (66 N^2 bytes; 4.3 MB for N = 256), each plane
+of `defocus` 4 new float64 arrays, and each PSF M^2 float64 values.
+
+Checks (`tests/test_analysis_batch.py`; the values are test prints on the GPU computer, CPU and GPU, unless one is
+named):
+
+| Case | Reference | Agreement (observed; test tolerance) |
+|---|---|---|
+| `systems.dispersive_singlet` (N-BK7 n_d and V_d), 3 fields x 3 wavelengths (F, d, C), pupil 48, one batch in blocks of 1000 rays (rays of two fields in a block); the singlet with the object at infinity, 2 angle fields, pupil 40 | `pupil_wavefront` for each field and wavelength | bit for bit: all tensors and numbers of each wavefront (the lateral color F to C at 1 mm: 0.266 um) |
+| `fft_psfs`, `fft_mtfs`: 9 wavefronts, pupil 64, grid 160 | `fft_psf`, `fft_mtf` of each | CPU: bit for bit; GPU: PSF 6.9e-18, MTF 1.1e-16 (1e-14) |
+| `defocus` by -50 and +50 um: the singlet on the axis, at the object height 1 mm, and with the object at infinity (2 degrees); pupil 96 (OPD peak to valley 2.2 to 5.0 waves) | `pupil_wavefront` of the optic with the image surface moved by dz (a new trace) | OPD 2.8e-11, 2.3e-11, 4.6e-12 waves (1e-9); the same intensities and valid rays; radius (1e-12 relative); center 1.1e-16 mm or less (1e-12); points on the sphere 1.1e-14 mm or less (1e-9); FFT PSF 3.0e-13 or less (1e-9) |
+| `defocus` by -80 and +80 um with an image space in a glass (n 1.4, `IdealMaterial`), the image surface with the index 1.4 also after it; on the axis and at the object height 1 mm, 1.55 um, pupil 64 (OPD peak to valley 3.7 to 5.0 waves) | `pupil_wavefront` of the optic with the image surface moved by dz (a new trace) | OPD 4.1e-11 waves (1e-9); radius and exit pupil: 0 (1e-12 relative, 1e-9 mm) |
+| the same optic with air after the image surface (Optiland's default) | Optiland's exit pupil of the moved optic | `exit_pupil_fixed` False and `defocus` gives a ValueError; the exit pupil moves by 0.0229 mm for dz = 80 um, dz (1 - 1 / 1.4) (1e-6 relative) |
+| the perfect lens (`ideal_relay`) through focus: dz = -150, 0, 60, 150 um, pupil 256, grid 1024 | the exact spherical-wave OPD of the moved plane; the image sum (`huygens_psf` with the same dz); the FFT PSF and a Debye sum with the first-order phase | see "Through focus of the perfect lens" below |
+| `polychromatic_psf` of one wavelength (default grid and step) | `fft_psf`; `polychromatic_mtf` against `fft_mtf` | PSF 3.1e-17 (1e-13); MTF 6.3e-17 (1e-12) |
+| the dispersive singlet on the axis, pupil 64, a common grid of 100 points (step 1.30 um) | Optiland's `MMDFTPSF` of each wavelength (the same pupil sampling, pixel pitch and 98 points) | 7.2e-13 (CPU), 1.2e-12 (GPU) (1e-11) |
+| the dispersive singlet at 1 mm (lateral color 0.266 um), weights 1, 2, 1, pupil 64, grid 128 | the weighted sum of the per-call FFT PSFs, each moved by s_l by trigonometric interpolation (NumPy: the DFT of the samples, then the trigonometric polynomial; exact for M >= 2 N - 1), with v_l made from the per-call data | 1.0e-17 (CPU), 1.4e-17 (GPU) (1e-12); the weights (1e-12 relative) |
+| the perfect lens at 1.31, 1.55, 1.65 um, weights 1, 2, 1, pupil 256, grid 1024 | sum_l v_l Airy(r; NA, lambda_l), v_l ~ w_l / lambda_l^2; sum_l u_l MTF_dl(nu; NA, lambda_l), u_l = w_l / sum(w) | peak 1 (1e-12); PSF 2.9e-4 inside r < 51.6 um of the window of +-839 um (1e-3); MTF 3.1e-4, both axes (1e-3) |
+| one wavefront twice, the second moved by (2, 3) um | (PSF(x) + PSF(x - s)) / 2; the MTF times abs(cos(pi nu s)) on each axis | PSF 1.4e-17 (1e-13); MTF 5.6e-17 and 1.1e-16 (1e-12) |
+| `polychromatic_mtf`, the sign of the lateral-color phase: two PSFs of one wavelength (the singlet on the axis; the second with 0.4 waves of Fringe Z7 and Z8 and moved by (2, 3) um), pupil 64 | the OTF of PSF_A(x) + PSF_B(x - s) on the period of the FFT PSF (B moved by trigonometric interpolation, then the DFT) | 1.6e-15 (1e-5); against the same reference with -s: 0.0178 (above 1e-3) |
+| `fft_psfs` and `fft_mtfs` with `FFT_ELEMENTS` set to 2 planes: 5 wavefronts in 3 calls (CPU, GPU) | one call | 0 (1e-14) |
+| `image_quality`: the dispersive singlet, 3 fields x 3 wavelengths x 3 planes (-40, 0, 40 um), weights 1, 2, 1, pupil 48 | the per-call functions for each field, wavelength and plane | the same wavefronts (bit for bit); CPU: 0; GPU: PSF 6.9e-18, MTF 5.6e-17, polychromatic PSF 0, polychromatic MTF 5.6e-17 (1e-14) |
+| the copy of the optic | a second call; a changed thickness | the same object and the same wavefront; a new copy and a new OPD |
+| `COPY_CACHE` set to 2 with 3 states of one optic; `_state_key` None; a cpu and a cuda copy of one optic; `image_quality(mtf=False)` | | the first copy goes and the last two stay; no copy is kept and the wavefront is the same (bit for bit); two copies (OPD within 1e-10); no MTFs, the same PSFs and polychromatic PSFs |
+| bad inputs: `defocus` without ray data or with a curved image surface; no field; two pupil samplings in one batch; `fft_mtfs` with a grid below 2 N - 1; a window outside half the period; negative weights; a weight count that is not the wavelength count; negative frequencies; no plane | | ValueError |
+
+**Through focus of the perfect lens** (`test_through_focus_of_the_perfect_lens`; test prints, the same on the CPU
+and the GPU): `ideal_relay` (NA 0.0995), pupil 256, grid 1024, 49 x 49 samples of the FFT PSF (1.94 um), dz = -150,
+0, 60 and 150 um (W020 = NA^2 dz / 2 = -0.48, 0, 0.19, 0.48 waves).
+- The OPD of `defocus` agrees with the exact OPD of a spherical wave on the reference sphere of the moved plane to
+  9.2e-12 waves or less (1e-9). The first-order phase n dz (1 - D . D_c) / (N_c lambda) differs from it by
+  3.56e-3, 5.8e-4 and 3.62e-3 waves at -150, 60 and 150 um: the second-order rest dz^2 sin^2 u / (2 R') at the edge
+  of the pupil (3.6e-3 at 150 um; the test bound is 1.1 times this value).
+- The image sum (`huygens_psf` with the same dz) is a plane-wave (Debye) sum. The FFT PSF of the pupil with the
+  first-order phase only agrees with it to 6.6e-4 (in focus), 6.8e-4 (60 um) and 1.13e-3 (-150 and 150 um), and a
+  Debye sum over the pupil rays (the first-order phase, the traced image-side directions, the weight J of each
+  sample) to 6.6e-4, 6.3e-4 and 1.11e-3 (tolerance 2e-3). Both are symmetric in dz: the peaks at -150 and 150 um
+  are 0.438 (FFT) and 0.439 (image sum) on both sides.
+- The FFT PSF of `defocus` (the reference sphere of the moved plane, as a trace to the moved image surface) has the
+  peaks 0.432 at -150 um and 0.444 at 150 um, and differs from the image sum by 7.0e-3 and 4.9e-3 (tolerance 1e-2;
+  5.5e-4 at 60 um). The cause is the second-order rest above: it has the same sign for both signs of dz, so it adds
+  to the defocus before the focus and removes from it after the focus. The two models differ at the order dz / R
+  (0.75 % at 150 um here); `defocus` keeps the result of a trace to the moved surface (the check against the moved
+  surface above).
+
+**Batch timings.** RX 7900 XT with `.venv-optics` (PyTorch 2.14.1 for ROCm 7.2, Optiland 0.6.3); Optiland on its
+NumPy backend on the CPU of the same computer. The rows are in `benchmarks/2026-11-08/` (logged 17:54 to 18:23 EST,
+in the GPU queue from 17:34; after the tests of this change: 176 passed), from the repository folder on the GPU
+computer, in this order (the files `optics-profile.out`, `optics-batch.jsonl` and `optics-analysis-2.jsonl`):
+
+    bash tools/gpu_run.sh optics_gpu python bench/profile_wavefront.py --pupil 64 256 --profile
+    bash tools/gpu_run.sh optics_gpu python bench/bench_batch.py --pupil 64 128 256 512
+    bash tools/gpu_run.sh optics_gpu python bench/bench_analysis.py --pupil 64 128 256 512 1024 2048
+
+The fixed cost (`optics-profile.out`; the singlet on the axis, the median of 5 runs, ms; N = 64 / 256). The steps of
+the 66da5d3 call, made again with Optiland's functions:
+
+| Step | N = 64 | N = 256 |
+|---|---|---|
+| exit-pupil point, `to_dict`, NumPy trace of the 6 check rays, `Optic.from_dict` | 0.34, 0.017, 1.31, 1.04 | 0.35, 0.017, 1.30, 1.07 |
+| trace of the 6 check rays through the copy, with the comparison | 13.5 | 13.3 |
+| trace of the chief ray and the 4 marginal rays | 12.5 | 12.5 |
+| trace of the pupil rays (3096 / 51040 rays) | 13.0 | 13.4 |
+| sum of these steps | 41.7 | 41.9 |
+| inside one trace: Optiland's paraxial ray aiming of 5 rays; the surface trace of 5 rays | 8.97; 2.75 | 8.93; 2.76 |
+| `pupil_wavefront` now: the kept copy; a new copy (after `clear_copy_cache`) | 9.09; 12.9 | 9.96; 13.4 |
+
+The sum of the steps (41.7 and 41.9 ms) agrees with the 66da5d3 rows above (42.6 ms at N = 64 and 256). The
+present call is 4.58x and 4.20x faster with the kept copy (3.23x and 3.13x with a new copy). In the cProfile table
+of 10 ray aimings on a new copy (10.1 ms each in cProfile), `build_paraxial_path` has 30 calls (3 for each aiming)
+and 86 ms, 85 % of the time; the table also shows 900 `.cpu()` calls and 710 `.item()` calls. One present call
+(the kept copy) makes 88 device-to-host reads (`host_reads`; the 66da5d3 count is not in a logged row).
+
+Per call against Optiland (`optics-analysis-2.jsonl`, the singlet on the axis, grid 2 N, best of 2 runs, ms), with
+`pupil_wavefront` of the 66da5d3 rows (`optics-analysis.jsonl`) for comparison:
+
+| N (rays) | `pupil_wavefront` 66da5d3 / now (faster) | Optiland: Wavefront / ScalarFFTPSF / ScalarFFTMTF | Faster than Optiland: PSF / MTF (66da5d3 rows) |
+|---|---|---|---|
+| 64 (3096) | 42.6 / 10.7 (3.97x) | 3.72 / 4.13 / 8.32 | 0.37x / 0.74x (0.10x / 0.20x) |
+| 128 (12644) | 41.8 / 10.3 (4.06x) | 5.65 / 6.75 / 11.4 | 0.64x / 1.07x (0.16x / 0.28x) |
+| 256 (51040) | 42.6 / 11.7 (3.65x) | 14.2 / 16.5 / 23.3 | 1.36x / 1.89x (0.39x / 0.52x) |
+| 512 (205012) | 47.4 / 11.9 (3.97x) | 45.7 / 61.7 / 75.3 | 4.36x / 5.05x (1.23x / 1.51x) |
+| 1024 (821904) | 51.3 / 21.3 (2.40x) | 191 / 275 / 345 | 10.9x / 12.3x (4.78x / 5.46x) |
+| 2048 (3290904) | 102 / 77.6 (1.32x) | 802 / 1330 / 1723 | 14.9x / 17.5x (12.0x / 13.8x) |
+
+"Faster" is `speedup_psf` (ScalarFFTPSF over `pupil_wavefront` + `fft_psf`) and `speedup_mtf` (ScalarFFTMTF over
+`pupil_wavefront` + `fft_psf` + `fft_mtf`), recomputed from the times of the rows. The differences from Optiland
+are at most: OPD 8.9e-16 waves, Zernike 2.8e-13 waves, PSF 1.4e-17, MTF 3.3e-16.
+- **Still slower** than Optiland on one call: the PSF at N = 64 and 128 (0.37x, 0.64x) and the MTF at N = 64
+  (0.74x). The trace step alone is slower up to N = 128 (`pupil_wavefront` 10.7 and 10.3 ms against Optiland's
+  Wavefront 3.72 and 5.65 ms: 0.35x and 0.55x) and faster from N = 256 (1.22x). `zernike_fit` is slower at N = 64
+  (4.59 against 3.65 ms, 0.80x), as before. The present call has one Optiland trace on the GPU (the ray aiming
+  and the surface trace); the rows do not split the 9.1 to 11.9 ms of the present call (N up to 512) into its parts.
+- **The threads of these rows.** The first row logs `threads` 4 and the numba layer "not initialized"; rows 2 to 6
+  log `threads` 16 and the layer "omp" (numba started its threads in the first row). The CPU parts of rows 2 to 6
+  (Optiland, and the host steps of this code) thus could use 16 threads; the 66da5d3 rows do not log this field.
+
+The batch (`optics-batch.jsonl`; `systems.dispersive_singlet`, 3 fields x 3 wavelengths x 5 planes (dz = -100,
+-50, 0, 50, 100 um) = 45 planes, grid 2 N, best of 2 runs, ms):
+
+| N | `image_quality` without weights / with weights 1, 2, 1 | one call for each plane: a new trace / `defocus` | Optiland: ScalarFFTPSF + ScalarFFTMTF / ScalarFFTMTF alone | without weights faster than: a new trace / `defocus` / Optiland / ScalarFFTMTF alone |
+|---|---|---|---|---|
+| 64 | 41.2 / 68.4 | 431 / 103 | 576 / 383 | 10.5x / 2.50x / 14.0x / 9.29x |
+| 128 | 42.2 / 74.2 | 485 / 106 | 836 / 516 | 11.5x / 2.51x / 19.8x / 12.2x |
+| 256 | 54.7 / 130 | 457 / 110 | 1833 / 1040 | 8.36x / 2.01x / 33.5x / 19.0x |
+| 512 | 119 / 486 | 534 / 152 | (not run) | 4.51x / 1.29x / - / - |
+
+- "A new trace" is `pupil_wavefront` of the optic with the image surface moved by dz, `fft_psf` and `fft_mtf` for
+  each of the 45 planes (9.6 to 11.9 ms per plane); "`defocus`" is 9 `pupil_wavefront` calls, then `defocus`,
+  `fft_psf` and `fft_mtf` for each plane. The batch gives the same numbers as the per-call path with a new trace
+  (PSF 1.5e-12, MTF 9.1e-12 or less) and as Optiland (PSF 3.5e-12, MTF 9.1e-12 or less, N up to 256).
+- The polychromatic PSF and MTF (with weights; 15 field points and planes) add 27.2, 32.0, 75.2 and 368 ms. At
+  N = 512 they are 76 % of the batch, and the batch with weights (486 ms) is only 1.10x faster than the per-call
+  path with a new trace, which has no polychromatic results. This part (a matrix Fourier transform of each
+  wavelength on the common grid, and the OTFs) is the slowest part of the batch at large N; Optiland has no
+  polychromatic PSF to compare.
+- One `pupil_wavefront` call of this system (field 0, wavelength d) takes 9.31 to 11.5 ms with the kept copy and
+  13.5 to 16.1 ms with a new copy (N = 64 to 512). The peak memory of the process is 1.91 to 2.76 GiB
+  (`max_rss_gb`).
 
 ## Checks (`tests/test_*.py`: `pop`, `trace_backends`, `device_pipeline`, `image_planes`, `nufft`, `sources`)
 
@@ -692,18 +879,36 @@ log). The optics runs with the two mode files gave the same efficiencies.
 - The device pipeline keeps 40 bytes per kept ray (the bundle) and the box of the spectrum (17 bytes per traced
   ray); the trace temporaries are bounded by one block. The spectrum itself (complex128) is on the device during
   step 1.
-- The image-quality analyses (`analysis.py`) take one field point and one wavelength per call (no polychromatic
-  PSF or MTF), scalar fields (no polarization). The FFT PSF needs a sampled pupil phase (W changes by well below
-  0.5 waves between neighboring pupil samples) and a geometric spot inside the window lambda F (N - 1). The MTF
-  frequency step assumes a flat image surface normal to z (Optiland projects on the tangent plane at the chief
-  ray). The orientation of an off-axis FFT PSF follows Optiland (checked against Optiland, not against the image
-  sum). `huygens_psf` takes only an object point on the axis at a finite distance.
+- The image-quality analyses (`analysis.py`) use scalar fields (no polarization). The FFT PSF needs a sampled
+  pupil phase (W changes by well below 0.5 waves between neighboring pupil samples) and a geometric spot inside the
+  window lambda F (N - 1). The MTF frequency step assumes a flat image surface normal to z (Optiland projects on
+  the tangent plane at the chief ray). The orientation of an off-axis FFT PSF follows Optiland (checked against
+  Optiland, not against the image sum). `huygens_psf` takes only an object point on the axis at a finite distance.
+- Batches (`pupil_wavefronts`, `defocus`, `polychromatic_psf`, `polychromatic_mtf`): a batch gives the numbers of
+  one call for each field and wavelength because the ray computations are elementwise; an optic whose surface
+  intersections iterate until all rays of a call converge can differ to its iteration tolerance (not tested here:
+  the systems of the tests have analytic intersections). `defocus` needs a flat image surface normal to z, one
+  homogeneous medium after the last surface, and the same index on both sides of the image surface at the primary
+  wavelength (else a ValueError). The polychromatic MTF reads each OTF at nu / (its frequency step),
+  linearly interpolated between lags (not tested against a finer pupil except on the perfect lens), and the
+  lateral-color phase uses nu in cycles/mm: the frequency step of item 6 (from the marginal-ray directions) and
+  the FFT frequency 1 / (M dx) (from F of item 5) differ slightly for an aberrated or off-axis field (not
+  quantified). The copy cache keeps up to 8 PyTorch copies of optics; the key needs a dictionary that pickles (else
+  no copy is kept).
+- The medium after the image surface (older than the batches; review `reviews/2026-11-08-de7c55fed642.md`).
+  Optiland 0.6.3 computes the paraxial values at the image surface in the medium after that surface (air by
+  default), a medium that the light does not enter. `pupil_wavefront` takes the center of its reference sphere from
+  Optiland's paraxial exit pupil (item 2), as Optiland does, so its radius depends on that medium. Test prints of
+  `test_defocus_with_a_glass_image_space` (image space n 1.4): `image_solve` puts the image surface 38.3 mm after
+  the last lens surface with air after the image surface and 53.2 mm with the index 1.4 after it (1.39 times); the
+  reference-sphere radii are 29.3 and 56 mm; with air after it, the exit pupil moves with the image surface by
+  dz (1 - 1 / 1.4). The comparisons with Optiland do not see this (Optiland uses the same exit pupil). For an image
+  space in a medium, give the image surface the same medium as its material; `defocus` refuses the other case.
 
 ## Next
 
-- Through-focus, multi-field and polychromatic PSF and MTF in one batch on the GPU (one trace per field and
-  wavelength, the FFTs of all planes in one call).
-
+- Batched Zernike fits (one normal matrix for all fields and wavelengths) and a batched Huygens PSF (the image
+  sum of several wavelengths in one pass).
 - The non-uniform FFT as the default for uniform grids in complex128 (a method "auto"). The logged rows
   (`benchmarks/2026-11-07/optics-nufft.jsonl`) show it faster than the direct complex128 sum in all bench rows and
   in the example, and slower than complex64 on 128 x 128 grids; "auto" needs a rule for complex64.

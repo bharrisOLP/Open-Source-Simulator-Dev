@@ -38,7 +38,7 @@ Source: Optiland 0.6.3 (Kramer Harrison), licensed under the MIT License (`LICEN
 
 | File | Functions | Source |
 |---|---|---|
-| `optics_gpu/src/optics_gpu/analysis.py` | `pupil_wavefront` (the steps of the wavefront data with the chief-ray reference), `_path_to_sphere` (the path to the reference sphere), the working F-number, the MTF frequency step, the restored launch-plane phase of an object at infinity, the padding and normalization of the FFT PSF | Optiland's `ChiefRayStrategy.compute_wavefront_data`, `SphericalReference.path_length`, `get_working_FNO`, `_get_mtf_frequency_steps`, `_restore_launch_phase` and its scalar FFT PSF; this code uses the image-space medium (`material_pre`) where Optiland uses the medium after the image surface (`optics_gpu/README.md`) |
+| `optics_gpu/src/optics_gpu/analysis.py` | `pupil_wavefronts` and `_chief_and_marginal` (the steps of the wavefront data with the chief-ray reference), `_path_to_sphere` (the path to the reference sphere), the working F-number, the MTF frequency step, the restored launch-plane phase of an object at infinity, the padding and normalization of the FFT PSF (`fft_psf`, `fft_psfs`), the kernel conventions of the matrix Fourier transform of `polychromatic_psf` (written from Soummer et al. 2007; the conventions are those of Optiland's `MMDFTPSF._compute_kernels`) | Optiland's `ChiefRayStrategy.compute_wavefront_data`, `SphericalReference.path_length`, `get_working_FNO`, `_get_mtf_frequency_steps`, `_restore_launch_phase` and its scalar FFT PSF; this code uses the image-space medium (`material_pre`) where Optiland uses the medium after the image surface (`optics_gpu/README.md`) |
 
 ## Not in this repository
 
