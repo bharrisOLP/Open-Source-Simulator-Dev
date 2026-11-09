@@ -4,11 +4,30 @@ Updated: 2026-11-08.
 
 ## In work
 
-**Now (2026-11-08; the fourth to tenth waves, one agent per package).** Each change gets one review before its
-commit. In work (tenth wave): photonsuite, a PIN injection phase shifter with self-heating (in review); meow_gpu,
-the modes that its solver misses (below).
-- Tenth wave, done: the add-on route, the GNU timeout in the suite runner and a CuPy cache folder per policy (the two
-  modules with 83 and 14 errors pass; the other 58 modules that name the cache give the same counts), and no patch
+**Now (2026-11-08; the fourth to eleventh waves, one agent per package).** Each change gets one review before its
+commit. The eleventh wave is done (below); the minor findings of its reviews (for example of review f39279a5164e)
+are open. In work (twelfth wave): the EME-FDTD gap of the double step and a rule for complex pairs at the cut
+(meow_gpu, suite); the review minors of photonsuite; the non-uniform FFT as the default (optics_gpu).
+- Eleventh wave (new features), done: bands_gpu, the hole slab of Johnson et al. (1999) against 3-D FDTD (4847fc7;
+  fdtd_gpu has no Bloch phases, so M and K fold to Gamma in supercells of a 7/4 crystal with cos-weighted sources;
+  first-order convergence; the extrapolations are 4e-5 to 6e-5 (K) and 2e-5 to 2e-4 (M) below bands_gpu; the earlier
+  triangular values carried a face bias (the slab faces on a subpixel sample), corrected gap at n 48: 0.265304 to
+  0.344444); optics_gpu, through-focus, multi-field and polychromatic PSF and MTF in one batch (0e9795c; the fixed cost
+  of a wavefront call cut from 42 ms to about 9 ms; a batch of 45 planes 4.5x to 11.5x faster than one call per plane
+  and 14x to 34x faster than Optiland on the CPU (pupils 64 to 256, without the polychromatic part; 8.4x to 14.1x with
+  it); defocus refuses an image surface with different media on its two sides); charge_gpu, a public face-current
+  accessor, and photonsuite.pin, a two-way electro-thermal loop on the mean Si temperature (a210ccf; the converged
+  current is up to 7.2 % (1 ns) and 11.9 % (10 ns) above one-way; the cross-over moves 12 and 21 mV lower).
+- Tenth wave, done: meow_gpu, the modes that its solver "missed" were spurious PEC-wall modes (2d19636; the tidy3d
+  operator keeps tangential E on the near walls as decoupled unknowns; tidy3d excludes them too; meow-gpu now deflates
+  them, and eps_ref is 0.99 min Re(eps) for every problem, because near-uniform windows failed without it); the
+  converged EME rows of 505c4c5 already used the physical mode sets (the rerun agrees within 1.4e-8, except the taper at
+  60 modes and 1.60 um, 3.6e-5, and at 80 modes, up to 2.2e-4, probably the choice of a complex-pair member at the cut,
+  and the 120-mode double step at 1.575 um, 9.4e-4, whose 505c4c5 solve did not converge); photonsuite, a PIN injection
+  phase shifter with self-heating (0753ed0; the carrier and thermal index changes cancel near 1.16 V at a lifetime of 1
+  ns (1.21 V at 10 ns) in this thermal model, and a heat path removes the cancel point up to 1.3 V).
+- Tenth wave, also done: the add-on route, the GNU timeout in the suite runner and a CuPy cache folder per policy (the
+  two modules with 83 and 14 errors pass; the other 58 modules that name the cache give the same counts), and no patch
   0005 (the repair must equal the whole-volume update of the same device bit for bit) (2e48a3c, 49c6849).
 - Ninth wave (new features), done: optics_gpu, the image-quality analyses of lens-design tools on the GPU: the OPD map,
   the Zernike fit (Fringe and Noll), the FFT PSF, the MTF and a Huygens PSF (603ae68, 66da5d3; a perfect lens against
@@ -20,13 +39,12 @@ the modes that its solver misses (below).
   (5ab6e9a); meow_gpu, an EME interface that conserves power and a star-product cascade (505c4c5; 5.45 GiB instead of
   28.3 GiB at 80 modes; on the taper 0.0005 below to 0.0090 above the 3-D FDTD at 40 to 80 modes, not converged in the
   mode count; the double step stays 0.004 to 0.010 above the FDTD at 40 to 120 modes, not explained). Found by that
-  work: the meow-gpu solver gives true eigenpairs but misses about 10 of the 40 nearest eigenvalues (all above cutoff),
-  so the EME rows that `meow_gpu/README.md` lists (one window and grid checked) use incomplete mode sets; the effect on
-  T00 is not known (the tenth wave works on it). Four of the five reviews of this paragraph failed and were fixed (the
-  first optics review passed; the review of its follow-up failed): the README advised to end a Drude medium before the
-  PML (that reflects more); the post-processing removed valid modes (complex pairs, the wrong branch); the README
-  described the image-space index of Optiland wrongly; the uutils timeout of the GPU computer sent SIGKILL only to the
-  direct child (tools/gpu_run.sh now uses GNU timeout, 7202be9).
+  work: the meow-gpu solver did not give some eigenvalues of the full matrix (about 10 of the 40 nearest); the tenth
+  wave showed that they are spurious PEC-wall modes (2d19636). Four of the five reviews of this paragraph failed and
+  were fixed (the first optics review passed; the review of its follow-up failed): the README advised to end a Drude
+  medium before the PML (that reflects more); the post-processing removed valid modes (complex pairs, the wrong branch);
+  the README described the image-space index of Optiland wrongly; the uutils timeout of the GPU computer sent SIGKILL
+  only to the direct child (tools/gpu_run.sh now uses GNU timeout, 7202be9).
 - Eighth wave (new features), done: fdtd_gpu, Drude and Lorentz dispersion on the ADE of fdtdx 0.6.3 and
   D_conductivity on its semi-implicit conductivity update (0a4c4b0; fdtdx needed no patch; a fill-fraction face
   rule, second order for E parallel to a face on the exact Yee grid (the FDTD follows it to res 200, then the
