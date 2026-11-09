@@ -43,12 +43,16 @@ short for the complex64 option.
 image_planes(..., method="nufft") computes the same sum on a uniform image grid by a type-1 non-uniform FFT
 (_image_planes_nufft): each ray spreads its weight with an "exponential of semicircle" kernel onto w x w points of
 a fine grid (2x oversampled), one FFT per plane, then a division by the transform of the kernel. The error is at
-most tol sum_r |a_r| in the tests (nufft_width sets w by tol). The default stays the direct sum.
+most tol sum_r |a_r| in the tests (nufft_width sets w by tol). With dtype complex64 the spread adds in float32, in
+flush periods that keep at most NUFFT_TERMS32 terms in a float32 value (nufft32_bound gives the error bound).
+method "auto" selects the non-uniform FFT (with the spread in complex128) or the direct sum by a rule from timing
+rows (_auto_nufft). The default stays the direct sum.
 """
 
 from __future__ import annotations
 
 import contextlib
+import functools
 import warnings
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
@@ -70,6 +74,17 @@ NUFFT_BETA = 2.30        # beta / w of its "exponential of semicircle" kernel fo
 NUFFT_QUAD = 128         # Gauss-Legendre nodes of the Fourier transform of the kernel (the deconvolution)
 NUFFT_COPIES = 16        # at most this many copies of the fine grid in the spread (fewer atomic adds to one value)
 NUFFT_MIN_CHUNK = 4096   # rays per chunk of the spread, at least, when one plane of the fine grid fills the budget
+NUFFT_TOL = 1e-12        # the default tol of the non-uniform FFT in complex128
+NUFFT_TOL32 = 1e-6       # the default tol of the non-uniform FFT in complex64 (the float32 spread)
+NUFFT_TERMS32 = 1024     # the float32 spread: at most this many terms go into one fine-grid value between two flushes
+U32 = 2.0**-24           # the unit roundoff of float32
+# method "auto" (_auto_nufft): the non-uniform FFT from AUTO_POINTS image points (4 times that for fewer than
+# AUTO_PLANES planes), AUTO_RAYS rays x planes and AUTO_WORK rays x planes x points (per dtype of the direct sum;
+# from the timing rows, README "The non-uniform FFT")
+AUTO_POINTS = {torch.complex128: 64 * 64, torch.complex64: 128 * 128}
+AUTO_PLANES = 5
+AUTO_RAYS = {torch.complex128: 2000, torch.complex64: 20000}
+AUTO_WORK = {torch.complex128: 8e7, torch.complex64: 2e9}
 UNIFORM_TOL = 64 * float(np.finfo(float).eps)   # a uniform image axis: |x_i - (x_0 + i h)| <= UNIFORM_TOL max|x|
 
 
@@ -472,7 +487,7 @@ def _grid(v, dev: torch.device, name: str) -> torch.Tensor:
 
 
 def image_sum(bundle: RayBundle, x_img, y_img, dz: float = 0.0, ray_chunk: int | None = None,
-              dtype: torch.dtype = torch.complex128, method: str = "direct", tol: float = 1e-12) -> torch.Tensor:
+              dtype: torch.dtype = torch.complex128, method: str = "direct", tol: float | None = None) -> torch.Tensor:
     """The field E (Nx, Ny), complex128 on the device of the bundle, on the grid (x_img, y_img) in um (NumPy
     arrays or tensors) in the plane at dz um after the image surface (dz < 0: before it):
     E(x, y) = sum_r a_r exp(i k (L'_r x + M'_r y + N'_r dz)). A plane wave per ray: this is the angular-spectrum
@@ -483,18 +498,24 @@ def image_sum(bundle: RayBundle, x_img, y_img, dz: float = 0.0, ray_chunk: int |
 
 
 def image_planes(bundle: RayBundle, x_img, y_img, dz, ray_chunk: int | None = None,
-                 dtype: torch.dtype = torch.complex128, method: str = "direct", tol: float = 1e-12) -> torch.Tensor:
+                 dtype: torch.dtype = torch.complex128, method: str = "direct",
+                 tol: float | None = None) -> torch.Tensor:
     """The fields E (Z, Nx, Ny), complex128 on the device of the bundle, on the grid (x_img, y_img) in um in the Z
     planes dz (um after the image surface; a number or a 1-D array or tensor):
     E_z(x, y) = sum_r a_r exp(i k (L'_r x + M'_r y + N'_r dz_z)), the same sum as image_sum for each plane.
 
     method "direct" (the default): the sum below, 8 Nx Ny floating-point operations per ray and plane.
     method "nufft": a type-1 non-uniform FFT (_image_planes_nufft), w^2 complex additions per ray and plane (w = 15
-    for the default tol) plus one FFT per plane, with an error of at most tol sum_r |a_r| in the tested cases (tol
-    from 1e-12 to 1e-2 sets the kernel width w; see nufft_width). It needs a uniform grid on each axis
-    (x_i = x_0 + i h within UNIFORM_TOL max|x|; for example np.arange or np.linspace); for another grid it warns and
-    uses the direct sum. It computes in complex128 only (dtype complex64 with method "nufft" gives a ValueError).
-    The default stays "direct" (README, "The non-uniform FFT").
+    for tol 1e-12) plus one FFT per plane, with an error of at most tol sum_r |a_r| in the tested cases (tol from
+    1e-12 to 1e-2 sets the kernel width w; see nufft_width; None: NUFFT_TOL = 1e-12 for complex128, NUFFT_TOL32 =
+    1e-6 for complex64). It needs a uniform grid on each axis (x_i = x_0 + i h within UNIFORM_TOL max|x|; for
+    example np.arange or np.linspace); for another grid it warns and uses the direct sum. With dtype complex64 the
+    spread adds in float32 (see _image_planes_nufft and nufft32_bound); the FFT stays in complex128.
+    method "auto": the non-uniform FFT where _auto_nufft expects it to be faster (a uniform grid; a rule from the
+    logged timing rows, README "The non-uniform FFT"), else the direct sum in dtype (no warning). "auto" uses the
+    spread in complex128 also for dtype complex64 (tol None: 1e-6), because the float32 spread was slower than the
+    complex128 spread in 122 of 144 logged rows on the RX 7900 XT (README); its error, at most tol sum_r |a_r| in
+    the tests, is far below the bound of the complex64 direct sum.
 
     The direct sum: one pass over the rays for all planes. For each chunk of rays:
     1. the weights of each plane, w_zr = a_r exp(i (k L'_r xc + k M'_r yc + k N'_r dz_z)), in float64 (the phase
@@ -520,24 +541,27 @@ def image_planes(bundle: RayBundle, x_img, y_img, dz, ray_chunk: int | None = No
     is the rays per chunk of the spread (None: _nufft_steps)."""
     if dtype not in (torch.complex128, torch.complex64):
         raise ValueError(f"dtype {dtype}: use torch.complex128 or torch.complex64")
-    if method not in ("direct", "nufft"):
-        raise ValueError(f"method {method!r}: use 'direct' or 'nufft'")
+    if method not in ("direct", "nufft", "auto"):
+        raise ValueError(f"method {method!r}: use 'direct', 'nufft' or 'auto'")
     dev = bundle.device
     xi, yi, dzs = _grid(x_img, dev, "x_img"), _grid(y_img, dev, "y_img"), _grid(dz, dev, "dz")
     nz, nx, ny = dzs.numel(), xi.numel(), yi.numel()
-    if method == "nufft":
-        if dtype != torch.complex128:
-            raise ValueError("the non-uniform FFT computes in complex128 only: use dtype=torch.complex128")
+    if method != "direct":
+        if tol is None:
+            tol = NUFFT_TOL32 if dtype == torch.complex64 else NUFFT_TOL
         w, beta = nufft_width(tol)
         if ray_chunk is not None and ray_chunk < 1:
             raise ValueError(f"ray_chunk {ray_chunk}: use an integer of at least 1, or None")
         if nz * nx * ny == 0 or bundle.n_rays == 0:
             return torch.zeros((nz, nx, ny), dtype=torch.complex128, device=dev)
-        ax, ay = _uniform_axis(xi), _uniform_axis(yi)
-        if ax is not None and ay is not None:
-            return _image_planes_nufft(bundle, ax, ay, nx, ny, dzs, w, beta, ray_chunk)
-        warnings.warn("image_planes: the image grid is not uniform on each axis, so the non-uniform FFT cannot be "
-                      "used; the direct sum computes the field", stacklevel=2)
+        if method == "nufft" or _auto_nufft(bundle.n_rays, nz, nx, ny, dtype):
+            ax, ay = _uniform_axis(xi), _uniform_axis(yi)
+            if ax is not None and ay is not None:
+                spread = dtype if method == "nufft" else torch.complex128
+                return _image_planes_nufft(bundle, ax, ay, nx, ny, dzs, w, beta, ray_chunk, spread)
+            if method == "nufft":
+                warnings.warn("image_planes: the image grid is not uniform on each axis, so the non-uniform FFT "
+                              "cannot be used; the direct sum computes the field", stacklevel=2)
     step = _planes_step(ray_chunk, nz, nx, ny, dtype)
     E = torch.zeros((nz * nx, ny), dtype=torch.complex128, device=dev)
     if E.numel() == 0 or bundle.n_rays == 0:
@@ -694,17 +718,33 @@ def _fine_size(n: int, w: int) -> int:
         m += 1
 
 
+@functools.lru_cache(maxsize=4)
+def _gauss_legendre(n: int) -> tuple[np.ndarray, np.ndarray]:
+    """The n Gauss-Legendre nodes and weights on [-1, 1] (np.polynomial.legendre.leggauss), read-only arrays."""
+    u, wq = np.polynomial.legendre.leggauss(n)
+    u.flags.writeable = wq.flags.writeable = False
+    return u, wq
+
+
 def _es_transform(m: np.ndarray, n_fine: int, w: int, beta: float) -> np.ndarray:
     """psi(m) = integral of phi(2 s / w) exp(i 2 pi m s / n_fine) ds (s in fine-grid cells), the Fourier transform
     of the ES kernel at the modes m (phi is even and real): (w / 2) integral over z in [-1, 1] of
     phi(z) cos(xi w z / 2) dz, xi = 2 pi m / n_fine. With z = sin(t), t in [-pi/2, pi/2], phi(sin t) =
     exp(beta (cos t - 1)) and the integrand exp(beta (cos t - 1)) cos(xi w sin(t) / 2) cos(t) are smooth (in z, phi
-    has square-root ends, so a Gauss-Legendre rule in z converges slowly); NUFFT_QUAD Gauss-Legendre nodes in t."""
-    u, wq = np.polynomial.legendre.leggauss(NUFFT_QUAD)
+    has square-root ends, so a Gauss-Legendre rule in z converges slowly); NUFFT_QUAD Gauss-Legendre nodes in t
+    (_gauss_legendre: computed one time; NumPy takes about 1 ms for 128 nodes)."""
+    u, wq = _gauss_legendre(NUFFT_QUAD)
     t, wt = 0.5 * np.pi * u, 0.5 * np.pi * wq
     weight = wt * np.exp(beta * (np.cos(t) - 1.0)) * np.cos(t)
     xi = 2 * np.pi * np.asarray(m, float) / n_fine
     return 0.5 * w * (np.cos(np.outer(xi, 0.5 * w * np.sin(t))) @ weight)
+
+
+def _es_start(f: torch.Tensor, n_fine: int, w: int) -> tuple[torch.Tensor, torch.Tensor]:
+    """u = (f - round(f)) n_fine, the position of each ray in fine-grid cells, and l0 = ceil(u - w / 2), the first
+    of the w fine-grid points of its kernel (float64; the index is l0 mod n_fine)."""
+    u = (f - torch.round(f)) * n_fine
+    return u, torch.ceil(u - 0.5 * w)
 
 
 def _es_spread_1d(f: torch.Tensor, n_fine: int, w: int, beta: float) -> tuple[torch.Tensor, torch.Tensor]:
@@ -712,8 +752,7 @@ def _es_spread_1d(f: torch.Tensor, n_fine: int, w: int, beta: float) -> tuple[to
     per image grid step (L' h / lambda). Only f mod 1 matters (the field on the grid is periodic in f), so u =
     (f - round(f)) n_fine is in [-n_fine / 2, n_fine / 2]; the kernel covers the w points l0 .. l0 + w - 1,
     l0 = ceil(u - w / 2) (indices mod n_fine), at z = (l - u) 2 / w in [-1, 1]."""
-    u = (f - torch.round(f)) * n_fine
-    l0 = torch.ceil(u - 0.5 * w)
+    u, l0 = _es_start(f, n_fine, w)
     j = torch.arange(w, dtype=torch.float64, device=f.device)
     z = (l0[:, None] - u[:, None] + j) * (2.0 / w)
     phi = torch.exp(beta * (torch.sqrt(torch.clamp(1.0 - z * z, min=0.0)) - 1.0))
@@ -754,8 +793,109 @@ def _golden_stride(n: int) -> int:
     return s
 
 
+def _spread32_segments(bundle: RayBundle, fx: float, fy: float, n1: int, n2: int, w: int, copies: int,
+                       step: int) -> list[tuple[int, int, int] | None]:
+    """The chunks of rays of the float32 spread and the flushes, in the order of the spread: (block, s, e) for the
+    rays s .. e - 1 of a block (in the golden order of _image_planes_nufft; ray i of a chunk goes to the copy
+    i mod copies), and None for a flush (the float32 copies are added into the complex128 fine grid and set to 0).
+    Between two flushes, every value of every copy gets at most NUFFT_TERMS32 terms.
+
+    The count: the first kernel point l0 of a ray (_es_start; fx and fy: cycles per grid step per unit of L' and M')
+    falls into one of n1 // w blocks of the fine grid on each axis (the last block has w to 2 w - 1 points). A point
+    l gets the terms of the rays with l0 in l - w + 1 .. l (mod n1), and these w points are in at most two adjacent
+    blocks. So the ray count of 2 x 2 adjacent blocks of one copy, summed since the last flush, is an upper bound of
+    the terms of each point of that copy. A chunk that would take this bound above NUFFT_TERMS32 starts after a
+    flush; a chunk that is above it alone is cut in half (a chunk of copies x NUFFT_TERMS32 rays always passes:
+    each copy gets at most NUFFT_TERMS32 of its rays). After a chunk that takes the bound above NUFFT_TERMS32 / 2,
+    a flush follows (the next chunk of that size would not pass). Each try reads one number from the device."""
+    dev = bundle.device
+    bx, by = n1 // w, n2 // w
+    count = torch.zeros((copies, bx, by), dtype=torch.int64, device=dev)
+    segs: list[tuple[int, int, int] | None] = []
+    open_ = False                                          # rays since the last flush
+    for i, (Lo, Mo, _, ao) in enumerate(bundle.blocks):
+        n = ao.numel()
+        stride = _golden_stride(n)
+        s, c = 0, step
+        while s < n:
+            e = min(s + c, n)
+            sel = torch.arange(s, e, device=dev).mul_(stride).remainder_(n)
+            jx = torch.remainder(_es_start(Lo[sel] * fx, n1, w)[1].to(torch.int64), n1).div_(w, rounding_mode="floor")
+            jy = torch.remainder(_es_start(Mo[sel] * fy, n2, w)[1].to(torch.int64), n2).div_(w, rounding_mode="floor")
+            key = (torch.arange(e - s, device=dev) % copies) * (bx * by) + jx.clamp_(max=bx - 1) * by
+            key += jy.clamp_(max=by - 1)
+            new = count + torch.bincount(key, minlength=copies * bx * by).view(copies, bx, by)
+            win = new + new.roll(-1, 1)
+            most = int((win + win.roll(-1, 2)).amax())
+            if most <= NUFFT_TERMS32:
+                segs.append((i, s, e))
+                count, s, open_ = new, e, True
+                if 2 * most > NUFFT_TERMS32:
+                    segs.append(None)
+                    count.zero_()
+                    open_ = False
+                elif 4 * most <= NUFFT_TERMS32:
+                    c = min(step, 2 * c)
+            elif open_:
+                segs.append(None)
+                count.zero_()
+                open_ = False
+            else:
+                c = max(1, (e - s) // 2)
+    return segs
+
+
+def nufft32_bound(nx: int, ny: int, tol: float = NUFFT_TOL32) -> np.ndarray:
+    """The bound of the float32 spread on an Nx x Ny grid: an (Nx, Ny) array B with |E32 - E64| <= B sum_r |a_r| at
+    each grid point, to first order in u = U32 = 2^-24. E32 is image_planes(method="nufft", dtype=torch.complex64,
+    tol=tol), E64 the same non-uniform FFT with the spread in complex128 (the float64 rounding of both is far
+    smaller). The error of E64 itself (at most tol sum_r |a_r| in the tests) comes in addition.
+
+    Derivation (_image_planes_nufft, float32 spread). A term t = c_r phi_x phi_y gets five float32 roundings (c_r,
+    phi_x and phi_y from float64 to float32, the product phi_x phi_y, and its product with c_r): at most 5 u |t|.
+    A fine-grid value of one copy gets at most n = NUFFT_TERMS32 terms between two flushes (_spread32_segments),
+    added in float32 from 0 in any order: at most (n - 1) u times the sum of their |t| (the recursive summation
+    bound, Higham, "Accuracy and Stability of Numerical Algorithms", 2nd ed., eq. (4.4), for the real and the
+    imaginary part; the complex error by the triangle inequality of the 2-norm). At a flush, the K <= NUFFT_COPIES
+    copies of a value are added in complex64 (K - 1 more roundings), then into the complex128 fine grid; the FFT
+    and the deconvolution are in complex128. So each fine-grid value b_l has an error of at most
+    (n + K + 3) u sum_{t in l} |t|, and the mode (m, n) of E, corr(m, n) sum_l b_l exp(...), has an error of at most
+    (n + K + 3) u corr(m, n) sum_r |a_r| Phi_x Phi_y, with Phi = sum_j phi_j of one ray on one axis (|c_r| = |a_r|).
+    corr = 1 / (psi_x(m) psi_y(n)) (_es_transform) and Phi <= Phi_max (the largest value over 4096 positions in a
+    cell, times 1 + 1e-9: Phi changes by less than 1e-4 of its value over a cell for w >= 5, so the sampling error
+    is below about 1e-10), so B = (NUFFT_TERMS32 + NUFFT_COPIES + 3) u rho_x(m) rho_y(n), rho(m) = Phi_max / psi(m).
+    rho is about 1 at the grid center and largest at the edges of the grid (the largest modes |m| = N / 2).
+    Weights near the float32 range limits (|a| below about 1e-30 or above 1e30) are outside this bound."""
+    w, beta = nufft_width(tol)
+    return (NUFFT_TERMS32 + NUFFT_COPIES + 3) * U32 * np.outer(_es_rho(nx, w, beta), _es_rho(ny, w, beta))
+
+
+def _es_rho(n: int, w: int, beta: float) -> np.ndarray:
+    """rho(m) = Phi_max / psi(m) for the modes m = i - n // 2 of an axis of n points (nufft32_bound)."""
+    n_fine = _fine_size(n, w)
+    d = np.arange(4096) / 4096.0                                            # the position in the cell
+    z = (2 * d[:, None] + 2 * np.arange(w)[None, :] - w) / w                 # the kernel points (_es_spread_1d)
+    phi = np.exp(beta * (np.sqrt(np.clip(1.0 - z * z, 0.0, None)) - 1.0))
+    return (1 + 1e-9) * phi.sum(1).max() / _es_transform(np.arange(n) - n // 2, n_fine, w, beta)
+
+
+def _auto_nufft(n_rays: int, nz: int, nx: int, ny: int, dtype: torch.dtype) -> bool:
+    """method "auto" of image_planes: True where the non-uniform FFT is expected to be faster than the direct sum
+    (the grid must also be uniform). The rule comes from the logged timing rows (README, "The non-uniform FFT"):
+    the image grid has at least AUTO_POINTS[dtype] points, 4 times that for fewer than AUTO_PLANES planes (on smaller
+    grids the direct sum costs less per ray than the w^2 adds of the spread; with fewer planes, the spread adds
+    fewer values per fine-grid index, and the atomic adds of many rays into the same values take longer), the rays
+    times the planes are at least AUTO_RAYS[dtype], and the rays times the planes times the points are at least
+    AUTO_WORK[dtype] (below these, the fixed cost of the non-uniform FFT per call and per plane, the zeroed fine
+    grids, the FFT and the deconvolution, is not paid back). dtype: the dtype of the direct sum; the non-uniform FFT
+    of "auto" spreads in complex128."""
+    rays, points = n_rays * nz, AUTO_POINTS[dtype] * (1 if nz >= AUTO_PLANES else 4)
+    return nx * ny >= points and rays >= AUTO_RAYS[dtype] and rays * nx * ny >= AUTO_WORK[dtype]
+
+
 def _image_planes_nufft(bundle: RayBundle, ax: tuple[float, float], ay: tuple[float, float], nx: int, ny: int,
-                        dzs: torch.Tensor, w: int, beta: float, ray_chunk: int | None) -> torch.Tensor:
+                        dzs: torch.Tensor, w: int, beta: float, ray_chunk: int | None,
+                        dtype: torch.dtype = torch.complex128) -> torch.Tensor:
     """image_planes by a type-1 non-uniform FFT on the uniform grid x_i = x0 + i hx (i < nx), y_j = y0 + j hy
     (j < ny) (ax = (x0, hx), ay = (y0, hy)): (Z, Nx, Ny) complex128 on the device of the bundle.
 
@@ -768,10 +908,19 @@ def _image_planes_nufft(bundle: RayBundle, ax: tuple[float, float], ay: tuple[fl
     3. Deconvolution: the modes m, n of the FFT divided by psi_x(m) psi_y(n) (_es_transform). Errors: the kernel
        is cut at |z| = 1 and the fine grid aliases; both fall with w (nufft_width).
     The planes go in batches of zb planes, the rays in chunks (_nufft_steps); each batch computes the kernel values
-    again (2 w per ray), and the spread of a batch adds w^2 zb values per ray."""
+    again (2 w per ray), and the spread of a batch adds w^2 zb values per ray.
+
+    dtype complex64, the float32 spread: c_zr and the kernel values are computed in float64 as above, then the
+    terms in float32 (c_zr in complex64, phi_x phi_y and the product), and index_add_ adds them as float32 pairs
+    (the real and imaginary parts as two float32 values, not as complex64 values; bench/bench_atomics.py times the
+    atomic adds of index_add_ for float32, float64, complex64 and complex128). The chunks of _spread32_segments
+    keep at most NUFFT_TERMS32 terms in each float32 value: at each flush, the copies are added in complex64, that
+    sum is added into a complex128 fine grid, and the copies are set to 0. Steps 2 and 3 are in complex128. The
+    bound: nufft32_bound."""
     dev, k = bundle.device, bundle.k
     nz = dzs.numel()
     (x0, hx), (y0, hy) = ax, ay
+    fx, fy = hx / bundle.wavelength, hy / bundle.wavelength
     n1, n2 = _fine_size(nx, w), _fine_size(ny, w)
     mx, my = np.arange(nx) - nx // 2, np.arange(ny) - ny // 2
     x_ref, y_ref = x0 + (nx // 2) * hx, y0 + (ny // 2) * hy
@@ -780,34 +929,61 @@ def _image_planes_nufft(bundle: RayBundle, ax: tuple[float, float], ay: tuple[fl
     rows = torch.as_tensor(np.remainder(mx, n1), device=dev)
     cols = torch.as_tensor(np.remainder(my, n2), device=dev)
     zb, copies, step = _nufft_steps(ray_chunk, nz, n1, n2, w)
+    single = dtype == torch.complex64
+    strides = [_golden_stride(b[3].numel()) for b in bundle.blocks]
+    if single:
+        segs = _spread32_segments(bundle, fx, fy, n1, n2, w, copies, step)
+        if segs and segs[-1] is not None:
+            segs.append(None)
+    else:
+        segs = [(i, s, min(s + step, b[3].numel())) for i, b in enumerate(bundle.blocks)
+                for s in range(0, b[3].numel(), step)]
+
+    def spread(b: torch.Tensor, i: int, s: int, e: int, kdz: torch.Tensor) -> None:
+        """Adds the terms of the rays s .. e - 1 (golden order) of block i into the fine grids b."""
+        Lo, Mo, No, ao = bundle.blocks[i]
+        sel = torch.arange(s, e, device=dev).mul_(strides[i]).remainder_(ao.numel())
+        L, M = Lo[sel], Mo[sel]
+        px, ix = _es_spread_1d(L * fx, n1, w, beta)
+        py, iy = _es_spread_1d(M * fy, n2, w, beta)
+        ph = No[sel, None] * kdz[None, :]                                      # (c, zb) float64
+        ph += ((k * x_ref) * L + (k * y_ref) * M)[:, None]
+        c = (1j * ph).exp_().mul_(ao[sel, None])                               # (c, zb), the weights
+        del sel, ph
+        ix += (torch.arange(ix.shape[0], device=dev) % copies)[:, None] * n1   # the copy of each ray
+        idx = (ix[:, :, None] * n2 + iy[:, None, :]).reshape(-1)               # (c w^2)
+        del ix, iy
+        if single:
+            px, py, c = px.to(torch.float32), py.to(torch.float32), c.to(torch.complex64)
+        pxy = px[:, :, None] * py[:, None, :]                                   # (c, w, w)
+        del px, py
+        vals = pxy[:, :, :, None] * c[:, None, None, :]                         # (c, w, w, zb)
+        del pxy, c
+        if single:
+            b.index_add_(0, idx, torch.view_as_real(vals).reshape(idx.numel(), -1, 2))
+        else:
+            b.index_add_(0, idx, vals.reshape(idx.numel(), -1))
+
     E = torch.empty((nz, nx, ny), dtype=torch.complex128, device=dev)
     for z0 in range(0, nz, zb):
         kdz = k * dzs[z0:z0 + zb]
         nb = kdz.numel()
-        b = torch.zeros((copies * n1 * n2, nb), dtype=torch.complex128, device=dev)
-        for Lo, Mo, No, ao in bundle.blocks:
-            n = ao.numel()
-            stride = _golden_stride(n)
-            for s in range(0, n, step):
-                sel = torch.arange(s, min(s + step, n), device=dev).mul_(stride).remainder_(n)
-                L, M = Lo[sel], Mo[sel]
-                px, ix = _es_spread_1d(L * (hx / bundle.wavelength), n1, w, beta)
-                py, iy = _es_spread_1d(M * (hy / bundle.wavelength), n2, w, beta)
-                ph = No[sel, None] * kdz[None, :]                              # (c, zb) float64
-                ph += ((k * x_ref) * L + (k * y_ref) * M)[:, None]
-                c = (1j * ph).exp_().mul_(ao[sel, None])                       # (c, zb), the weights
-                del sel, ph
-                ix += (torch.arange(ix.shape[0], device=dev) % copies)[:, None] * n1   # the copy of each ray
-                idx = (ix[:, :, None] * n2 + iy[:, None, :]).reshape(-1)       # (c w^2)
-                del ix, iy
-                pxy = px[:, :, None] * py[:, None, :]                           # (c, w, w)
-                del px, py
-                vals = pxy[:, :, :, None] * c[:, None, None, :]                 # (c, w, w, zb)
-                del pxy, c
-                b.index_add_(0, idx, vals.reshape(-1, nb))
-                del idx, vals
-        if copies > 1:
-            b = b.reshape(copies, n1 * n2, nb).sum(0)
+        if single:
+            b = torch.zeros((n1 * n2, nb), dtype=torch.complex128, device=dev)
+            b32 = torch.zeros((copies * n1 * n2, nb, 2), dtype=torch.float32, device=dev)
+            for seg in segs:
+                if seg is None:                     # a flush: the copies added in complex64, then into complex128
+                    b += torch.view_as_complex(b32).reshape(copies, n1 * n2, nb).sum(0)
+                    b32.zero_()
+                else:
+                    spread(b32, *seg, kdz)
+            del b32
+        else:
+            b = torch.zeros((copies * n1 * n2, nb), dtype=torch.complex128, device=dev)
+            for seg in segs:
+                spread(b, *seg, kdz)
+            if copies > 1:
+                b = b.reshape(copies, n1 * n2, nb).sum(0)
         F = torch.fft.ifft2(b.reshape(n1, n2, nb), dim=(0, 1), norm="forward")
         del b
         E[z0:z0 + nb] = (F.index_select(0, rows).index_select(1, cols) * corr).permute(2, 0, 1)

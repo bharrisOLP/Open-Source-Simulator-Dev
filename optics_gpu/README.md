@@ -17,6 +17,8 @@ E = image_sum(bundle, x_img_um, y_img_um, dz=20.0)       # the field 20 um after
 stack = image_planes(bundle, x_img_um, y_img_um, np.linspace(-60, 60, 25))      # 25 planes in one pass (Z, Nx, Ny)
 eta_z = overlap_efficiency_device(stack, fiber_mode, power=p0)                  # one eta per plane
 stack = image_planes(bundle, x_img_um, y_img_um, dzs, method="nufft")  # uniform grid: non-uniform FFT, tol 1e-12
+stack = image_planes(bundle, x_img_um, y_img_um, dzs, method="auto")   # a rule selects "nufft" or "direct"
+stack = image_planes(bundle, x_img_um, y_img_um, dzs, method="nufft", dtype=torch.complex64)  # float32 spread, tol 1e-6
 
 from optics_gpu.analysis import fft_mtf, fft_psf, huygens_psf, pupil_wavefront, zernike_fit
 wf = pupil_wavefront(optic, field=(0.0, 0.0), n_pupil=256, device="cuda")   # OPD map (waves), 256 x 256 pupil grid
@@ -150,7 +152,8 @@ chunk is `GROUP_RAYS` rays, and the peak is above the budget.
 
 ## The non-uniform FFT (`image_planes(..., method="nufft")` in `src/optics_gpu/pop.py`)
 
-`image_planes` and `image_sum` take `method="nufft"` and a tolerance `tol` (default 1e-12, from 1e-12 to 1e-2).
+`image_planes` and `image_sum` take `method="nufft"` and a tolerance `tol` (from 1e-12 to 1e-2; the default
+`None` is `NUFFT_TOL` = 1e-12 for complex128 and `NUFFT_TOL32` = 1e-6 for complex64).
 On a uniform grid x_i = x_0 + i h_x, y_j = y_0 + j h_y the image sum is a type-1 non-uniform FFT:
 
     E_z(m, n) = sum_r c_zr exp(i 2 pi (m f_r + n g_r)),   f_r = L'_r h_x / lambda,   g_r = M'_r h_y / lambda,
@@ -169,7 +172,9 @@ exp(i 2 pi m f) is periodic in f with period 1, so only f mod 1 matters: a grid 
 2. One inverse FFT (unnormalized) per plane.
 3. Deconvolution: each mode is divided by psi_x(m) psi_y(n), the Fourier transform of the kernel (Gauss-Legendre
    quadrature with 128 nodes in t, with z = sin t: then the integrand is smooth; in z, the square-root ends of phi
-   make the rule converge slowly). Against mpmath, psi agrees to 6.4e-15 (test).
+   make the rule converge slowly). Against mpmath, psi agrees to 6.4e-15 (test). The nodes are computed one time
+   per process (`_gauss_legendre`); before the twelfth wave, each call computed them two times with
+   `np.polynomial.legendre.leggauss(128)`, a fixed cost of each call in the rows of 2026-11-07 (see "Timings").
 
 The cost per ray and plane is w^2 complex additions (w = 15 for tol 1e-12, 9 for 1e-6), against 8 Nx Ny
 floating-point operations for the direct sum; then one FFT of n1 x n2 points per plane. The kernel values (2 w
@@ -206,13 +211,14 @@ above the budget: the fine grid of one plane, its FFT step, and 4096 times the v
 2800 x 2800 points the fine grid alone is above the budget; before the one review the chunk then fell to one ray.
 
 Limits: the grid must be uniform on each axis (|x_i - (x_0 + i h)| <= 64 eps max|x|, so `np.arange` and
-`np.linspace` grids pass); for another grid, `image_planes` gives a UserWarning and uses the direct sum. The
-non-uniform FFT computes in complex128 only (`dtype=torch.complex64` with `method="nufft"` gives a ValueError).
+`np.linspace` grids pass); for another grid, `image_planes` gives a UserWarning and uses the direct sum. With
+`dtype=torch.complex64` the spread adds in float32 (see "The float32 spread" below); before the twelfth wave this
+gave a ValueError.
 
 **Timings.** GPU (RX 7900 XT; `.venv-optics`, PyTorch 2.14.1 for ROCm 7.2; with the shared limits of the
 computer: `OMP_NUM_THREADS`, `OPENBLAS_NUM_THREADS` and `MKL_NUM_THREADS` 4). Rows 1 to 24 of
-`benchmarks/2026-11-07/optics-nufft.jsonl` (kernel widths w 15, 12 and 9 for tol 1e-12, 1e-9 and 1e-6), from the
-repository folder on the GPU computer:
+`benchmarks/2026-11-08/optics-nufft-2.jsonl` (with the cache of the Gauss-Legendre nodes; kernel widths w 15, 12
+and 9 for tol 1e-12, 1e-9 and 1e-6), from the repository folder on the GPU computer:
 
     bash tools/gpu_run.sh optics_gpu python bench/bench_nufft.py --rays 1e5 1e6 1e7 \
         --image 128 256 512 1024 --planes 1 21
@@ -225,39 +231,47 @@ best of 2 runs. \* = `direct_scaled`: the direct sum was timed on every s-th ray
 
 | Rays traced (kept) | Grid | Planes | Direct complex128 | Direct complex64 | NUFFT tol 1e-12 | NUFFT 1e-9 | NUFFT 1e-6 | NUFFT faster than complex128 / complex64 |
 |---|---|---|---|---|---|---|---|---|
-| 1e5 (5.3e4) | 128^2 | 1 | 11.4 ms | 2.68 ms | 8.64 ms | 6.61 ms | 5.85 ms | 1.32x / 0.31x |
-| 1e5 (5.3e4) | 128^2 | 21 | 7.53 ms | 0.846 ms | 1.13 ms | 0.811 ms | 0.549 ms | 6.65x / 0.75x |
-| 1e5 (5.3e4) | 256^2 | 1 | 36.3 ms | 4.38 ms | 8.06 ms | 6.53 ms | 5.79 ms | 4.50x / 0.54x |
-| 1e5 (5.3e4) | 256^2 | 21 | 29.3 ms | 3.23 ms | 1.20 ms | 0.868 ms | 0.607 ms | 24.33x / 2.69x |
-| 1e5 (5.3e4) | 512^2 | 1 | 130 ms | 14.0 ms | 8.80 ms | 7.40 ms | 6.70 ms | 14.81x / 1.59x |
-| 1e5 (5.3e4) | 512^2 | 21 | 116 ms\* | 12.5 ms\* | 1.95 ms | 1.56 ms | 1.21 ms | 59.24x / 6.38x |
-| 1e5 (5.3e4) | 1024^2 | 1 | 499 ms | 54.4 ms | 12.5 ms | 11.3 ms | 10.5 ms | 39.74x / 4.33x |
-| 1e5 (5.3e4) | 1024^2 | 21 | 461 ms\* | 49.0 ms\* | 4.12 ms | 3.43 ms | 2.85 ms | 111.87x / 11.89x |
-| 1e6 (5.28e5) | 128^2 | 1 | 108 ms | 13.5 ms | 31.2 ms | 22.4 ms | 15.2 ms | 3.47x / 0.43x |
-| 1e6 (5.28e5) | 128^2 | 21 | 74.9 ms | 8.76 ms | 9.90 ms | 6.61 ms | 3.94 ms | 7.57x / 0.88x |
-| 1e6 (5.28e5) | 256^2 | 1 | 358 ms | 43.6 ms | 26.3 ms | 18.8 ms | 12.9 ms | 13.63x / 1.66x |
-| 1e6 (5.28e5) | 256^2 | 21 | 292 ms\* | 32.4 ms\* | 9.97 ms | 6.60 ms | 3.92 ms | 29.26x / 3.25x |
-| 1e6 (5.28e5) | 512^2 | 1 | 1.29 s | 146 ms | 26.3 ms | 19.0 ms | 13.4 ms | 49.08x / 5.56x |
-| 1e6 (5.28e5) | 512^2 | 21 | 1.15 s\* | 125 ms\* | 13.4 ms | 9.10 ms | 5.74 ms | 86.37x / 9.36x |
-| 1e6 (5.28e5) | 1024^2 | 1 | 4.96 s\* | 538 ms\* | 29.2 ms | 21.9 ms | 16.3 ms | 169.78x / 18.38x |
-| 1e6 (5.28e5) | 1024^2 | 21 | 4.59 s\* | 487 ms\* | 23.7 ms | 16.3 ms | 10.7 ms | 193.53x / 20.53x |
-| 1e7 (5.3e6) | 128^2 | 1 | 1.08 s | 140 ms | 330 ms | 238 ms | 165 ms | 3.28x / 0.43x |
-| 1e7 (5.3e6) | 128^2 | 21 | 752 ms\* | 88.7 ms\* | 104 ms | 71.7 ms | 44.8 ms | 7.22x / 0.85x |
-| 1e7 (5.3e6) | 256^2 | 1 | 3.59 s\* | 433 ms\* | 262 ms | 179 ms | 117 ms | 13.72x / 1.65x |
-| 1e7 (5.3e6) | 256^2 | 21 | 2.93 s\* | 326 ms\* | 113 ms | 77.4 ms | 47.4 ms | 25.90x / 2.89x |
-| 1e7 (5.3e6) | 512^2 | 1 | 13.0 s\* | 1.48 s\* | 259 ms | 176 ms | 111 ms | 50.03x / 5.70x |
-| 1e7 (5.3e6) | 512^2 | 21 | 11.6 s\* | 1.26 s\* | 167 ms | 113 ms | 68.5 ms | 69.43x / 7.56x |
-| 1e7 (5.3e6) | 1024^2 | 1 | 49.9 s\* | 5.35 s\* | 259 ms | 177 ms | 112 ms | 192.34x / 20.63x |
-| 1e7 (5.3e6) | 1024^2 | 21 | 46.1 s\* | 4.98 s\* | 255 ms | 173 ms | 108 ms | 180.51x / 19.50x |
+| 1e5 (5.3e4) | 128^2 | 1 | 12.1 ms | 2.74 ms | 5.56 ms | 2.93 ms | 1.92 ms | 2.17x / 0.49x |
+| 1e5 (5.3e4) | 128^2 | 21 | 7.54 ms | 0.846 ms | 1.02 ms | 0.704 ms | 0.431 ms | 7.42x / 0.83x |
+| 1e5 (5.3e4) | 256^2 | 1 | 36.5 ms | 4.45 ms | 6.12 ms | 3.75 ms | 2.16 ms | 5.97x / 0.73x |
+| 1e5 (5.3e4) | 256^2 | 21 | 29.5 ms | 3.25 ms | 1.08 ms | 0.748 ms | 0.481 ms | 27.34x / 3.01x |
+| 1e5 (5.3e4) | 512^2 | 1 | 131 ms | 14.1 ms | 5.99 ms | 3.97 ms | 3.18 ms | 21.78x / 2.36x |
+| 1e5 (5.3e4) | 512^2 | 21 | 117 ms\* | 12.6 ms\* | 1.82 ms | 1.43 ms | 1.08 ms | 64.01x / 6.92x |
+| 1e5 (5.3e4) | 1024^2 | 1 | 499 ms | 54.3 ms | 9.78 ms | 8.08 ms | 7.18 ms | 51.08x / 5.56x |
+| 1e5 (5.3e4) | 1024^2 | 21 | 463 ms\* | 49.3 ms\* | 3.98 ms | 3.29 ms | 2.70 ms | 116.43x / 12.40x |
+| 1e6 (5.28e5) | 128^2 | 1 | 109 ms | 13.6 ms | 28.3 ms | 19.5 ms | 12.3 ms | 3.85x / 0.48x |
+| 1e6 (5.28e5) | 128^2 | 21 | 75.1 ms | 8.79 ms | 9.83 ms | 6.56 ms | 3.85 ms | 7.64x / 0.89x |
+| 1e6 (5.28e5) | 256^2 | 1 | 358 ms | 43.6 ms | 23.8 ms | 16.2 ms | 10.4 ms | 15.05x / 1.83x |
+| 1e6 (5.28e5) | 256^2 | 21 | 293 ms\* | 32.5 ms\* | 9.91 ms | 6.53 ms | 3.84 ms | 29.61x / 3.28x |
+| 1e6 (5.28e5) | 512^2 | 1 | 1.30 s | 146 ms | 23.7 ms | 16.3 ms | 10.8 ms | 54.77x / 6.16x |
+| 1e6 (5.28e5) | 512^2 | 21 | 1.16 s\* | 126 ms\* | 13.1 ms | 8.97 ms | 5.62 ms | 88.73x / 9.62x |
+| 1e6 (5.28e5) | 1024^2 | 1 | 4.97 s\* | 535 ms\* | 26.6 ms | 19.0 ms | 13.5 ms | 187.12x / 20.12x |
+| 1e6 (5.28e5) | 1024^2 | 21 | 4.61 s\* | 489 ms\* | 23.6 ms | 16.2 ms | 10.6 ms | 195.45x / 20.75x |
+| 1e7 (5.3e6) | 128^2 | 1 | 1.08 s | 140 ms | 326 ms | 234 ms | 162 ms | 3.32x / 0.43x |
+| 1e7 (5.3e6) | 128^2 | 21 | 753 ms\* | 88.8 ms\* | 105 ms | 72.2 ms | 45.5 ms | 7.21x / 0.85x |
+| 1e7 (5.3e6) | 256^2 | 1 | 3.59 s\* | 433 ms\* | 259 ms | 176 ms | 114 ms | 13.86x / 1.67x |
+| 1e7 (5.3e6) | 256^2 | 21 | 2.95 s\* | 327 ms\* | 113 ms | 77.2 ms | 47.2 ms | 26.12x / 2.90x |
+| 1e7 (5.3e6) | 512^2 | 1 | 13.1 s\* | 1.47 s\* | 256 ms | 173 ms | 108 ms | 51.02x / 5.74x |
+| 1e7 (5.3e6) | 512^2 | 21 | 11.6 s\* | 1.27 s\* | 166 ms | 113 ms | 68.3 ms | 70.02x / 7.63x |
+| 1e7 (5.3e6) | 1024^2 | 1 | 50.0 s\* | 5.41 s\* | 257 ms | 173 ms | 109 ms | 194.68x / 21.09x |
+| 1e7 (5.3e6) | 1024^2 | 21 | 46.3 s\* | 5.04 s\* | 256 ms | 173 ms | 108 ms | 181.20x / 19.69x |
 
-At tol 1e-12 the non-uniform FFT is faster than the direct complex128 sum in all 24 rows (1.32x to 194x). It is
-slower than the direct complex64 sum on all 128^2 rows (0.31x to 0.88x) and on 256^2 with one plane at 1e5 rays
-(0.54x); it is faster in the other 17 rows (1.59x to 20.6x). On the rays of the direct timing, the largest field
-difference from the direct complex128 sum is 1.8e-14 of sum_r |a_r| at tol 1e-12, 2.7e-12 at 1e-9 and 2.2e-9 at
-1e-6 (`err_*`); the largest coupling difference into a Gaussian mode of radius 8 um is 2.5e-15, 5.2e-13 and
-2.4e-10 (`d_eta_*`).
+At tol 1e-12 the non-uniform FFT is faster than the direct complex128 sum in all 24 rows (2.17x to 195x). It is
+slower than the direct complex64 sum in the same 7 rows as on 2026-11-07, all 128^2 rows and 256^2 with one plane
+at 1e5 rays (0.43x to 0.89x); it is faster in the other 17 rows (1.67x to 21.1x). On the rays of the direct
+timing, the largest field difference from the direct complex128 sum is 1.8e-14 of sum_r |a_r| at tol 1e-12,
+2.7e-12 at 1e-9 and 2.2e-9 at 1e-6 (`err_*`); the largest coupling difference into a Gaussian mode of radius 8 um
+is 2.5e-15, 5.2e-13 and 2.4e-10 (`d_eta_*`).
 
-The example (row 25 of the same file; 10877 rays, 25 planes, 128 x 128 points):
+Against rows 1 to 24 of `benchmarks/2026-11-07/optics-nufft.jsonl` (the same command before the node cache): the
+direct sums take 0.99x to 1.06x the time of then (complex128 0.999x to 1.061x, complex64 0.994x to 1.022x). The
+non-uniform FFT at tol 1e-12 takes 0.64x to 1.00x the time of then: at 1e5 and 1e6 rays it takes 1.4 to 5.9 ms
+less per call (the per-plane difference times the planes), the largest change is in the one-plane rows at 1e5
+rays (0.64x to 0.78x), and at 1e7 rays the ratio is 0.988x to 1.003x. The node computation was a fixed cost of
+each call, so the change is largest where the call is short.
+
+The example (row 25 of `benchmarks/2026-11-07/optics-nufft.jsonl`, before the node cache; 10877 rays, 25 planes,
+128 x 128 points):
 
     bash tools/gpu_run.sh optics_gpu python examples/coupling_scans_on_device.py \
         --mode-file ../results/optics_gpu/sin_tip_mode_sym_x.npz
@@ -266,8 +280,116 @@ Its focus scan takes 0.362 ms per plane with the non-uniform FFT, 1.64 ms with t
 slower) and 0.175 ms with complex64 (the non-uniform FFT is 2.1x slower than complex64); eta differs from
 complex128 by at most 2.2e-14.
 
-**The default stays `method="direct"`.** A non-uniform FFT default needs a rule for `dtype=torch.complex64`
-(see Next).
+### The float32 spread (`method="nufft"`, `dtype=torch.complex64`)
+
+The weights c_zr and the kernel values are computed in float64 as for complex128, then the terms in float32
+(c_zr in complex64, phi_x phi_y and their product), and `index_add_` adds them as float32 pairs (the real and the
+imaginary part as two float32 values, not as complex64 values). The FFT and the deconvolution stay in complex128.
+The default tol is 1e-6 (w = 9): below that, the float32 rounding is larger than the kernel error.
+
+The atomic adds: `benchmarks/2026-11-08/optics-atomics.jsonl` (8 rows; `index_add_` of 2^24 values into 256 to
+1048576 target rows, in 1 and 21 columns, random targets, best of 3 runs), from the repository folder on the GPU
+computer:
+
+    bash tools/gpu_run.sh optics_gpu python bench/bench_atomics.py --targets 256 4096 65536 1048576 --cols 1 21
+
+float64 takes 1.29x to 23.7x the time of float32 (23.7x with 256 targets in one column, the most adds into one
+value). complex64 takes 0.98x to 12.6x the time of float32 per float32 value (a complex64 value is two float32
+values), and complex128 takes 0.73x to 1.84x the time of complex64. So the float32 spread adds float32 pairs.
+
+A float32 sum of many terms in one value loses accuracy: a value of the fine grid can get the terms of very many
+rays (all rays with nearly the same direction add into the same values, and the terms of a focus are in phase).
+So the spread adds in flush periods: in each period every float32 value of every copy gets at most
+`NUFFT_TERMS32` = 1024 terms; at the end of a period the copies are added in complex64, that sum is added into a
+complex128 fine grid, and the copies are set to 0. `_spread32_segments` finds the chunks of rays and the flushes
+before the spread: the first kernel point of each ray falls into a block of w x w fine-grid points, the rays that
+add into one point have their first points in at most 2 x 2 adjacent blocks, so the ray counts of 2 x 2 blocks
+(per copy, since the last flush) bound the terms of each point. A chunk that would take this bound above 1024
+starts after a flush, a chunk above it alone is cut in half, and each try reads one number from the GPU.
+
+**The bound** (`nufft32_bound(nx, ny, tol)`, to first order in u = 2^-24): at each grid point,
+
+    |E32 - E64| <= (NUFFT_TERMS32 + NUFFT_COPIES + 3) u rho_x(m) rho_y(n) sum_r |a_r|,   rho(m) = Phi_max / psi(m),
+
+with E64 the same non-uniform FFT with the spread in complex128 (its own error, at most tol sum_r |a_r| in the
+tests, comes in addition). Each term gets five float32 roundings (at most 5 u |t|); a float32 sum of at most n =
+1024 terms from 0, in any order, has an error of at most (n - 1) u times the sum of their |t| (the recursive
+summation bound, N. J. Higham, Accuracy and Stability of Numerical Algorithms, 2nd ed., SIAM 2002, eq. (4.4)); the
+sum of K <= 16 copies in complex64 adds K - 1 roundings. The FFT sums the fine-grid errors with |exp(...)| = 1, and
+the deconvolution multiplies mode (m, n) by 1 / (psi_x(m) psi_y(n)). Phi = sum_j phi_j, the sum of the w kernel
+values of one ray, is at most Phi_max (about psi(0)), so rho is 1 at the grid center (to 2.5e-5 at w = 5 and to
+1e-8 or better at w >= 9; test print) and largest at the edge of the grid (the largest modes |m| = N / 2):
+1.82, 3.17, 4.79 and 7.25 for w 5, 9, 12, 15 (tol 1e-2, 1e-6, 1e-9, 1e-12; 128 points; test print). For a 128 x 128
+grid at tol 1e-6, B = 6.22e-5 at the center and 6.23e-4 at the corners (test print). Weights near the float32 range
+limits (|a| below about 1e-30 or above 1e30) are outside the bound.
+
+The bound is for the worst case: all terms of a value in phase and all roundings in one direction. In the tests
+(GPU, test prints of `tests/test_nufft32_auto.py`, two runs), the largest |E32 - E64| / (B sum_r |a_r|) is 3.2e-5
+to 4.2e-5 for random rays, 8.1e-5 to 1.2e-3 for the four focus scans of the checks below, and 4.1e-2 for 60000
+equal rays in one direction (all terms equal and in phase: the worst case of a float32 sum). The coupling of the
+focus scans differs from the direct complex128 sum by 1.7e-7 or less.
+
+**Timings of the float32 spread.** Column `spread32_gain_1e-06` (the time of the complex128 spread over the time
+of the float32 spread, both at tol 1e-6) of `benchmarks/2026-11-08/optics-nufft-auto.jsonl` (144 rows; commands
+in "Method auto" below) and of `benchmarks/2026-11-08/optics-nufft-2.jsonl` (24 rows; command in "Timings" above):
+- 0.15x to 1.60x in the 144 rows; the float32 spread is faster in 22 of them, all on grids of 16 x 16 to
+  128 x 128 points (128 x 128 only in one row: the 4f system, 7713 rays, 5 planes, 1.09x);
+- 0.17x to 0.92x in the 24 rows (128 x 128 to 1024 x 1024 points, 5.3e4 to 5.3e6 rays): slower in all of them;
+- with `NUFFT_TERMS32` = 16384 (`--terms32 16384`, column `nufft32_s_1e-06_terms16384`, the 84 singlet rows;
+  fewer flushes, and a bound (16384 + 19) / (1024 + 19) = 15.7 times larger): 0.70x to 3.05x, faster in 39 of the
+  84 rows.
+
+So the flushes and the count tries that keep the bound cost more than the float32 atomic adds save, except on
+small grids, where many adds go into the same values. In the 144 rows, the float32 spread differs from the direct
+complex128 sum by at most 4.7e-7 of sum_r |a_r| (`err32_1e-06`; at most 7.5e-4 of the stated bound max B + tol,
+`bound32_1e-06`), and the coupling by at most 5.1e-8 (`d_eta32_1e-06`).
+
+### Method "auto"
+
+`method="auto"` selects the non-uniform FFT or the direct sum with a rule (`_auto_nufft`), and for a non-uniform
+grid the direct sum without a warning. The non-uniform FFT of "auto" spreads in complex128 also for
+`dtype=torch.complex64` (tol 1e-6 then, an error of at most 1e-6 sum_r |a_r| in the tests, far below the bound of
+the direct complex64 sum), because the float32 spread is slower than the complex128 spread in 122 of the 144 rows
+(above). The rule, per dtype of the direct sum (constants in `src/optics_gpu/pop.py`):
+
+| | complex128 (tol 1e-12) | complex64 (direct sum in float32; non-uniform FFT at tol 1e-6) |
+|---|---|---|
+| image points Nx Ny, at least (`AUTO_POINTS`; 4 times that for fewer than `AUTO_PLANES` = 5 planes) | 64 x 64 | 128 x 128 |
+| rays x planes, at least (`AUTO_RAYS`) | 2000 | 20000 |
+| rays x planes x points, at least (`AUTO_WORK`) | 8e7 | 2e9 |
+
+On small grids the direct sum costs less per ray than the w^2 adds of the spread. With fewer planes the spread
+adds fewer values per fine-grid index, so more atomic adds go into the same values. Below the ray and work limits,
+the fixed cost of the non-uniform FFT (per call, and per plane: the fine grids, the FFT and the deconvolution) is
+not paid back. The limits were set from timing runs before the log, then checked on the logged rows
+`benchmarks/2026-11-08/optics-nufft-auto.jsonl`: rows 1 to 84, the singlet (NA 0.09), 16^2 to 1024^2 points, 489
+to 528085 rays; rows 85 to 144, the 4f system (its image-side beam has 2.5 times less NA, so more rays add into the
+same values), 32^2 to 512^2 points, 733 to 782357 rays; 1, 5 and 21 planes; 16 rows with `direct_scaled`. From the
+repository folder on the GPU computer:
+
+    bash tools/gpu_run.sh optics_gpu python bench/bench_nufft.py --rays 1e3 1e4 1e5 1e6 \
+        --image 16 32 64 128 256 512 1024 --planes 1 5 21 --tol 1e-12 1e-6 --terms32 16384
+    bash tools/gpu_run.sh optics_gpu python bench/bench_nufft.py --system 4f --rays 1e3 1e4 1e5 1e6 \
+        --image 32 64 128 256 512 --planes 1 5 21 --tol 1e-12 1e-6
+
+Recomputed from the times of each row (the loss: the time of the selected method over the faster of the two;
+complex128: `direct_c128_s` and `nufft_s_1e-12`; complex64: `direct_c64_s` and `nufft_s_1e-06`):
+- complex128: "auto" selects the non-uniform FFT in 87 of the 144 rows, and there it is 1.05x to 196x faster
+  than the direct sum. The loss is above 1 in 3 rows, all with the direct sum selected: row 49 (singlet, 53009
+  rays, 64 x 64, 1 plane) 1.005, row 70 (singlet, 528085 rays, 64 x 64, 1 plane) 1.042, row 92 (4f, 733 rays,
+  128 x 128, 5 planes) 1.013.
+- complex64: the non-uniform FFT in 48 rows, there 1.09x to 46.4x faster than the direct complex64 sum. The loss
+  is above 1 in 3 rows, all with the direct sum selected: row 33 (singlet, 5193 rays, 128 x 128, 21 planes) 1.082,
+  row 35 (singlet, 5193 rays, 256 x 256, 5 planes) 1.013, row 73 (singlet, 528085 rays, 128 x 128, 1 plane) 1.139.
+- So in all 144 rows "auto" is never slower than the direct sum; where it loses, it misses a faster non-uniform
+  FFT by at most 4.2 % (complex128) and 13.9 % (complex64).
+
+**The default stays `method="direct"`.** For complex64 the rows show misses up to 1.139 (rows 33, 35 and 73). For
+complex128 the rows support "auto" (at most 1.042, and never slower than the direct sum), but a default "auto"
+changes the results of all callers that use the default (`huygens_psf`, `propagate_through` with a trace device,
+the direct baselines of `bench/bench_nufft.py` and `bench/bench_image_sum.py`, and the tests of the direct and
+complex64 sums), and their fields on the GPU then change from run to run at the rounding level (the atomic adds
+of the spread go in a varying order). That switch for complex128 is a change of its own (Next).
 
 ## Image quality: OPD, Zernike, PSF and MTF (`src/optics_gpu/analysis.py`)
 
@@ -670,11 +792,21 @@ The checks of `tests/test_analysis.py` are in the section "Image quality" above.
 | the non-uniform FFT in batches of 3 planes, with 3 copies, with one copy, in chunks of 31, 164 and 97 rays; one plane of the fine grid above the budget (chunks of `NUFFT_MIN_CHUNK` rays) (`SUM_ELEMENTS`, `ALLOC_SLACK`, `NUFFT_COPIES` patched) (CPU, GPU) | the default: one batch, 16 copies, one chunk | GPU 1.9e-16, 2.0e-16, 2.8e-16, 2.4e-16 of sum \|a\| (1e-14) |
 | `_nufft_steps` with the default budget: Nx 2048 (fine grid 4096^2), Nx 4096 (8192^2), 1 and 21 planes | | 21333 rays; `NUFFT_MIN_CHUNK` = 4096 rays (1 ray before the one review) |
 | peak GPU memory of the non-uniform FFT minus E (GPU): 1 and 21 planes 128 x 128 (budget 2^22), 41 planes 256 x 256 and 1 plane 512 x 512 (2^23), 5 planes 1024 x 1024 (2^25) | the budget | 0.60, 0.83, 0.80, 0.63, 0.65 (0.25 to 1) |
-| bad inputs of the non-uniform FFT: tol 0, 1e-13, 0.1, NaN; method "fft"; complex64; `ray_chunk` 0 | | ValueError |
+| bad inputs of the non-uniform FFT: tol 0, 1e-13, 0.1, NaN (also with "auto"); method "fft"; dtype float64; `ray_chunk` 0 (also with "auto"); before the twelfth wave also complex64 | | ValueError |
+| the float32 spread: random rays (as above), 4 planes, 24 x 17 points, tol 1e-2, 1e-6, 1e-12, one chunk and chunks of 500 rays (CPU, GPU) | the complex128 spread (same tol): `nufft32_bound` B; the NumPy sum | GPU (two runs): largest \|dE\| / (B sum \|a\|) 3.2e-5 to 4.2e-5 (1); against NumPy 2.2e-5, 9.9e-9 to 1.1e-8, 3.9e-8 to 4.9e-8 of sum \|a\| (max B + tol) |
+| the float32 spread, 60000 equal rays in one direction (each value of a copy gets 3750 terms in phase: flushes needed), 2 planes (CPU, GPU) | the complex128 spread; the analytic plane wave | GPU: 4.1e-2 of B (1); 1.9e-5 of sum \|a\| (max B + tol = 6.2e-4) |
+| `_spread32_segments`: 50000 rays (40000 near 2 directions, 10000 random), 20 x 20 points, 16 copies, chunks of 20000 rays (CPU) | the exact term counts of the spread (bincount of its indices) | at most 625 terms per value and flush period (1024; above 128); every ray once; 6 flushes |
+| `nufft32_bound`: rho at the center and the edge; Phi over a cell, tol 1e-2 to 1e-12 | rho = 1 at the center; Phi_max sampled at 4096 positions | rho(0) - 1: 2.5e-5 (w 5), below 5e-9 (w >= 9) (1e-4); edge 1.82 to 7.25; Phi changes by 4.8e-5 (w 5) to 5.8e-15 (w 15) (1e-4) |
+| the float32 spread in the focus scans of the checks above (4f, singlet, Gaussian focus, uniform pupil) (CPU, GPU) | the complex128 spread (tol 1e-6): B; the direct complex128 sum: eta with the power of each plane and with one power | GPU (two runs): 1.2e-3, 1.9e-4 to 2.1e-4, 1.2e-4, 8.1e-5 to 8.3e-5 of B (1); \|d eta\| 1.6e-7 to 1.7e-7, 2.3e-8 to 2.7e-8, 1.5e-8, 3.8e-9 to 4.0e-9 (1e-6) |
+| `_auto_nufft`: each of the three limits alone keeps the direct sum | | |
+| `image_planes(method="auto")`, limits patched to both sides of the rule, complex128 and complex64; a non-uniform grid; `image_sum` (CPU, GPU) | the selected method: the direct sum, or the non-uniform FFT with the complex128 spread | bit for bit (CPU; and the direct sum on the GPU); GPU non-uniform FFT within 1e-15 of sum \|a\|; no warning for the non-uniform grid |
+| complex64 "auto" on a grid phase of 305 rad (above `PHASE32_MAX`; uniform pupil of NA 0.6, 251 x 251 points) (CPU, GPU) | the direct complex64 sum; the direct complex128 sum | ValueError; "auto" with the non-uniform FFT (complex128 spread, tol 1e-6): 4.0e-8 to 4.5e-8 of sum \|a\| on the GPU, two runs (1e-6) |
+| peak GPU memory of the float32 spread minus E (GPU): 1 and 21 planes 128 x 128 (budget 2^22), 1 plane 512 x 512 (2^23) | the budget | 0.35, 0.58, 0.52 (at most 1) |
 
 All tests ran on the GPU computer (RX 7900 XT; `.venv-optics` from `tools/env/optics_rocm.sh`, PyTorch 2.14.1 for
-ROCm 7.2): 154 passed (`tests/test_analysis.py`: 27, `tests/test_device_pipeline.py`: 18,
-`tests/test_image_planes.py`: 30, `tests/test_nufft.py`: 48, `tests/test_sources.py`: 14). The observed values of
+ROCm 7.2): 204 passed on 2026-11-08 (all files of `tests/`; `tests/test_nufft32_auto.py`: 20; on 2026-11-07: 154,
+with `tests/test_analysis.py` 27, `tests/test_device_pipeline.py` 18, `tests/test_image_planes.py` 30,
+`tests/test_nufft.py` 48, `tests/test_sources.py` 14). The observed values of
 the rows from "PyTorch-backend trace" down, and of the image-quality checks, come from the same computer. The
 NumPy pipeline gives the same values as before the device pipeline: eta 0.99998, 0.95324, 0.93319 in the 4f check.
 
@@ -909,9 +1041,11 @@ log). The optics runs with the two mode files gave the same efficiencies.
 
 - Batched Zernike fits (one normal matrix for all fields and wavelengths) and a batched Huygens PSF (the image
   sum of several wavelengths in one pass).
-- The non-uniform FFT as the default for uniform grids in complex128 (a method "auto"). The logged rows
-  (`benchmarks/2026-11-07/optics-nufft.jsonl`) show it faster than the direct complex128 sum in all bench rows and
-  in the example, and slower than complex64 on 128 x 128 grids; "auto" needs a rule for complex64.
-- A float32 spread for the non-uniform FFT (with `dtype=torch.complex64`). It needs a time comparison of float32
-  and float64 atomic adds on the GPU, and a bound for the float32 sums of many rays in one fine-grid point.
+- Method "auto" as the default for complex128 (the logged rows support it, section "Method auto"), as a change of
+  its own: `method="direct"` in the tests and benches of the direct sum, and the README values that come from the
+  default (Huygens PSF, device pipeline) checked again.
+- A faster float32 spread: the flushes that keep its bound cost time when many rays add into the same values.
+  Options: a tighter count (the 2 x 2 blocks cover 4 times the area of the w x w first points of the rays that add
+  into one point), or a fixed-point spread with 64-bit integer atomic adds (integer adds are exact, so the result
+  does not depend on the order of the adds).
 - `propagate_through` and `bench/bench_pipeline.py` with the complex64 option of the image sum.

@@ -324,21 +324,23 @@ def test_nufft_steps_of_large_grids():
 
 
 def test_nufft_width_and_bad_inputs():
-    """nufft_width: w = ceil(log10(1 / tol)) + 3, beta = 2.30 w; tol outside 1e-12 .. 1e-2, an unknown method,
-    complex64 with the non-uniform FFT and ray_chunk 0 give a ValueError."""
+    """nufft_width: w = ceil(log10(1 / tol)) + 3, beta = 2.30 w; tol outside 1e-12 .. 1e-2 (also with method
+    "auto"), an unknown method, a dtype other than complex128 and complex64, and ray_chunk 0 give a ValueError."""
     assert [nufft_width(t)[0] for t in (1e-2, 1e-6, 1e-9, 1e-12, 3e-7)] == [5, 9, 12, 15, 10]
     assert nufft_width(1e-12)[1] == pytest.approx(2.30 * 15)
     bundle = random_bundle("cpu", sizes=(50,))
     x = np.arange(-4, 4) * 1.0
     for tol in (0.0, 1e-13, 0.1, float("nan")):
-        with pytest.raises(ValueError, match="tol"):
-            image_planes(bundle, x, x, [0.0], method="nufft", tol=tol)
+        for method in ("nufft", "auto"):
+            with pytest.raises(ValueError, match="tol"):
+                image_planes(bundle, x, x, [0.0], method=method, tol=tol)
     with pytest.raises(ValueError, match="method"):
         image_planes(bundle, x, x, [0.0], method="fft")
     with pytest.raises(ValueError, match="complex128"):
-        image_planes(bundle, x, x, [0.0], method="nufft", dtype=torch.complex64)
-    with pytest.raises(ValueError, match="ray_chunk"):
-        image_planes(bundle, x, x, [0.0], method="nufft", ray_chunk=0)
+        image_planes(bundle, x, x, [0.0], method="nufft", dtype=torch.float64)
+    for method in ("nufft", "auto"):
+        with pytest.raises(ValueError, match="ray_chunk"):
+            image_planes(bundle, x, x, [0.0], method=method, ray_chunk=0)
 
 
 MEMORY_CASES = [          # (planes, Nx, Ny, SUM_ELEMENTS): one batch with copies; batches of planes; one plane
